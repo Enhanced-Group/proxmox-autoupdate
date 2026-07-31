@@ -125,8 +125,11 @@ EDITABLE_KEYS = {
     "SENDER_EMAIL": _v_optional_email,
     "RECIPIENT_EMAIL": _v_optional_email,
     "DISCORD_WEBHOOK_URL": _v_url,
+    "DISCORD_BOT_TOKEN": _v_optional,
+    "DISCORD_USER_ID": lambda v: v == "" or v.isdigit(),
     "SLACK_WEBHOOK_URL": _v_url,
     "GENERIC_WEBHOOK_URL": _v_url,
+    "CONFIRM_UPDATES": _v_bool,
     "EXCLUDE_IDS": _v_idlist,
     "WINDOWS_UPDATE_TIMEOUT": _v_int,
     "LINUX_UPDATE_TIMEOUT": _v_int,
@@ -147,6 +150,7 @@ EDITABLE_KEYS = {
 SENSITIVE_KEYS = {
     "MAILGUN_API_KEY",
     "DISCORD_WEBHOOK_URL",
+    "DISCORD_BOT_TOKEN",
     "SLACK_WEBHOOK_URL",
     "GENERIC_WEBHOOK_URL",
 }
@@ -447,8 +451,18 @@ def send_test_notification(cfg):
                                "is" if len(missing) == 1 else "are"))
         elif "@" not in (cfg.get("SENDER_EMAIL") or ""):
             problems.append("SENDER_EMAIL does not look like an address.")
-    for method, key, label in (("discord", "DISCORD_WEBHOOK_URL", "Discord"),
-                               ("slack", "SLACK_WEBHOOK_URL", "Slack/Teams"),
+    if "discord" in methods:
+        token = (cfg.get("DISCORD_BOT_TOKEN") or "").strip()
+        uid = (cfg.get("DISCORD_USER_ID") or "").strip()
+        hook = (cfg.get("DISCORD_WEBHOOK_URL") or "").strip()
+        if token and not uid:
+            problems.append("Discord: a bot token is set but DISCORD_USER_ID is not.")
+        elif uid and not token:
+            problems.append("Discord: a user ID is set but DISCORD_BOT_TOKEN is not.")
+        elif not token and not hook:
+            problems.append("Discord is enabled but neither a webhook URL nor a "
+                            "bot DM is configured.")
+    for method, key, label in (("slack", "SLACK_WEBHOOK_URL", "Slack/Teams"),
                                ("webhook", "GENERIC_WEBHOOK_URL", "Generic webhook")):
         if method in methods and not (cfg.get(key) or "").strip():
             problems.append("%s is enabled but %s is not set." % (label, key))
@@ -567,6 +581,65 @@ def _version_tuple(v):
     return tuple(parts or [0])
 
 
+CHANGELOG_URL = "%s/CHANGELOG.md" % GITHUB_RAW
+LOCAL_CHANGELOG = "/usr/local/share/proxmox-autoupdate/CHANGELOG.md"
+
+VERSION_HEADING = re.compile(r"^##\s+([0-9][^\s—-]*)\s*[—-]?\s*(.*)$")
+SECTION_HEADING = re.compile(r"^###\s+(.+?)\s*$")
+BULLET = re.compile(r"^[-*]\s+(.*)$")
+
+
+def parse_changelog(text, limit=2):
+    """Turn CHANGELOG.md into [{version, date, sections: {name: [items]}}].
+
+    Only the newest two entries by default — what changed now, and what changed
+    the release before. The full history is on GitHub for anyone who wants it.
+
+    Deliberately tolerant: an unrecognised line is skipped rather than aborting,
+    so a formatting slip in the changelog never breaks the Maintenance tab.
+    """
+    entries = []
+    current = None
+    section = None
+    for line in text.splitlines():
+        m = VERSION_HEADING.match(line)
+        if m:
+            if len(entries) >= limit:
+                break
+            current = {"version": m.group(1).strip(),
+                       "date": m.group(2).strip(),
+                       "sections": {}}
+            entries.append(current)
+            section = None
+            continue
+        if current is None:
+            continue
+        m = SECTION_HEADING.match(line)
+        if m:
+            section = m.group(1)
+            current["sections"].setdefault(section, [])
+            continue
+        m = BULLET.match(line.strip())
+        if m and section:
+            current["sections"][section].append(m.group(1).strip())
+    return entries
+
+
+def fetch_changelog():
+    """Published changelog, falling back to the copy installed alongside us."""
+    req = urllib.request.Request(
+        CHANGELOG_URL, headers={"User-Agent": "proxmox-autoupdate"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read(200_000).decode("utf-8", errors="replace"), None
+    except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
+        try:
+            with open(LOCAL_CHANGELOG, encoding="utf-8") as fh:
+                return fh.read(), "Showing the installed copy — %s" % exc
+        except OSError:
+            return "", "Could not reach GitHub: %s" % exc
+
+
 def check_for_updates():
     """Read-only version check against the published update script.
 
@@ -608,6 +681,42 @@ def check_for_updates():
 SELFUPDATE_UNIT = "pve-autoupdate-selfupdate"
 UNINSTALL_UNIT = "pve-autoupdate-uninstall"
 
+# Version the running self-update is installing. The service restarts part way
+# through, so this is also mirrored to disk — the button must stay disabled
+# across that restart until the new version is actually confirmed running.
+PENDING_VERSION = {}
+PENDING_FILE = "/var/lib/proxmox-autoupdate/pending-version"
+
+
+def set_pending_version(version):
+    PENDING_VERSION["target"] = version
+    try:
+        os.makedirs(os.path.dirname(PENDING_FILE), exist_ok=True)
+        with open(PENDING_FILE, "w", encoding="utf-8") as fh:
+            fh.write(version or "")
+    except OSError:
+        pass
+
+
+def load_pending_version():
+    """Clear the marker once the installed version has actually changed to it."""
+    target = PENDING_VERSION.get("target")
+    if target is None:
+        try:
+            with open(PENDING_FILE, encoding="utf-8") as fh:
+                target = fh.read().strip() or None
+        except OSError:
+            target = None
+        PENDING_VERSION["target"] = target
+    if target and installed_version() == target:
+        PENDING_VERSION["target"] = None
+        try:
+            os.remove(PENDING_FILE)
+        except OSError:
+            pass
+        return None
+    return target
+
 
 def unit_state(unit):
     """systemd's view of a transient unit: active, failed, inactive or unknown."""
@@ -627,11 +736,17 @@ def maintenance_status():
     """
     selfupd = unit_state(SELFUPDATE_UNIT)
     uninst = unit_state(UNINSTALL_UNIT)
+    pending = load_pending_version()
     return {
         "self_update": selfupd,
         "uninstall": uninst,
+        "pending": pending,
+        # Busy while the unit runs *and* while the installed version has not yet
+        # caught up with the target — the unit finishes before the restarted
+        # service reports the new number.
         "busy": selfupd in ("active", "activating")
-                or uninst in ("active", "activating"),
+                or uninst in ("active", "activating")
+                or bool(pending),
     }
 
 
@@ -966,7 +1081,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/self/version":
             status = maintenance_status()
             status["version"] = installed_version()
+            status["expected"] = PENDING_VERSION.get("target")
             self._json(200, status)
+        elif path == "/api/self/changelog":
+            text, warning = fetch_changelog()
+            self._json(200, {
+                "entries": parse_changelog(text),
+                "installed": installed_version(),
+                "warning": warning,
+                "url": "https://github.com/%s/blob/main/CHANGELOG.md" % GITHUB_REPO,
+            })
         elif path == "/api/config":
             cfg = read_config()
             payload = {k: cfg.get(k, "") for k in EDITABLE_KEYS}
@@ -1070,11 +1194,21 @@ class Handler(BaseHTTPRequestHandler):
             "test -s \"$d/install.sh\"; "
             "bash \"$d/install.sh\" --unattended"
         ) % INSTALL_SCRIPT_URL
+        # Remember what we are installing, so the button stays disabled until
+        # that exact version is confirmed running rather than merely until the
+        # unit exits.
+        target = body.get("target_version")
+        if not target:
+            info = check_for_updates()
+            target = info.get("latest")
+        set_pending_version(target)
+
         ok, detail = run_detached(command, SELFUPDATE_UNIT)
         if not ok:
+            set_pending_version(None)
             self._json(500, {"error": "Could not start the update: %s" % detail})
             return
-        sys.stderr.write("[ui] self-update started by %s\n" % user)
+        sys.stderr.write("[ui] self-update to %s started by %s\n" % (target, user))
         self._json(200, {
             "started": True,
             "detail": "Update started. This panel will restart part way through — "
@@ -1261,6 +1395,19 @@ const post = (path, body) => api(path, {
   body: JSON.stringify(body || {}),
 });
 
+/* Whether update actions ask first. Deliberately does not apply to deleting
+   logs or uninstalling — those are irreversible from here and always confirm. */
+let CONFIRM_UPDATES = {{CONFIRM_UPDATES}};
+
+/* Confirm an update action, honouring that preference. Returns true to go
+   ahead. The backend still requires its token either way; this only decides
+   whether a human is asked. */
+async function confirmUpdate(opts) {
+  if (!CONFIRM_UPDATES) { return true; }
+  return (await dialog(Object.assign({requireText: "UPDATE", danger: true}, opts)))
+         === "UPDATE";
+}
+
 /* Proxmox-style dialog. Resolves false on cancel, true on confirm, or the typed
    text when `requireText` is set.
 
@@ -1326,10 +1473,20 @@ function dialog(opts) {
 """
 
 
+def confirm_updates_flag():
+    """CONFIRM_UPDATES as a JS literal. Defaults to true — the safer default is
+    the one that applies when the setting has never been touched."""
+    return "false" if (read_config().get("CONFIRM_UPDATES") or "").strip() == "false" else "true"
+
+
+def _shared_js():
+    return SHARED_JS.replace("{{CONFIRM_UPDATES}}", confirm_updates_flag())
+
+
 def render_page(user, csrf):
     return (PAGE_TEMPLATE
             .replace("{{CSS}}", SHARED_CSS)
-            .replace("{{JS}}", SHARED_JS)
+            .replace("{{JS}}", _shared_js())
             .replace("{{USER}}", html.escape(user))
             .replace("{{CSRF}}", csrf))
 
@@ -1338,7 +1495,7 @@ def render_guest_page(user, csrf, vmid, name):
     # vmid is already known to be all digits, so it is safe to inline into JS.
     return (GUEST_TEMPLATE
             .replace("{{CSS}}", SHARED_CSS)
-            .replace("{{JS}}", SHARED_JS)
+            .replace("{{JS}}", _shared_js())
             .replace("{{USER}}", html.escape(user))
             .replace("{{CSRF}}", csrf)
             .replace("{{VMID}}", html.escape(vmid))
@@ -1387,6 +1544,7 @@ SHARED_CSS = r"""  :root {
   .pill.run  { background: var(--warn); color: #000; }
   .pill.ok   { background: var(--ok); color: #fff; }
   .pill.err  { background: var(--err); color: #fff; }
+  .pill.warn-pill { background: var(--accent); color: #fff; }
   .msg { padding: 8px 11px; border-radius: 4px; margin-top: 10px; display: none; font-size: 12px; }
   .msg.show { display: block; }
   .msg.ok { background: rgba(76,175,80,.15); border: 1px solid var(--ok); }
@@ -1602,11 +1760,37 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
   <div class="card" id="cardDiscord">
     <h2>Discord</h2>
-    <label for="cfg2_DISCORD_WEBHOOK_URL">Webhook URL</label>
+    <label for="cfg2_DISCORD_WEBHOOK_URL">Channel webhook URL</label>
     <input type="password" id="cfg2_DISCORD_WEBHOOK_URL" data-key="DISCORD_WEBHOOK_URL"
            placeholder="https://discord.com/api/webhooks/...">
     <div class="hint">Server Settings → Integrations → Webhooks → New Webhook → Copy URL.
       Treat it as a secret: anyone with the URL can post to that channel.</div>
+
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <strong style="font-size:12px">Direct message instead of a channel</strong>
+      <div class="hint" style="margin-bottom:8px">
+        Fill both in and the report is DM'd to you; the webhook above is kept as a
+        fallback. The bot must share a server with you for Discord to allow the DM.
+        <br><em>The bot is never run as a process</em> — the token is only used as
+        an auth header on two POSTs when a report is sent.
+      </div>
+      <div class="grid">
+        <div>
+          <label for="cfg2_DISCORD_BOT_TOKEN">Bot token</label>
+          <input type="password" id="cfg2_DISCORD_BOT_TOKEN" data-key="DISCORD_BOT_TOKEN">
+        </div>
+        <div>
+          <label for="cfg2_DISCORD_USER_ID">Your Discord user ID</label>
+          <input id="cfg2_DISCORD_USER_ID" data-key="DISCORD_USER_ID"
+                 placeholder="<your-user-id>">
+          <div class="hint">Enable Developer Mode, then right-click yourself → Copy User ID.</div>
+        </div>
+      </div>
+    </div>
+    <div class="hint" style="margin-top:10px">
+      The full run log is attached as a <code>.log</code> file, split across
+      messages if it exceeds 8&nbsp;MB.
+    </div>
   </div>
 
   <div class="card" id="cardSlack">
@@ -1692,14 +1876,37 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div class="row">
       <div>Installed: <strong id="verInstalled">—</strong></div>
       <button id="btnCheckUpdate">Check for updates</button>
-    </div>
-    <div id="verMsg" class="msg"></div>
-    <div id="verActions" class="row hidden" style="margin-top:10px">
-      <button id="btnSelfUpdate" class="primary">Install update now</button>
+      <button id="btnSelfUpdate" class="primary hidden">Install update now</button>
+      <span id="installStage" class="hint hidden" style="margin:0"></span>
     </div>
     <div id="maintProgress" class="progress"><div></div></div>
+    <div id="verMsg" class="msg"></div>
     <div class="hint">Checking only reads the published version — it never
       installs anything on its own. Updating is always a deliberate action.</div>
+  </div>
+
+  <div class="card">
+    <h2>What's new <span id="clSource" class="hint" style="margin:0"></span></h2>
+    <div id="changelog" class="hint">Loading…</div>
+  </div>
+
+  <div class="card">
+    <h2>Confirmations</h2>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="confirmUpdates" style="width:auto">
+      <span>Ask before starting an update</span>
+    </label>
+    <div class="hint">
+      Applies to <strong>Update Everything</strong>, <strong>Update Now</strong> and
+      <strong>Install update</strong>. Turn it off if you run updates often and the
+      prompt is only friction.<br>
+      Deleting logs and uninstalling always confirm regardless — those cannot be
+      undone from here.
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnSaveConfirm" class="primary">Save</button>
+    </div>
+    <div id="confirmMsg" class="msg"></div>
   </div>
 
   <div class="card">
@@ -1882,9 +2089,27 @@ function renderMaintState(v) {
   const busy = !!v.busy;
   const btn = $("btnSelfUpdate");
   btn.disabled = busy;
-  btn.textContent = busy ? "Installing…" : "Install update now";
   $("btnCheckUpdate").disabled = busy;
   $("maintProgress").classList.toggle("active", busy);
+
+  // Three distinct stages, because "installing" covers a stretch where the
+  // panel itself restarts and the version briefly still reads as the old one.
+  const stage = $("installStage");
+  stage.classList.toggle("hidden", !busy);
+  if (busy) {
+    btn.classList.remove("hidden");
+    btn.innerHTML = '<span class="spinner"></span>Installing…';
+    if (v.self_update === "active" || v.self_update === "activating") {
+      stage.textContent = "Downloading and running the installer…";
+    } else if (v.pending) {
+      stage.textContent = "Installed — waiting for the panel to restart on " +
+                          v.pending + "…";
+    } else {
+      stage.textContent = "Working…";
+    }
+  } else {
+    btn.textContent = "Install update now";
+  }
 
   if (v.self_update === "failed") {
     msg($("verMsg"), "The update failed. Check: journalctl -u pve-autoupdate-selfupdate", false);
@@ -1893,6 +2118,68 @@ function renderMaintState(v) {
   }
   return busy;
 }
+
+// --- changelog -------------------------------------------------------------
+function renderChangelog(data) {
+  const box = $("changelog");
+  if (!data.entries || !data.entries.length) {
+    box.textContent = data.warning || "No changelog available.";
+    return;
+  }
+  $("clSource").textContent = data.warning || "";
+  box.innerHTML = "";
+  data.entries.forEach((e, i) => {
+    const wrap = document.createElement("div");
+    wrap.style.cssText = i ? "margin-top:14px;opacity:.72" : "";
+    const isInstalled = e.version === data.installed;
+    const head = document.createElement("div");
+    head.style.cssText = "font-size:13px;color:var(--text);margin-bottom:4px";
+    head.innerHTML = "<strong>" + e.version + "</strong>" +
+      (e.date ? ' <span style="opacity:.6">· ' + e.date + "</span>" : "") +
+      (isInstalled ? ' <span class="pill ok">installed</span>'
+                   : (i === 0 ? ' <span class="pill warn-pill">new</span>' : ""));
+    wrap.appendChild(head);
+    Object.keys(e.sections).forEach((name) => {
+      const items = e.sections[name];
+      if (!items.length) return;
+      const h = document.createElement("div");
+      h.style.cssText = "margin-top:6px;font-size:11px;text-transform:uppercase;" +
+                        "letter-spacing:.05em;color:var(--muted)";
+      h.textContent = name;
+      wrap.appendChild(h);
+      const ul = document.createElement("ul");
+      ul.style.cssText = "margin:3px 0 0 16px;padding:0;font-size:12px;line-height:1.5";
+      items.forEach((t) => {
+        const li = document.createElement("li");
+        li.textContent = t;
+        ul.appendChild(li);
+      });
+      wrap.appendChild(ul);
+    });
+    box.appendChild(wrap);
+  });
+}
+
+async function loadChangelog() {
+  try {
+    renderChangelog(await api("/api/self/changelog"));
+  } catch (e) {
+    $("changelog").textContent = e.message;
+  }
+}
+
+// --- confirmation preference ----------------------------------------------
+$("btnSaveConfirm").onclick = async () => {
+  try {
+    await post("/api/config", {config: {
+      CONFIRM_UPDATES: $("confirmUpdates").checked ? "true" : "false",
+    }});
+    CONFIRM_UPDATES = $("confirmUpdates").checked;
+    msg($("confirmMsg"), CONFIRM_UPDATES
+        ? "Updates will ask for confirmation."
+        : "Updates will start immediately when clicked.", true);
+  } catch (e) { msg($("confirmMsg"), e.message, false); }
+};
 
 function watchMaintenance() {
   if (maintPoll) return;
@@ -1907,13 +2194,22 @@ function watchMaintenance() {
     $("verInstalled").textContent = v.version;
     if (!renderMaintState(v)) {
       clearInterval(maintPoll); maintPoll = null;
-      msg($("verMsg"), "Finished — now on version " + v.version + ".", true);
-      $("verActions").classList.add("hidden");
+      // Only reached once the installed version matches what was being
+      // installed, so this really does mean finished.
+      msg($("verMsg"), "Update complete — now running " + v.version + ".", true);
+      $("btnSelfUpdate").classList.add("hidden");
+      latestVersion = null;
+      loadChangelog();
     }
   }, 3000);
 }
 
 async function loadMaint() {
+  loadChangelog();
+  try {
+    const cfg = (await api("/api/config")).config;
+    $("confirmUpdates").checked = cfg.CONFIRM_UPDATES !== "false";
+  } catch (e) { /* leave the default */ }
   try {
     const v = await api("/api/self/version");
     $("verInstalled").textContent = v.version;
@@ -1946,39 +2242,45 @@ async function loadMaint() {
   }
 }
 
+let latestVersion = null;
+
 $("btnCheckUpdate").onclick = async () => {
   const btn = $("btnCheckUpdate");
-  btn.disabled = true; btn.textContent = "Checking…";
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Checking…';
   try {
     const r = await post("/api/self/check", {});
     if (r.error) {
       msg($("verMsg"), r.error, false);
     } else if (r.update_available) {
+      latestVersion = r.latest;
       msg($("verMsg"), "Version " + r.latest + " is available (you have " + r.current + ").", true);
-      $("verActions").classList.remove("hidden");
+      $("btnSelfUpdate").classList.remove("hidden");
+      loadChangelog();
     } else {
+      latestVersion = null;
       msg($("verMsg"), "Up to date (" + r.current + ").", true);
-      $("verActions").classList.add("hidden");
+      $("btnSelfUpdate").classList.add("hidden");
     }
   } catch (e) { msg($("verMsg"), e.message, false); }
   finally { btn.disabled = false; btn.textContent = "Check for updates"; }
 };
 
 $("btnSelfUpdate").onclick = async () => {
-  const ok = await dialog({
+  const go = await confirmUpdate({
     title: "Install update",
-    message: "Download and install the new version now?<br><br>" +
-             "The control panel will restart as part of this.",
-    requireText: "UPDATE", okText: "Install",
+    okText: "Install",
+    message: "Install version <strong>" + (latestVersion || "latest") +
+             "</strong> now?<br><br>The control panel will restart as part of this.",
   });
-  if (ok !== "UPDATE") return;
+  if (!go) return;
   // Disable immediately: the request is quick, but the update it kicks off is
   // not, and a second click would start a competing installer.
   $("btnSelfUpdate").disabled = true;
-  $("btnSelfUpdate").textContent = "Installing…";
+  $("btnSelfUpdate").innerHTML = '<span class="spinner"></span>Installing…';
   $("maintProgress").classList.add("active");
   try {
-    const r = await post("/api/self/update", {confirm: "UPDATE"});
+    const r = await post("/api/self/update",
+                         {confirm: "UPDATE", target_version: latestVersion});
     msg($("verMsg"), r.detail, true);
     watchMaintenance();
   } catch (e) {
@@ -2153,19 +2455,15 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  // Updating the host and every guest cannot be undone and may schedule a
-  // reboot, so it is deliberately not a single click.
-  const typed = await dialog({
+  const go = await confirmUpdate({
     title: "Update everything now",
-    danger: true,
     okText: "Update everything",
-    requireText: "UPDATE",
     message:
       "This updates the Proxmox host <strong>and every guest</strong> right now." +
       "<p style='margin:10px 0 0;opacity:.8'>Excluded guests are still skipped. " +
       "A reboot may be scheduled if the host kernel changes.</p>",
   });
-  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
+  if (!go) { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/run", {dry_run: false, confirm: "UPDATE"});
     msg($("runMsg"), "Full update started.", true);
@@ -2425,17 +2723,15 @@ $("btnDry").onclick = async () => {
 $("btnFull").onclick = async () => {
   const me = allGuests.find((g) => g.vmid === VMID);
   const label = me ? (me.name + " (" + VMID + ")") : ("guest " + VMID);
-  const typed = await dialog({
+  const go = await confirmUpdate({
     title: "Update " + label,
-    danger: true,
     okText: "Update now",
-    requireText: "UPDATE",
     message:
       "Update <strong>" + label + "</strong> now." +
       "<p style='margin:10px 0 0;opacity:.8'>Only this guest is touched. The " +
       "Proxmox host is not updated and no reboot is scheduled.</p>",
   });
-  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
+  if (!go) { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/guest/run", {vmid: VMID, dry_run: false, confirm: "UPDATE"});
     msg($("runMsg"), "Update started.", true);

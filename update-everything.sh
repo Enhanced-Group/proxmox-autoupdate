@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="3.3.0"
+PAU_VERSION="3.4.0"
 
 set -u
 set -o pipefail
@@ -303,6 +303,13 @@ DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL:-}"
 
+# Discord direct message. With both of these set the report is DM'd to that user
+# instead of posted to a channel; the webhook, if also configured, is kept as a
+# fallback. The bot must share a server with the recipient for Discord to allow
+# the DM at all.
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
+DISCORD_USER_ID="${DISCORD_USER_ID:-}"
+
 # Stay silent on clean runs, so the channel only fires when something needs you.
 NOTIFY_ON_FAILURE_ONLY="${NOTIFY_ON_FAILURE_ONLY:-false}"
 
@@ -328,10 +335,15 @@ for METHOD in $(echo "${NOTIFY_METHODS}" | tr ',' ' '); do
             fi
             ;;
         discord)
-            if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
+            if [ -n "${DISCORD_WEBHOOK_URL}" ] \
+               || { [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; }; then
                 NOTIFY_ACTIVE="${NOTIFY_ACTIVE} discord"
+            elif [ -n "${DISCORD_BOT_TOKEN}" ]; then
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} discord(bot token set but no user ID)"
+            elif [ -n "${DISCORD_USER_ID}" ]; then
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} discord(user ID set but no bot token)"
             else
-                NOTIFY_DISABLED="${NOTIFY_DISABLED} discord(no URL)"
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} discord(no webhook URL or bot DM)"
             fi
             ;;
         slack)
@@ -1211,8 +1223,189 @@ notify_email() {
     rm -f "${NOTIFY_RESPONSE_FILE}"
 }
 
+# Discord truncates hard: 2000 characters of content, 4096 in an embed. A real
+# run's log is far bigger than that, so the summary goes in the embed and the
+# log itself is attached as a file. Discord's upload ceiling is 10 MB on a free
+# server; 8 MB leaves room for the multipart overhead, and anything larger is
+# split across several messages rather than silently dropped.
+DISCORD_MAX_UPLOAD=$((8 * 1024 * 1024))
+
+# Discord can be reached two ways:
+#   webhook  — post straight to a channel URL, no auth header
+#   bot DM   — open a DM channel with the bot token, then post to that channel
+#
+# The bot never runs as a process. There is no gateway/websocket connection and
+# nothing stays logged in: the token is only ever an Authorization header on two
+# ordinary HTTPS POSTs, made when a report is sent and not otherwise. Nothing
+# here keeps the bot online or listening.
+#
+# A bot token plus a user ID takes precedence, because someone who has
+# configured a DM has asked for a DM. Both paths end up posting the same
+# multipart body, so only the URL and the auth header differ.
+#
+# Sets DISCORD_TARGET_URL and DISCORD_TARGET_AUTH; returns 1 if neither is
+# usable. The DM channel is resolved once per run and reused.
+DISCORD_TARGET_URL=""
+DISCORD_TARGET_AUTH=""
+DISCORD_TARGET_READY=""
+
+discord_resolve_target() {
+    [ -n "${DISCORD_TARGET_READY}" ] && return "${DISCORD_TARGET_READY}"
+
+    if [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; then
+        local resp channel
+        resp=$(curl -s --max-time 30 -X POST \
+            "https://discord.com/api/v10/users/@me/channels" \
+            -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"recipient_id\":\"${DISCORD_USER_ID}\"}" 2>/dev/null) || resp=""
+        channel=$(printf '%s' "${resp}" | jq -r '.id // empty' 2>/dev/null || true)
+
+        if [ -n "${channel}" ]; then
+            DISCORD_TARGET_URL="https://discord.com/api/v10/channels/${channel}/messages"
+            DISCORD_TARGET_AUTH="Authorization: Bot ${DISCORD_BOT_TOKEN}"
+            DISCORD_TARGET_READY=0
+            return 0
+        fi
+
+        # Most often: the bot and the recipient share no server, or the token is
+        # wrong. Say which, rather than failing silently.
+        local why
+        why=$(printf '%s' "${resp}" | jq -r '.message // empty' 2>/dev/null || true)
+        print_fail "Discord DM unavailable${why:+ — ${why}}"
+        [ -z "${why}" ] && echo "     ${C_DIM}Check the bot token, and that the bot shares a server with user ${DISCORD_USER_ID}.${C_NC}"
+
+        # Fall back to the webhook rather than losing the report entirely.
+        if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
+            print_warn "Falling back to the Discord webhook"
+            DISCORD_TARGET_URL="${DISCORD_WEBHOOK_URL}"
+            DISCORD_TARGET_AUTH=""
+            DISCORD_TARGET_READY=0
+            return 0
+        fi
+        DISCORD_TARGET_READY=1
+        return 1
+    fi
+
+    if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
+        DISCORD_TARGET_URL="${DISCORD_WEBHOOK_URL}"
+        DISCORD_TARGET_AUTH=""
+        DISCORD_TARGET_READY=0
+        return 0
+    fi
+    DISCORD_TARGET_READY=1
+    return 1
+}
+
+# curl args for the resolved target: adds the bot Authorization header when
+# talking to the API, and nothing extra for a webhook.
+discord_auth_args() {
+    if [ -n "${DISCORD_TARGET_AUTH}" ]; then
+        printf '%s\n%s\n' "-H" "${DISCORD_TARGET_AUTH}"
+    fi
+}
+
+discord_attach_log() {
+    local url="$1"
+    local -a auth=()
+    mapfile -t auth < <(discord_auth_args)
+    [ "${KEEP_LOGS}" = "true" ] || return 0
+    [ -s "${LOG_FILE}" ] || return 0
+
+    # The log is still being written by the tee, so snapshot it, and strip the
+    # ANSI escapes so the attachment reads cleanly in Discord's viewer.
+    local workdir
+    workdir=$(mktemp -d) || return 0
+    local flat="${workdir}/$(basename "${LOG_FILE}" .log).log"
+    sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\r$//' "${LOG_FILE}" > "${flat}" 2>/dev/null || {
+        rm -rf "${workdir}"; return 0
+    }
+
+    local size
+    size=$(wc -c < "${flat}" 2>/dev/null || echo 0)
+
+    if [ "${size}" -le "${DISCORD_MAX_UPLOAD}" ]; then
+        local code
+        code=$(curl -s --max-time 180 -o /dev/null -w "%{http_code}" \
+            "${auth[@]+"${auth[@]}"}" \
+            -F "payload_json={\"content\":\"Full log\"}" \
+            -F "files[0]=@${flat};type=text/plain" \
+            "${url}" 2>/dev/null) || code="000"
+        case "${code}" in
+            200|204) print_ok "Discord log attached" ;;
+            *)       print_warn "Discord log upload returned HTTP ${code}" ;;
+        esac
+        rm -rf "${workdir}"
+        return 0
+    fi
+
+    # Too big for one message: split on line boundaries so each part is readable
+    # on its own, then send them in order.
+    local base="${workdir}/part"
+    split -C "${DISCORD_MAX_UPLOAD}" -d -a 3 "${flat}" "${base}." 2>/dev/null || {
+        print_warn "Could not split the log for Discord (${size} bytes) — skipping attachment"
+        rm -rf "${workdir}"
+        return 0
+    }
+
+    local parts total index=0
+    parts=$(find "${workdir}" -name 'part.*' | sort)
+    total=$(echo "${parts}" | grep -c . || echo 0)
+    local failed=0
+    local part
+    while IFS= read -r part; do
+        [ -z "${part}" ] && continue
+        index=$((index + 1))
+        local named="${workdir}/$(basename "${LOG_FILE}" .log).part${index}of${total}.log"
+        mv "${part}" "${named}"
+        local code
+        code=$(curl -s --max-time 180 -o /dev/null -w "%{http_code}" \
+            "${auth[@]+"${auth[@]}"}" \
+            -F "payload_json={\"content\":\"Full log — part ${index} of ${total}\"}" \
+            -F "files[0]=@${named};type=text/plain" \
+            "${url}" 2>/dev/null) || code="000"
+        case "${code}" in
+            200|204) ;;
+            *) failed=$((failed + 1)) ;;
+        esac
+        sleep 1   # stay clear of Discord's webhook rate limit
+    done <<< "${parts}"
+
+    if [ "${failed}" -eq 0 ]; then
+        print_ok "Discord log attached in ${total} part(s)"
+    else
+        print_warn "Discord log: ${failed} of ${total} part(s) failed to upload"
+    fi
+    rm -rf "${workdir}"
+}
+
 notify_discord() {
-    post_webhook "Discord" "${DISCORD_WEBHOOK_URL}" "$(build_payload discord "$1" "$2")"
+    if ! discord_resolve_target; then
+        print_fail "Discord: no usable webhook or bot DM target"
+        return 0
+    fi
+
+    local -a auth=()
+    mapfile -t auth < <(discord_auth_args)
+    local label="Discord"
+    [ -n "${DISCORD_TARGET_AUTH}" ] && label="Discord DM"
+
+    local code
+    code=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" \
+        "${auth[@]+"${auth[@]}"}" \
+        -H "Content-Type: application/json" \
+        -X POST --data-binary "$(build_payload discord "$1" "$2")" \
+        "${DISCORD_TARGET_URL}" 2>/dev/null) || code="000"
+
+    if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
+        print_ok "${label} notified"
+    elif [ "${code}" = "000" ]; then
+        print_fail "${label} unreachable (network error or timeout)"
+    else
+        print_fail "${label} returned HTTP ${code}"
+    fi
+
+    discord_attach_log "${DISCORD_TARGET_URL}"
 }
 
 notify_slack() {

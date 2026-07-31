@@ -15,7 +15,8 @@ This tool performs weekly updates across your entire Proxmox stack — including
 - **Honest Result Reporting:** Guests report status through explicit markers rather than exit codes, so a benign non-zero `apt` exit is no longer reported as a failure — and a real failure is never reported as success. Packages that were genuinely upgraded are distinguished from those held back.
 - **Dry Run Mode:** `update-everything.sh --dry-run` reports exactly what would be upgraded, installs nothing, and still emails the report.
 - **Pre-Update Snapshots:** Optionally snapshot each guest before updating, with automatic pruning of old auto-snapshots.
-- **Web Control Panel:** Optional **Auto-Update** button in the Proxmox toolbar (left of *Documentation*) — run updates, manage exclusions, edit the schedule and config, and read past reports without touching a shell. Authorised by your existing Proxmox login.
+- **Web Control Panel:** Optional **Update Everything** button in the Proxmox toolbar (left of *Documentation*) — run updates, manage exclusions, edit the schedule and config, and read past reports without touching a shell. Authorised by your existing Proxmox login.
+- **Flexible Notifications:** Discord (channel *or* direct message, with the log attached as a file), Slack/Teams, any JSON webhook, and Mailgun email — in any combination, or none at all.
 - **Per-Guest Updates:** Each VM and container gets its own **Auto-Update** tab below *Permissions* — patch a single guest without running the whole sweep, or exclude it from the schedule with one click. Also available as `--only <id>` on the CLI.
 - **Fancy Terminal Output:** Braille dot spinners, ANSI color-coded results, Unicode box-drawing banners, and a summary table.
 - **Interactive Configuration:** Prompts for Mailgun credentials, region, exclusion list, and Windows timeout during install. Stored securely in `/etc/proxmox-autoupdate.conf` (`chmod 600`).
@@ -217,6 +218,17 @@ SNAPSHOT_KEEP="3"                # auto-snapshots to keep per guest
 # Dry run — leave false for scheduled runs, use --dry-run for one-offs
 DRY_RUN="false"
 
+# Logs
+KEEP_LOGS="true"                 # false still streams a run live, then deletes it
+LOG_RETENTION_DAYS="90"          # 0 keeps them forever
+
+# Ask before starting an update. Deletions and uninstall always confirm.
+CONFIRM_UPDATES="true"
+
+# Notifications — all optional; empty NOTIFY_METHODS means updates run quietly
+NOTIFY_METHODS=""                # email, discord, slack, webhook (comma-separated)
+NOTIFY_ON_FAILURE_ONLY="false"
+
 # Timing settings
 UPDATE_SCHEDULE_CRON="0 23 * * 5" # Fridays at 23:00 (cron 5-field format)
 REBOOT_TIME="00:00"              # HH:MM format for post-update reboot (if kernel updated)
@@ -300,7 +312,8 @@ on it.
 | Channel | Config key | Notes |
 |---|---|---|
 | Email | `MAILGUN_*` | The full HTML report |
-| Discord | `DISCORD_WEBHOOK_URL` | Colour-coded embed — green/red/grey for ok/error/dry-run |
+| Discord — channel | `DISCORD_WEBHOOK_URL` | Colour-coded embed, green/red/grey for ok/error/dry-run |
+| Discord — DM | `DISCORD_BOT_TOKEN` + `DISCORD_USER_ID` | Same report, sent to you directly |
 | Slack / Teams | `SLACK_WEBHOOK_URL` | Teams works via an incoming-webhook connector |
 | Generic | `GENERIC_WEBHOOK_URL` | JSON POST — ntfy, Gotify, Home Assistant, n8n, anything |
 
@@ -308,6 +321,34 @@ on it.
 NOTIFY_METHODS="discord,webhook"     # comma-separated; empty = silent
 NOTIFY_ON_FAILURE_ONLY="true"        # stay quiet on clean runs
 ```
+
+### Discord
+
+The **full run log is attached as a `.log` file**, not pasted into the message —
+Discord truncates content at 2000 characters and an embed at 4096, which a real
+run comfortably exceeds. Logs above 8 MB are split across several messages so
+nothing is lost.
+
+To DM the report to yourself instead of posting to a channel, set a bot token
+and your user ID:
+
+```bash
+DISCORD_BOT_TOKEN="..."              # bot token, not a webhook URL
+DISCORD_USER_ID="<your-user-id>" # Developer Mode → right-click yourself → Copy User ID
+```
+
+With both set, the report is DM'd; a `DISCORD_WEBHOOK_URL` is kept as a fallback
+if the DM can't be opened. **The bot is never run as a process** — there is no
+gateway connection and nothing stays logged in. The token is only used as an
+`Authorization` header on two ordinary POSTs at report time:
+
+```
+POST /api/v10/users/@me/channels      → open the DM channel
+POST /api/v10/channels/{id}/messages  → send the report and attach the log
+```
+
+Discord only permits the DM if the bot shares a server with you. If it doesn't,
+the panel says so rather than failing silently.
 
 The generic webhook payload:
 
@@ -381,7 +422,7 @@ Clicking opens a panel with seven tabs:
 | **Notifications** | Enable channels, paste webhook URLs, send a test notification |
 | **Configuration** | Timeouts, snapshots, start-stopped behaviour |
 | **Logs & Reports** | Keep-or-discard, retention period, where they live, how much space, purge, and browse past runs |
-| **Maintenance** | Version and update check, recent run history, uninstall |
+| **Maintenance** | Version check and update, changelog, confirmation preference, run history, uninstall |
 
 ### Per-guest updates
 
@@ -429,18 +470,41 @@ pve-autoupdate-patch-webui apply
 pve-autoupdate-patch-webui remove
 ```
 
-### Update checking and uninstalling from the UI
+### Updating and uninstalling from the UI
 
-The **Maintenance** tab has a *Check for updates* button. It only **reads** the
-published version and tells you — it never installs anything by itself. Applying
-is a separate action behind a typed `UPDATE` confirmation. That split is
-deliberate: automatic self-update would mean a compromised or simply mistaken
-upstream could roll itself onto your node without anyone deciding to.
+*Check for updates* only **reads** the published version — it never installs
+anything by itself. That split is deliberate: automatic self-update would mean a
+compromised or simply mistaken upstream could roll itself onto your node without
+anyone deciding to.
 
-Uninstalling from the UI takes **two independent steps**: a plain-language
-confirmation listing exactly what will be removed, then typing `UNINSTALL`.
-Both self-update and uninstall run detached under systemd, because each one
-restarts or deletes the very service handling the request.
+If an update is available, the **changelog for the new version** is shown next
+to the button, alongside the one before it, so you can see what changes before
+committing to it. The full history lives in
+[CHANGELOG.md](CHANGELOG.md).
+
+While installing, the button is disabled and reports which stage it's at. It
+stays disabled until the **new version number is confirmed running** — not
+merely until the installer exits — because the panel restarts part way through
+and briefly still reports the old version.
+
+Uninstalling takes **two independent steps**: a plain-language confirmation
+listing exactly what will be removed, then typing `UNINSTALL`. Both self-update
+and uninstall run detached under systemd, because each one restarts or deletes
+the very service handling the request.
+
+### Confirmations
+
+Update actions ask before starting by default. If that's only friction for you,
+turn it off in **Maintenance → Confirmations**:
+
+```bash
+CONFIRM_UPDATES="false"
+```
+
+That covers **Update Everything**, **Update Now** and **Install update**.
+Deleting logs and uninstalling always confirm regardless — those cannot be
+undone from the panel. The backend still requires its confirmation token either
+way; the setting only decides whether a human is asked for it.
 
 ### Security
 
