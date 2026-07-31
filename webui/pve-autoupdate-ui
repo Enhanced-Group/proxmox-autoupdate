@@ -2020,9 +2020,19 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  // Starts immediately on click — no confirmation, by deliberate choice
-  // (e229f88). The backend still requires the confirm token, which is supplied
-  // here rather than typed.
+  // Updating the host and every guest cannot be undone and may schedule a
+  // reboot, so it is deliberately not a single click.
+  const typed = await dialog({
+    title: "Update everything now",
+    danger: true,
+    okText: "Update everything",
+    requireText: "UPDATE",
+    message:
+      "This updates the Proxmox host <strong>and every guest</strong> right now." +
+      "<p style='margin:10px 0 0;opacity:.8'>Excluded guests are still skipped. " +
+      "A reboot may be scheduled if the host kernel changes.</p>",
+  });
+  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/run", {dry_run: false, confirm: "UPDATE"});
     msg($("runMsg"), "Full update started.", true);
@@ -2280,9 +2290,19 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  // Starts immediately on click — no confirmation, by deliberate choice
-  // (e229f88). The backend still requires the confirm token, which is supplied
-  // here rather than typed.
+  const me = allGuests.find((g) => g.vmid === VMID);
+  const label = me ? (me.name + " (" + VMID + ")") : ("guest " + VMID);
+  const typed = await dialog({
+    title: "Update " + label,
+    danger: true,
+    okText: "Update now",
+    requireText: "UPDATE",
+    message:
+      "Update <strong>" + label + "</strong> now." +
+      "<p style='margin:10px 0 0;opacity:.8'>Only this guest is touched. The " +
+      "Proxmox host is not updated and no reboot is scheduled.</p>",
+  });
+  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/guest/run", {vmid: VMID, dry_run: false, confirm: "UPDATE"});
     msg($("runMsg"), "Update started.", true);
