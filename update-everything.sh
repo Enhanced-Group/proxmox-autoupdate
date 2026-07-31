@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="3.5.0"
+PAU_VERSION="3.5.1"
 
 set -u
 set -o pipefail
@@ -1099,6 +1099,12 @@ build_text_summary() {
     fi
 }
 
+# >>> PAU-NOTIFIER-BEGIN
+# Everything between these markers is lifted verbatim by the web panel's "Send
+# test notification", so that a test exercises the real notifier rather than a
+# copy of it. Keep the whole notifier inside them: a helper left outside is not
+# a compile error, it is a function that is simply missing at run time.
+
 # ---- Keeping credentials out of the process list ----
 # A process's full command line is readable from /proc by any local user, so an
 # argument is not a safe place for a secret. Webhook URLs are credentials in
@@ -1491,6 +1497,8 @@ notify_slack() {
 notify_webhook() {
     post_webhook "Webhook" "${GENERIC_WEBHOOK_URL}" "$(build_payload generic "$1" "$2")"
 }
+
+# <<< PAU-NOTIFIER-END
 
 notify_all() {
     local subject="$1" body="$2" html_file="$3"
