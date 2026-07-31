@@ -290,6 +290,65 @@ pct rollback <ctid> autoupdate_20260731_230014    # containers
 
 ---
 
+## Notifications
+
+**Entirely optional.** With no channel configured the updates still run on
+schedule — they just run quietly. You can skip setup at install time and add a
+channel later from the panel or the config file; nothing about updating depends
+on it.
+
+| Channel | Config key | Notes |
+|---|---|---|
+| Email | `MAILGUN_*` | The full HTML report |
+| Discord | `DISCORD_WEBHOOK_URL` | Colour-coded embed — green/red/grey for ok/error/dry-run |
+| Slack / Teams | `SLACK_WEBHOOK_URL` | Teams works via an incoming-webhook connector |
+| Generic | `GENERIC_WEBHOOK_URL` | JSON POST — ntfy, Gotify, Home Assistant, n8n, anything |
+
+```bash
+NOTIFY_METHODS="discord,webhook"     # comma-separated; empty = silent
+NOTIFY_ON_FAILURE_ONLY="true"        # stay quiet on clean runs
+```
+
+The generic webhook payload:
+
+```json
+{
+  "title": "[Proxmox] ✓ Update Report - pve01 (31/07/2026 23:00:14)",
+  "message": "Completed successfully\n\nHost: pve01\n...",
+  "status": "success", "dry_run": false, "host": "pve01",
+  "pve_version": "9.2.5", "reboot_scheduled": false,
+  "repeat_offenders": "OGL-Server (101) x3",
+  "counts": {"lxc_updated": 3, "lxc_errors": 0, "vm_updated": 2,
+             "vm_errors": 0, "host_packages": 5}
+}
+```
+
+**Webhook URLs are credentials** — anyone holding one can post to your channel.
+They live in `/etc/proxmox-autoupdate.conf` (`chmod 600`) and are masked in the UI.
+
+There's a **Send test notification** button in the panel. It runs the real
+notifier, so if the test arrives, real reports will too.
+
+A failing notification never fails a run — the updates already happened, and not
+being able to talk about them is the lesser problem.
+
+---
+
+## Running from the Proxmox Shell
+
+Closing the browser tab kills the shell session, which used to kill the update
+with it — leaving `dpkg` half-configured. Two fixes: the script now ignores
+`SIGHUP`, and `--detach` hands the run to systemd so it isn't yours to kill:
+
+```bash
+update-everything.sh --detach
+journalctl -fu pve-autoupdate-run    # watch it
+```
+
+Runs started from the web panel already survive this.
+
+---
+
 ## Web Control Panel
 
 Optional. Adds an **Auto-Update** button to the Proxmox toolbar, immediately to
@@ -299,31 +358,32 @@ the left of *Documentation*:
 [ Auto-Update ] [ Documentation ] [ Create VM ] [ Create CT ]
 ```
 
-Clicking it opens a panel with five tabs:
+Buttons live in the **content toolbar**, next to the controls they belong with:
+
+```
+Node selected:      [ ⟳ Update Everything ● ]  Reboot   Shutdown   Shell   Bulk Actions   Help
+LXC / Linux VM:     [ ⟳ Update Now ]           Start    Shutdown   Console   More   Help
+Windows VM:         (no button — scheduled runs only)
+```
+
+The node button carries a **status dot**: green if the last run was clean, red if
+it reported errors, amber while one is running. Hovering shows when it last ran
+and any guests that keep failing — so problems are visible without opening
+anything.
+
+Clicking opens a panel with seven tabs:
 
 | Tab | What it does |
 |-----|--------------|
 | **Run** | Dry run, or "Update everything now" (requires typing `UPDATE`), with live streaming output |
 | **Exclusions** | Tick-list of every VM and container — choose which ones the scheduled run skips |
 | **Schedule** | Change the cron expression and reboot time — writes both the config and the crontab |
-| **Configuration** | Edit timeouts, snapshot settings and Mailgun credentials |
-| **Past Reports** | Browse and read previous run logs |
+| **Notifications** | Enable channels, paste webhook URLs, send a test notification |
+| **Configuration** | Timeouts, snapshots, start-stopped behaviour |
+| **Logs & Reports** | Keep-or-discard, retention period, where they live, how much space, purge, and browse past runs |
+| **Maintenance** | Version and update check, recent run history, uninstall |
 
 ### Per-guest updates
-
-Every VM and container also gets its own **Auto-Update** tab in its left-hand
-menu, directly below *Permissions*:
-
-```
-Summary · Console · Resources · Network · Options
-Task History · Backup · Replication · Snapshots
-Firewall · Permissions · Auto-Update      ← here
-```
-
-From there you can update **just that guest** — the point being that you don't
-have to run the whole sweep to patch one machine. That tab also has a checkbox
-to exclude the guest from scheduled runs, which writes the same `EXCLUDE_IDS`
-list as the Exclusions tab.
 
 A per-guest run:
 
@@ -369,6 +429,19 @@ pve-autoupdate-patch-webui apply
 pve-autoupdate-patch-webui remove
 ```
 
+### Update checking and uninstalling from the UI
+
+The **Maintenance** tab has a *Check for updates* button. It only **reads** the
+published version and tells you — it never installs anything by itself. Applying
+is a separate action behind a typed `UPDATE` confirmation. That split is
+deliberate: automatic self-update would mean a compromised or simply mistaken
+upstream could roll itself onto your node without anyone deciding to.
+
+Uninstalling from the UI takes **two independent steps**: a plain-language
+confirmation listing exactly what will be removed, then typing `UNINSTALL`.
+Both self-update and uninstall run detached under systemd, because each one
+restarts or deletes the very service handling the request.
+
 ### Security
 
 **Treat access to this port as equivalent to root shell access, and firewall it
@@ -383,6 +456,11 @@ accordingly.**
 - Log reads are confined to the log directory; path traversal is rejected.
 - Guest IDs are validated as numeric and checked against the real guest list
   before being passed to the update script.
+- The status dot needs a credentialed cross-origin read, so the panel returns
+  CORS headers **only** when the Origin's hostname matches this node's — never a
+  wildcard, which credentialed CORS forbids anyway, and never a reflected
+  arbitrary origin, which would let any site read your run status using your
+  cookie.
 
 The service runs as root and is deliberately **not** systemd-sandboxed: those
 protections are inherited by child processes, and `ProtectSystem` would break the
@@ -439,6 +517,16 @@ Logs older than 90 days are automatically pruned on each run.
 ---
 
 ## Uninstall
+
+From the web panel: **Maintenance → Uninstall** (two confirmation steps).
+
+From the shell:
+
+```bash
+pve-autoupdate-uninstall            # installed alongside the updater
+```
+
+Or fetch it:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/main/uninstall.sh | bash

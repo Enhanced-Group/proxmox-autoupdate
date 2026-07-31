@@ -21,6 +21,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -39,6 +40,7 @@ CONFIG_FILE = "/etc/proxmox-autoupdate.conf"
 LOG_DIR = "/var/log/proxmox-autoupdate"
 LOCKFILE = "/var/run/proxmox-autoupdate.lock"
 CRON_MARKER = "# proxmox-autoupdate"
+STATE_FILE = "/var/lib/proxmox-autoupdate/state.json"
 
 # Certificate: prefer the operator's custom cert so the browser trusts this port
 # exactly as it trusts 8006. Falls back to the self-signed node cert.
@@ -91,12 +93,40 @@ def _v_nonempty(v):
     return len(v.strip()) > 0 and "\n" not in v and '"' not in v
 
 
+VALID_METHODS = {"email", "discord", "slack", "webhook"}
+
+
+def _v_methods(v):
+    if v.strip() in ("", "none"):
+        return True
+    return all(part.strip() in VALID_METHODS for part in v.split(",") if part.strip())
+
+
+def _v_url(v):
+    # Empty clears the channel. Otherwise require an https URL — these carry no
+    # authentication of their own, so the URL is the secret.
+    return v == "" or (v.startswith("https://") and " " not in v and len(v) < 2048)
+
+
+def _v_optional_email(v):
+    return v == "" or _v_email(v)
+
+
+def _v_optional(v):
+    return "\n" not in v and '"' not in v
+
+
 EDITABLE_KEYS = {
-    "MAILGUN_API_KEY": _v_nonempty,
-    "MAILGUN_DOMAIN": _v_nonempty,
+    "NOTIFY_METHODS": _v_methods,
+    "NOTIFY_ON_FAILURE_ONLY": _v_bool,
+    "MAILGUN_API_KEY": _v_optional,
+    "MAILGUN_DOMAIN": _v_optional,
     "MAILGUN_REGION": _v_region,
-    "SENDER_EMAIL": _v_email,
-    "RECIPIENT_EMAIL": _v_email,
+    "SENDER_EMAIL": _v_optional_email,
+    "RECIPIENT_EMAIL": _v_optional_email,
+    "DISCORD_WEBHOOK_URL": _v_url,
+    "SLACK_WEBHOOK_URL": _v_url,
+    "GENERIC_WEBHOOK_URL": _v_url,
     "EXCLUDE_IDS": _v_idlist,
     "WINDOWS_UPDATE_TIMEOUT": _v_int,
     "LINUX_UPDATE_TIMEOUT": _v_int,
@@ -106,11 +136,20 @@ EDITABLE_KEYS = {
     "START_STOPPED_LINUX_VMS": _v_bool,
     "SNAPSHOT_BEFORE_UPDATE": _v_bool,
     "SNAPSHOT_KEEP": _v_int,
+    "KEEP_LOGS": _v_bool,
+    "LOG_RETENTION_DAYS": _v_int,
     "UPDATE_SCHEDULE_CRON": _v_cron,
     "REBOOT_TIME": _v_time,
 }
 
-SENSITIVE_KEYS = {"MAILGUN_API_KEY"}
+# Masked in the UI and never overwritten by the masking placeholder. Webhook
+# URLs are included because the URL *is* the credential.
+SENSITIVE_KEYS = {
+    "MAILGUN_API_KEY",
+    "DISCORD_WEBHOOK_URL",
+    "SLACK_WEBHOOK_URL",
+    "GENERIC_WEBHOOK_URL",
+}
 
 
 # --- Job state ----------------------------------------------------------------
@@ -321,6 +360,246 @@ def list_guests():
     return guests, None
 
 
+def read_state():
+    """Run history written by update-everything.sh. Absent before the first run."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def repeat_offenders_text():
+    guests = read_state().get("guests") or {}
+    items = [
+        (gid, g) for gid, g in guests.items()
+        if isinstance(g, dict) and (g.get("consecutive_failures") or 0) > 1
+    ]
+    items.sort(key=lambda kv: -kv[1]["consecutive_failures"])
+    return ", ".join(
+        "%s (%s) x%d" % (g.get("name") or "guest", gid, g["consecutive_failures"])
+        for gid, g in items
+    )
+
+
+def log_stats():
+    """Total size and count of the log directory, for the UI to display."""
+    total = count = 0
+    oldest = None
+    if os.path.isdir(LOG_DIR):
+        for name in os.listdir(LOG_DIR):
+            if not name.endswith(".log"):
+                continue
+            try:
+                st = os.stat(os.path.join(LOG_DIR, name))
+            except OSError:
+                continue
+            total += st.st_size
+            count += 1
+            if oldest is None or st.st_mtime < oldest:
+                oldest = st.st_mtime
+    return {"dir": LOG_DIR, "bytes": total, "count": count, "oldest": oldest}
+
+
+def purge_logs(keep_current=True):
+    """Delete stored logs. The log of a run in progress is kept by default."""
+    current = None
+    if keep_current:
+        snap = JOB.snapshot()
+        if snap["running"] and snap["log"]:
+            current = snap["log"]
+    removed = 0
+    if os.path.isdir(LOG_DIR):
+        for name in os.listdir(LOG_DIR):
+            if not name.endswith(".log") or name == current:
+                continue
+            try:
+                os.remove(os.path.join(LOG_DIR, name))
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def send_test_notification(cfg):
+    """Fire a sample notification through every configured channel.
+
+    Reuses update-everything.sh's own notifier rather than reimplementing the
+    payloads here, so a successful test genuinely proves the real path works.
+    """
+    methods = [m.strip() for m in (cfg.get("NOTIFY_METHODS") or "").split(",") if m.strip()]
+    methods = [m for m in methods if m in VALID_METHODS]
+    if not methods:
+        return False, "No notification channels are enabled."
+
+    script = r'''
+set -u
+CONFIG_FILE="%s"
+. "${CONFIG_FILE}"
+HOST_NAME=$(hostname -f 2>/dev/null || hostname)
+TIMESTAMP=$(date '+%%d/%%m/%%Y %%H:%%M:%%S')
+ERRORS_OCCURRED=false; DRY_RUN=false; KEEP_LOGS=false; LOG_FILE=""
+REBOOT_NEEDED=false; REPEAT_OFFENDERS=""; PVE_VERSION_AFTER=$(pveversion 2>/dev/null | awk '{print $1}')
+LXC_UPDATED=0 LXC_ERRORS=0 VM_UPDATED=0 VM_ERRORS=0 HOST_PKG_COUNT=0
+C_GREEN='' C_RED='' C_BOLD='' C_NC='' C_DIM='' C_YELLOW='' C_CYAN=''
+print_ok()   { echo "OK: $1"; }
+print_fail() { echo "FAIL: $1"; }
+%s
+BODY="This is a test notification from Proxmox Auto-Update on ${HOST_NAME}.
+
+If you can read this, the channel is configured correctly.
+No update was run."
+for m in %s; do
+    case "$m" in
+        email)   notify_email   "[Proxmox] Test notification" "$BODY" "" ;;
+        discord) notify_discord "[Proxmox] Test notification" "$BODY" ;;
+        slack)   notify_slack   "[Proxmox] Test notification" "$BODY" ;;
+        webhook) notify_webhook "[Proxmox] Test notification" "$BODY" ;;
+    esac
+done
+'''
+    # Lift the notifier verbatim out of the update script.
+    try:
+        with open(UPDATE_SCRIPT, encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError as exc:
+        return False, "Cannot read %s: %s" % (UPDATE_SCRIPT, exc)
+
+    start = src.find("PAYLOAD_HELPER='")
+    end = src.find("notify_all()")
+    if start < 0 or end < 0 or end <= start:
+        return False, "Could not locate the notification helpers in the update script."
+    helpers = src[start:end]
+
+    # Email needs the HTML file argument; a plain-text body is fine for a test.
+    body_file = ""
+    if "email" in methods:
+        fd, body_file = tempfile.mkstemp(suffix=".html")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("<p>This is a <strong>test notification</strong> from "
+                     "Proxmox Auto-Update.</p><p>If you can read this, email is "
+                     "configured correctly. No update was run.</p>")
+        script = script.replace('notify_email   "[Proxmox] Test notification" "$BODY" ""',
+                                'notify_email   "[Proxmox] Test notification" "$BODY" "%s"'
+                                % body_file)
+
+    full = script % (CONFIG_FILE, helpers, " ".join(methods))
+    try:
+        res = subprocess.run(["bash", "-c", full], capture_output=True,
+                             text=True, timeout=120)
+        output = (res.stdout + res.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "Test failed to run: %s" % exc
+    finally:
+        if body_file:
+            try:
+                os.remove(body_file)
+            except OSError:
+                pass
+
+    ok = "FAIL:" not in output and output != ""
+    return ok, output or "No output from the notifier."
+
+
+GITHUB_REPO = "Enhanced-Group/proxmox-autoupdate"
+GITHUB_RAW = "https://raw.githubusercontent.com/%s/main" % GITHUB_REPO
+INSTALL_SCRIPT_URL = "%s/install.sh" % GITHUB_RAW
+UNINSTALL_SCRIPT = "/usr/local/bin/pve-autoupdate-uninstall"
+
+
+def installed_version():
+    try:
+        with open(UPDATE_SCRIPT, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'\s*PAU_VERSION="([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _version_tuple(v):
+    parts = []
+    for chunk in re.split(r"[.\-+]", v):
+        parts.append(int(chunk) if chunk.isdigit() else 0)
+    return tuple(parts or [0])
+
+
+def check_for_updates():
+    """Read-only version check against the published update script.
+
+    Deliberately only *reports*. Applying is a separate, explicitly confirmed
+    action, so a compromised or mistaken upstream cannot roll itself out
+    silently onto a node that merely looked.
+    """
+    current = installed_version()
+    req = urllib.request.Request(
+        "%s/update-everything.sh" % GITHUB_RAW,
+        headers={"User-Agent": "proxmox-autoupdate"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            head = resp.read(4096).decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
+        return {"current": current, "latest": None,
+                "error": "Could not reach GitHub: %s" % exc}
+
+    m = re.search(r'PAU_VERSION="([^"]+)"', head)
+    if not m:
+        return {"current": current, "latest": None,
+                "error": "Could not read a version from the published script."}
+
+    latest = m.group(1)
+    try:
+        behind = _version_tuple(latest) > _version_tuple(current)
+    except ValueError:
+        behind = latest != current
+    return {
+        "current": current,
+        "latest": latest,
+        "update_available": bool(behind),
+        "repo": "https://github.com/%s" % GITHUB_REPO,
+        "command": "curl -sSL %s | bash" % INSTALL_SCRIPT_URL,
+    }
+
+
+def run_detached(command, unit):
+    """Run a command owned by systemd rather than by this service.
+
+    Required for self-update and uninstall: both restart or delete this very
+    process, so anything still parented to it would be killed part way through.
+    """
+    if shutil_which("systemd-run"):
+        subprocess.run(["systemctl", "reset-failed", unit + ".service"],
+                       capture_output=True, timeout=10)
+        res = subprocess.run(
+            ["systemd-run", "--unit", unit, "--collect",
+             "--description", "proxmox-autoupdate maintenance",
+             "/bin/bash", "-c", command],
+            capture_output=True, text=True, timeout=20)
+        if res.returncode == 0:
+            return True, unit
+        return False, (res.stderr.strip() or "systemd-run failed")
+
+    try:
+        subprocess.Popen(["/bin/bash", "-c", command],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        return True, "detached process"
+    except OSError as exc:
+        return False, str(exc)
+
+
+def shutil_which(name):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def read_crontab():
     try:
         res = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
@@ -468,6 +747,31 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[ui] %s - %s\n" % (self.address_string(), fmt % args))
 
+    def _allowed_origin(self):
+        """Echo the Origin back only when it is this same host on another port.
+
+        The Proxmox UI runs on :8006 and this panel on :8007, so the status dot
+        is a cross-origin credentialed request. Credentialed CORS forbids '*',
+        and reflecting arbitrary origins would let any site read run status
+        using the visitor's cookie — so the hostname must match exactly.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(origin)
+        except ValueError:
+            return None
+        if parsed.scheme != "https" or not parsed.hostname:
+            return None
+
+        host_header = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        candidates = {host_header.lower()} if host_header else set()
+        candidates.discard("")
+        if parsed.hostname.lower() in candidates:
+            return origin
+        return None
+
     def _send(self, code, body, ctype="application/json", extra=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -476,6 +780,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        allowed = self._allowed_origin()
+        if allowed:
+            self.send_header("Access-Control-Allow-Origin", allowed)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
         # Allow the Proxmox UI (any origin/port on this host) to frame us, but
         # nothing else may embed this control panel.
         self.send_header("Content-Security-Policy",
@@ -559,7 +868,33 @@ class Handler(BaseHTTPRequestHandler):
             status["lock_held"] = lock_is_held() and not status["running"]
             status["schedule"] = current_schedule()
             status["user"] = user
+            status["version"] = installed_version()
             self._json(200, status)
+        elif path == "/api/state":
+            # Consumed cross-origin by the toolbar button's status dot.
+            state = read_state()
+            snap = JOB.snapshot()
+            self._json(200, {
+                "running": snap["running"] or lock_is_held(),
+                "last_run": state.get("last_run") or {},
+                "repeat_offenders": repeat_offenders_text(),
+                "version": installed_version(),
+            })
+        elif path == "/api/history":
+            state = read_state()
+            self._json(200, {
+                "runs": state.get("runs") or [],
+                "guests": state.get("guests") or {},
+                "repeat_offenders": repeat_offenders_text(),
+            })
+        elif path == "/api/logs/stats":
+            cfg = read_config()
+            stats = log_stats()
+            stats["keep_logs"] = (cfg.get("KEEP_LOGS") or "true")
+            stats["retention_days"] = (cfg.get("LOG_RETENTION_DAYS") or "90")
+            self._json(200, stats)
+        elif path == "/api/self/version":
+            self._json(200, {"version": installed_version()})
         elif path == "/api/config":
             cfg = read_config()
             payload = {k: cfg.get(k, "") for k in EDITABLE_KEYS}
@@ -623,8 +958,79 @@ class Handler(BaseHTTPRequestHandler):
             self._save_config(body)
         elif path == "/api/schedule":
             self._save_schedule(body)
+        elif path == "/api/notify/test":
+            self._test_notification()
+        elif path == "/api/logs/purge":
+            removed = purge_logs()
+            self._json(200, {"removed": removed})
+        elif path == "/api/self/check":
+            self._json(200, check_for_updates())
+        elif path == "/api/self/update":
+            self._self_update(body, user)
+        elif path == "/api/self/uninstall":
+            self._self_uninstall(body, user)
         else:
             self._json(404, {"error": "Not found"})
+
+    def _test_notification(self):
+        ok, detail = send_test_notification(read_config())
+        self._json(200 if ok else 400, {"ok": ok, "detail": detail})
+
+    def _self_update(self, body, user):
+        if body.get("confirm") != "UPDATE":
+            self._json(400, {"error": "Self-update requires an explicit confirmation."})
+            return
+        if JOB.snapshot()["running"] or lock_is_held():
+            self._json(409, {"error": "An update run is in progress — wait for it to finish."})
+            return
+
+        # Runs detached: the installer replaces this very script and restarts
+        # this service, so it cannot be a child of the request handling it.
+        command = ("curl -fsSL %s -o /tmp/pau-install.sh && "
+                   "bash /tmp/pau-install.sh --unattended; "
+                   "rm -f /tmp/pau-install.sh" % INSTALL_SCRIPT_URL)
+        ok, detail = run_detached(command, "pve-autoupdate-selfupdate")
+        if not ok:
+            self._json(500, {"error": "Could not start the update: %s" % detail})
+            return
+        sys.stderr.write("[ui] self-update started by %s\n" % user)
+        self._json(200, {
+            "started": True,
+            "detail": "Update started as %s. This panel will restart; "
+                      "reload in about a minute." % detail,
+        })
+
+    def _self_uninstall(self, body, user):
+        # Two independent gates: the typed word, and an explicit acknowledgement
+        # that this removes the panel serving the request.
+        if body.get("confirm") != "UNINSTALL":
+            self._json(400, {"error": "Type UNINSTALL to confirm."})
+            return
+        if not body.get("acknowledged"):
+            self._json(400, {"error": "Acknowledgement required."})
+            return
+        if JOB.snapshot()["running"] or lock_is_held():
+            self._json(409, {"error": "An update run is in progress — wait for it to finish."})
+            return
+
+        purge = " --purge" if body.get("purge") else ""
+        if os.path.isfile(UNINSTALL_SCRIPT):
+            command = "%s --yes%s" % (UNINSTALL_SCRIPT, purge)
+        else:
+            command = ("curl -fsSL %s/uninstall.sh -o /tmp/pau-uninstall.sh && "
+                       "bash /tmp/pau-uninstall.sh --yes%s; "
+                       "rm -f /tmp/pau-uninstall.sh" % (GITHUB_RAW, purge))
+
+        ok, detail = run_detached(command, "pve-autoupdate-uninstall")
+        if not ok:
+            self._json(500, {"error": "Could not start the uninstall: %s" % detail})
+            return
+        sys.stderr.write("[ui] uninstall started by %s (purge=%s)\n" % (user, bool(purge)))
+        self._json(200, {
+            "started": True,
+            "detail": "Uninstall started as %s. This panel will stop responding "
+                      "shortly — that is expected." % detail,
+        })
 
     def _run(self, body, user):
         dry = bool(body.get("dry_run", True))
@@ -844,8 +1250,10 @@ PAGE_TEMPLATE = r"""<!doctype html>
   <button data-tab="run" class="active">Run</button>
   <button data-tab="exclusions">Exclusions</button>
   <button data-tab="schedule">Schedule</button>
+  <button data-tab="notify">Notifications</button>
   <button data-tab="config">Configuration</button>
-  <button data-tab="logs">Past Reports</button>
+  <button data-tab="logs">Logs &amp; Reports</button>
+  <button data-tab="maint">Maintenance</button>
 </div>
 
 <!-- RUN -->
@@ -928,6 +1336,86 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
 </section>
 
+<!-- NOTIFICATIONS -->
+<section id="tab-notify" class="hidden">
+  <div class="card">
+    <h2>Channels</h2>
+    <div class="hint" style="margin-bottom:10px">
+      Notifications are optional. With none enabled the updates still run on
+      schedule — they just run quietly. You can add a channel at any time.
+    </div>
+    <div class="row" style="gap:16px;margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_email" style="width:auto"><span>Email (Mailgun)</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_discord" style="width:auto"><span>Discord</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_slack" style="width:auto"><span>Slack / Teams</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_webhook" style="width:auto"><span>Generic webhook</span></label>
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="failOnly" style="width:auto">
+      <span>Only notify when something fails</span>
+    </label>
+    <div class="hint">A weekly "nothing happened" message trains you to ignore the channel.</div>
+  </div>
+
+  <div class="card" id="cardEmail">
+    <h2>Email (Mailgun)</h2>
+    <div class="grid">
+      <div><label for="cfg2_MAILGUN_API_KEY">API key</label>
+        <input type="password" id="cfg2_MAILGUN_API_KEY" data-key="MAILGUN_API_KEY"></div>
+      <div><label for="cfg2_MAILGUN_DOMAIN">Domain</label>
+        <input id="cfg2_MAILGUN_DOMAIN" data-key="MAILGUN_DOMAIN"></div>
+      <div><label for="cfg2_MAILGUN_REGION">Region</label>
+        <select id="cfg2_MAILGUN_REGION" data-key="MAILGUN_REGION">
+          <option>EU</option><option>US</option></select></div>
+      <div><label for="cfg2_SENDER_EMAIL">Sender</label>
+        <input id="cfg2_SENDER_EMAIL" data-key="SENDER_EMAIL"></div>
+      <div><label for="cfg2_RECIPIENT_EMAIL">Recipient</label>
+        <input id="cfg2_RECIPIENT_EMAIL" data-key="RECIPIENT_EMAIL"></div>
+    </div>
+  </div>
+
+  <div class="card" id="cardDiscord">
+    <h2>Discord</h2>
+    <label for="cfg2_DISCORD_WEBHOOK_URL">Webhook URL</label>
+    <input type="password" id="cfg2_DISCORD_WEBHOOK_URL" data-key="DISCORD_WEBHOOK_URL"
+           placeholder="https://discord.com/api/webhooks/...">
+    <div class="hint">Server Settings → Integrations → Webhooks → New Webhook → Copy URL.
+      Treat it as a secret: anyone with the URL can post to that channel.</div>
+  </div>
+
+  <div class="card" id="cardSlack">
+    <h2>Slack / Teams</h2>
+    <label for="cfg2_SLACK_WEBHOOK_URL">Webhook URL</label>
+    <input type="password" id="cfg2_SLACK_WEBHOOK_URL" data-key="SLACK_WEBHOOK_URL"
+           placeholder="https://hooks.slack.com/services/...">
+    <div class="hint">Teams works too via an incoming-webhook connector.</div>
+  </div>
+
+  <div class="card" id="cardWebhook">
+    <h2>Generic webhook</h2>
+    <label for="cfg2_GENERIC_WEBHOOK_URL">URL</label>
+    <input type="password" id="cfg2_GENERIC_WEBHOOK_URL" data-key="GENERIC_WEBHOOK_URL"
+           placeholder="https://...">
+    <div class="hint">Receives a JSON POST with title, message, status, host,
+      counts and reboot_scheduled — works with ntfy, Gotify, Home Assistant, n8n.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnSaveNotify" class="primary">Save notification settings</button>
+      <button id="btnTestNotify">Send test notification</button>
+    </div>
+    <div class="hint">The test uses the same code path as a real run, so if it
+      arrives, real reports will too.</div>
+    <div id="notifyMsg" class="msg"></div>
+    <pre id="notifyOut" class="hidden" style="margin-top:10px"></pre>
+  </div>
+</section>
+
 <!-- CONFIG -->
 <section id="tab-config" class="hidden">
   <div class="card">
@@ -944,12 +1432,78 @@ PAGE_TEMPLATE = r"""<!doctype html>
 <!-- LOGS -->
 <section id="tab-logs" class="hidden">
   <div class="card">
+    <h2>Log storage</h2>
+    <div class="grid">
+      <div><label for="keepLogs">Keep logs on disk</label>
+        <select id="keepLogs"><option value="true">Yes</option><option value="false">No</option></select>
+        <div class="hint">"No" still streams a run live, then deletes it afterwards.</div>
+      </div>
+      <div><label for="retentionDays">Delete logs older than (days)</label>
+        <input id="retentionDays" type="number" min="0">
+        <div class="hint">0 keeps them forever. Pruned at the start of every run.</div>
+      </div>
+      <div><label>Location</label>
+        <input id="logPath" readonly>
+        <div class="hint" id="logUsage">—</div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnSaveLogCfg" class="primary">Save log settings</button>
+      <button id="btnPurgeLogs" class="danger">Delete all stored logs</button>
+    </div>
+    <div id="logCfgMsg" class="msg"></div>
+  </div>
+  <div class="card">
     <h2>Past reports</h2>
     <table><tbody id="logList"></tbody></table>
   </div>
   <div class="card">
     <h2>Selected log</h2>
     <pre id="logFile">Select a log above.</pre>
+  </div>
+</section>
+
+<!-- MAINTENANCE -->
+<section id="tab-maint" class="hidden">
+  <div class="card">
+    <h2>Version</h2>
+    <div class="row">
+      <div>Installed: <strong id="verInstalled">—</strong></div>
+      <button id="btnCheckUpdate">Check for updates</button>
+    </div>
+    <div id="verMsg" class="msg"></div>
+    <div id="verActions" class="row hidden" style="margin-top:10px">
+      <button id="btnSelfUpdate" class="primary">Install update now</button>
+    </div>
+    <div class="hint">Checking only reads the published version — it never
+      installs anything on its own. Updating is always a deliberate action.</div>
+  </div>
+
+  <div class="card">
+    <h2>Recent runs</h2>
+    <table>
+      <thead><tr><th>When</th><th>Result</th><th>Scope</th><th>Failed</th></tr></thead>
+      <tbody id="histList"><tr><td colspan="4">Loading…</td></tr></tbody>
+    </table>
+    <div id="offenders" class="hint"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="color:var(--err)">Uninstall</h2>
+    <div class="hint" style="margin-bottom:10px">
+      Removes the updater, its schedule, this control panel and the Proxmox UI
+      button. The Proxmox UI file is restored exactly as pve-manager shipped it.
+      Guest snapshots named <code>autoupdate_*</code> are left alone.
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="purgeToo" style="width:auto">
+      <span>Also delete the configuration and all logs</span>
+    </label>
+    <div class="hint">Leave unticked to keep your settings for a future reinstall.</div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnUninstall" class="danger">Uninstall…</button>
+    </div>
+    <div id="uninstallMsg" class="msg"></div>
   </div>
 </section>
 
@@ -1001,13 +1555,194 @@ document.querySelectorAll(".tabs button").forEach((btn) => {
   btn.onclick = () => {
     document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
-    ["run", "exclusions", "schedule", "config", "logs"].forEach((name) => {
+    ["run", "exclusions", "schedule", "notify", "config", "logs", "maint"].forEach((name) => {
       $("tab-" + name).classList.toggle("hidden", name !== btn.dataset.tab);
     });
-    if (btn.dataset.tab === "logs") loadLogList();
+    if (btn.dataset.tab === "logs") { loadLogList(); loadLogCfg(); }
     if (btn.dataset.tab === "exclusions") loadGuests();
+    if (btn.dataset.tab === "notify") loadNotify();
+    if (btn.dataset.tab === "maint") loadMaint();
   };
 });
+
+// --- notifications ---
+const METHOD_IDS = {email: "m_email", discord: "m_discord",
+                    slack: "m_slack", webhook: "m_webhook"};
+
+function syncNotifyCards() {
+  $("cardEmail").style.display   = $("m_email").checked ? "" : "none";
+  $("cardDiscord").style.display = $("m_discord").checked ? "" : "none";
+  $("cardSlack").style.display   = $("m_slack").checked ? "" : "none";
+  $("cardWebhook").style.display = $("m_webhook").checked ? "" : "none";
+}
+Object.values(METHOD_IDS).forEach((id) => { $(id).onchange = syncNotifyCards; });
+
+async function loadNotify() {
+  try {
+    const data = await api("/api/config");
+    const cfg = data.config, sensitive = data.sensitive;
+    const active = (cfg.NOTIFY_METHODS || "").split(",").map((s) => s.trim());
+    Object.entries(METHOD_IDS).forEach(([m, id]) => { $(id).checked = active.includes(m); });
+    $("failOnly").checked = cfg.NOTIFY_ON_FAILURE_ONLY === "true";
+    document.querySelectorAll("#tab-notify [data-key]").forEach((el) => {
+      const k = el.dataset.key;
+      el.value = sensitive.includes(k) && cfg[k] ? "********" : (cfg[k] || "");
+    });
+    syncNotifyCards();
+  } catch (e) { msg($("notifyMsg"), e.message, false); }
+}
+
+function collectNotify() {
+  const methods = Object.entries(METHOD_IDS)
+    .filter(([, id]) => $(id).checked).map(([m]) => m);
+  const cfg = {
+    NOTIFY_METHODS: methods.join(","),
+    NOTIFY_ON_FAILURE_ONLY: $("failOnly").checked ? "true" : "false",
+  };
+  document.querySelectorAll("#tab-notify [data-key]").forEach((el) => {
+    cfg[el.dataset.key] = el.value;
+  });
+  return cfg;
+}
+
+$("btnSaveNotify").onclick = async () => {
+  try {
+    await post("/api/config", {config: collectNotify()});
+    msg($("notifyMsg"), "Notification settings saved.", true);
+  } catch (e) { msg($("notifyMsg"), e.message, false); }
+};
+
+$("btnTestNotify").onclick = async () => {
+  const btn = $("btnTestNotify");
+  btn.disabled = true; btn.textContent = "Sending…";
+  $("notifyOut").classList.add("hidden");
+  try {
+    // Save first, so the test exercises what is on screen.
+    await post("/api/config", {config: collectNotify()});
+    const res = await post("/api/notify/test", {});
+    msg($("notifyMsg"), res.ok ? "Test sent — check your channel." : "Test reported a problem.", res.ok);
+    $("notifyOut").textContent = res.detail || "";
+    $("notifyOut").classList.remove("hidden");
+  } catch (e) {
+    msg($("notifyMsg"), e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = "Send test notification";
+  }
+};
+
+// --- log settings ---
+async function loadLogCfg() {
+  try {
+    const s = await api("/api/logs/stats");
+    $("keepLogs").value = s.keep_logs === "false" ? "false" : "true";
+    $("retentionDays").value = s.retention_days;
+    $("logPath").value = s.dir;
+    const mb = (s.bytes / 1048576).toFixed(1);
+    $("logUsage").textContent = s.count + " file(s), " + mb + " MB" +
+      (s.oldest ? " · oldest " + new Date(s.oldest * 1000).toLocaleDateString() : "");
+  } catch (e) { msg($("logCfgMsg"), e.message, false); }
+}
+
+$("btnSaveLogCfg").onclick = async () => {
+  try {
+    await post("/api/config", {config: {
+      KEEP_LOGS: $("keepLogs").value,
+      LOG_RETENTION_DAYS: $("retentionDays").value,
+    }});
+    msg($("logCfgMsg"), "Log settings saved.", true);
+    loadLogCfg();
+  } catch (e) { msg($("logCfgMsg"), e.message, false); }
+};
+
+$("btnPurgeLogs").onclick = async () => {
+  if (!confirm("Delete all stored update logs?\n\nThe log of a run in progress is kept.")) return;
+  try {
+    const res = await post("/api/logs/purge", {});
+    msg($("logCfgMsg"), "Deleted " + res.removed + " log file(s).", true);
+    loadLogCfg(); loadLogList();
+  } catch (e) { msg($("logCfgMsg"), e.message, false); }
+};
+
+// --- maintenance ---
+async function loadMaint() {
+  try {
+    const v = await api("/api/self/version");
+    $("verInstalled").textContent = v.version;
+  } catch (e) { $("verInstalled").textContent = "unknown"; }
+
+  try {
+    const h = await api("/api/history");
+    const tbody = $("histList");
+    tbody.innerHTML = "";
+    if (!h.runs.length) {
+      tbody.innerHTML = "<tr><td colspan='4'>No runs recorded yet.</td></tr>";
+    } else {
+      h.runs.forEach((r) => {
+        const tr = document.createElement("tr");
+        const when = r.finished ? new Date(r.finished).toLocaleString() : "—";
+        const bad = (r.result || "").indexOf("error") === 0;
+        tr.innerHTML =
+          "<td>" + when + "</td>" +
+          "<td><span class='pill " + (bad ? "err" : "ok") + "'>" + (r.result || "?") + "</span></td>" +
+          "<td>" + (r.scope || "all") + "</td>" +
+          "<td>" + ((r.failed || []).join(", ") || "—") + "</td>";
+        tbody.appendChild(tr);
+      });
+    }
+    $("offenders").textContent = h.repeat_offenders
+      ? "Repeatedly failing: " + h.repeat_offenders : "";
+  } catch (e) {
+    $("histList").innerHTML = "<tr><td colspan='4'>" + e.message + "</td></tr>";
+  }
+}
+
+$("btnCheckUpdate").onclick = async () => {
+  const btn = $("btnCheckUpdate");
+  btn.disabled = true; btn.textContent = "Checking…";
+  try {
+    const r = await post("/api/self/check", {});
+    if (r.error) {
+      msg($("verMsg"), r.error, false);
+    } else if (r.update_available) {
+      msg($("verMsg"), "Version " + r.latest + " is available (you have " + r.current + ").", true);
+      $("verActions").classList.remove("hidden");
+    } else {
+      msg($("verMsg"), "Up to date (" + r.current + ").", true);
+      $("verActions").classList.add("hidden");
+    }
+  } catch (e) { msg($("verMsg"), e.message, false); }
+  finally { btn.disabled = false; btn.textContent = "Check for updates"; }
+};
+
+$("btnSelfUpdate").onclick = async () => {
+  if (prompt("Install the new version now?\n\nType UPDATE to confirm:") !== "UPDATE") return;
+  try {
+    const r = await post("/api/self/update", {confirm: "UPDATE"});
+    msg($("verMsg"), r.detail, true);
+  } catch (e) { msg($("verMsg"), e.message, false); }
+};
+
+$("btnUninstall").onclick = async () => {
+  const purge = $("purgeToo").checked;
+  // Deliberately two steps: a plain-language confirm, then a typed word.
+  const warning = "This will remove Proxmox Auto-Update from this node:\n\n" +
+    "  • the updater and its schedule\n" +
+    "  • this control panel and its service\n" +
+    "  • the button in the Proxmox UI\n" +
+    (purge ? "  • your configuration and ALL logs\n" : "  • (config and logs will be kept)\n") +
+    "\nThis panel will stop responding once it starts.\n\nContinue?";
+  if (!confirm(warning)) return;
+  if (prompt("Final step.\n\nType UNINSTALL to confirm:") !== "UNINSTALL") {
+    msg($("uninstallMsg"), "Cancelled.", false);
+    return;
+  }
+  try {
+    const r = await post("/api/self/uninstall",
+                         {confirm: "UNINSTALL", acknowledged: true, purge: purge});
+    msg($("uninstallMsg"), r.detail, true);
+    $("btnUninstall").disabled = true;
+  } catch (e) { msg($("uninstallMsg"), e.message, false); }
+};
 
 // --- exclusions ---
 async function loadGuests() {
