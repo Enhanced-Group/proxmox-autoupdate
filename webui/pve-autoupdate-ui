@@ -473,6 +473,19 @@ def send_test_notification(cfg):
 set -u
 CONFIG_FILE="%s"
 . "${CONFIG_FILE}"
+
+# A config written by an older installer will not contain the newer keys, and
+# the notifier runs under `set -u` — without these defaults it aborts on the
+# first unset variable instead of sending anything.
+DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
+DISCORD_USER_ID="${DISCORD_USER_ID:-}"
+SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
+GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL:-}"
+MAILGUN_API_KEY="${MAILGUN_API_KEY:-}"
+SENDER_EMAIL="${SENDER_EMAIL:-}"
+RECIPIENT_EMAIL="${RECIPIENT_EMAIL:-}"
+
 HOST_NAME=$(hostname -f 2>/dev/null || hostname)
 TIMESTAMP=$(date '+%%d/%%m/%%Y %%H:%%M:%%S')
 
@@ -785,6 +798,112 @@ def shutil_which(name):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def _discord_call(url, token, payload=None):
+    """One Discord REST call. Returns (status, parsed_body, raw_text)."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, method="POST" if data is not None else "GET",
+        headers={
+            "Authorization": "Bot %s" % token,
+            "Content-Type": "application/json",
+            "User-Agent": "proxmox-autoupdate (https://github.com/%s, 1.0)" % GITHUB_REPO,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read(4000).decode("utf-8", errors="replace")
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(4000).decode("utf-8", errors="replace")
+        status = exc.code
+    except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
+        return 0, None, str(exc)
+    try:
+        return status, json.loads(raw), raw
+    except ValueError:
+        return status, None, raw
+
+
+def diagnose_discord_dm(cfg):
+    """Walk the DM flow one call at a time and report what each one did.
+
+    A bare "400" is unactionable — it could be the token, the user ID, the bot's
+    server membership, or the message body. Each step is reported separately so
+    the failing one is obvious.
+    """
+    steps = []
+    token = (cfg.get("DISCORD_BOT_TOKEN") or "").strip()
+    token = token[4:].strip() if token.lower().startswith("bot ") else token
+    uid = (cfg.get("DISCORD_USER_ID") or "").strip()
+
+    if not token:
+        return False, [{"step": "Configuration", "ok": False,
+                        "detail": "DISCORD_BOT_TOKEN is empty."}]
+    if not re.fullmatch(r"[0-9]{15,25}", uid):
+        return False, [{"step": "Configuration", "ok": False,
+                        "detail": "DISCORD_USER_ID must be a numeric user ID "
+                                  "(15-25 digits). Got %r." % uid}]
+
+    # 1 — does the token work at all?
+    status, body, raw = _discord_call("https://discord.com/api/v10/users/@me", token)
+    if status == 200 and isinstance(body, dict):
+        steps.append({"step": "Bot token", "ok": True,
+                      "detail": "Authenticated as %s (id %s)."
+                                % (body.get("username", "?"), body.get("id", "?"))})
+        if body.get("id") == uid:
+            steps.append({"step": "User ID", "ok": False,
+                          "detail": "That is the bot's own ID. Use *your* user ID — "
+                                    "a bot cannot DM itself."})
+            return False, steps
+    else:
+        msg = (body or {}).get("message") if isinstance(body, dict) else None
+        steps.append({"step": "Bot token", "ok": False,
+                      "detail": "HTTP %s — %s" % (status, msg or raw[:200])})
+        if status == 401:
+            steps[-1]["detail"] += ("  This is not a valid bot token. Use the token "
+                                    "from Bot → Reset Token, not the client secret "
+                                    "or application ID.")
+        return False, steps
+
+    # 2 — can a DM channel be opened with this recipient?
+    status, body, raw = _discord_call(
+        "https://discord.com/api/v10/users/@me/channels", token,
+        {"recipient_id": uid})
+    if status in (200, 201) and isinstance(body, dict) and body.get("id"):
+        channel = body["id"]
+        steps.append({"step": "Open DM channel", "ok": True,
+                      "detail": "Channel %s opened." % channel})
+    else:
+        msg = (body or {}).get("message") if isinstance(body, dict) else None
+        code = (body or {}).get("code") if isinstance(body, dict) else None
+        detail = "HTTP %s — %s" % (status, msg or raw[:200])
+        if code == 50007:
+            detail += ("  Discord refuses the DM: the bot must share a server with "
+                       "you, and your Privacy Settings for that server must allow "
+                       "direct messages from members.")
+        elif status == 400:
+            detail += ("  Discord rejected the recipient. Check the ID is your own "
+                       "user ID (Developer Mode → right-click yourself → Copy User ID), "
+                       "not a server, channel or message ID.")
+        steps.append({"step": "Open DM channel", "ok": False, "detail": detail})
+        return False, steps
+
+    # 3 — will it accept a message on that channel?
+    status, body, raw = _discord_call(
+        "https://discord.com/api/v10/channels/%s/messages" % channel, token,
+        {"content": "Proxmox Auto-Update: Discord DM test. "
+                    "If you can read this, DM notifications work."})
+    if status in (200, 201):
+        steps.append({"step": "Send message", "ok": True,
+                      "detail": "Test message delivered — check your DMs."})
+        return True, steps
+
+    msg = (body or {}).get("message") if isinstance(body, dict) else None
+    steps.append({"step": "Send message", "ok": False,
+                  "detail": "HTTP %s — %s" % (status, msg or raw[:200])})
+    return False, steps
 
 
 def read_crontab():
@@ -1164,6 +1283,9 @@ class Handler(BaseHTTPRequestHandler):
             self._save_schedule(body)
         elif path == "/api/notify/test":
             self._test_notification()
+        elif path == "/api/notify/diagnose-discord":
+            ok, steps = diagnose_discord_dm(read_config())
+            self._json(200, {"ok": ok, "steps": steps})
         elif path == "/api/logs/purge":
             removed = purge_logs()
             self._json(200, {"removed": removed})
@@ -1416,6 +1538,52 @@ async function confirmUpdate(opts) {
          === "UPDATE";
 }
 
+/* ---- Unsaved changes -----------------------------------------------------
+   Nothing on these tabs saves on its own, and it is easy to edit a field,
+   switch tab and assume it took. Every editable section tracks whether it has
+   been touched since its last save, and says so — on the tab, on the Save
+   button, and on the way out of the page. */
+const dirty = new Set();
+
+function markDirty(section) {
+  if (dirty.has(section)) { return; }
+  dirty.add(section);
+  paintDirty(section, true);
+}
+
+function markClean(section) {
+  if (!dirty.delete(section)) { paintDirty(section, false); return; }
+  paintDirty(section, false);
+}
+
+function paintDirty(section, on) {
+  const tab = document.querySelector('.tabs button[data-tab="' + section + '"]');
+  if (tab) { tab.classList.toggle("dirty", on); }
+  const banner = document.getElementById("unsaved-" + section);
+  if (banner) { banner.classList.toggle("hidden", !on); }
+  const sec = document.getElementById("tab-" + section);
+  if (sec) {
+    sec.querySelectorAll("button.primary").forEach((b) => b.classList.toggle("needs-save", on));
+  }
+}
+
+/* Any input inside a tab marks that tab dirty. Registered once, on the
+   container, so fields added later are covered without re-binding. */
+function watchForChanges() {
+  document.querySelectorAll("section[id^='tab-']").forEach((sec) => {
+    const name = sec.id.replace(/^tab-/, "");
+    const flag = (e) => {
+      if (e.target.matches("input, select, textarea")) { markDirty(name); }
+    };
+    sec.addEventListener("input", flag);
+    sec.addEventListener("change", flag);
+  });
+}
+
+window.addEventListener("beforeunload", (e) => {
+  if (dirty.size) { e.preventDefault(); e.returnValue = ""; }
+});
+
 /* Proxmox-style dialog. Resolves false on cancel, true on confirm, or the typed
    text when `requireText` is set.
 
@@ -1560,6 +1728,23 @@ SHARED_CSS = r"""  :root {
   .tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
   .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
   .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  /* Unsaved changes: a dot on the tab, a pulsing Save button, a banner. */
+  .tabs button.dirty::after {
+    content: "•"; margin-left: 5px; color: var(--warn); font-size: 16px; line-height: 0;
+  }
+  .tabs button.active.dirty::after { color: #fff; }
+  button.needs-save {
+    box-shadow: 0 0 0 2px var(--warn);
+    animation: needsave 1.6s ease-in-out infinite;
+  }
+  @keyframes needsave { 0%,100% { box-shadow: 0 0 0 2px var(--warn) }
+                        50%     { box-shadow: 0 0 0 2px rgba(255,179,0,.35) } }
+  .unsaved {
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(255,179,0,.12); border: 1px solid var(--warn);
+    border-radius: 4px; padding: 7px 10px; margin-bottom: 12px; font-size: 12px;
+  }
+  .unsaved::before { content: "⚠"; color: var(--warn); }
   .hidden { display: none; }
   .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
@@ -1667,6 +1852,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- EXCLUSIONS -->
 <section id="tab-exclusions" class="hidden">
+  <div id="unsaved-exclusions" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Guests excluded from scheduled updates</h2>
     <div class="hint" style="margin-bottom:10px">
@@ -1692,6 +1878,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- SCHEDULE -->
 <section id="tab-schedule" class="hidden">
+  <div id="unsaved-schedule" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Update schedule</h2>
     <div class="grid">
@@ -1726,6 +1913,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- NOTIFICATIONS -->
 <section id="tab-notify" class="hidden">
+  <div id="unsaved-notify" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Channels</h2>
     <div class="hint" style="margin-bottom:10px">
@@ -1822,6 +2010,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div class="row">
       <button id="btnSaveNotify" class="primary">Save notification settings</button>
       <button id="btnTestNotify">Send test notification</button>
+      <button id="btnDiagDiscord">Diagnose Discord DM</button>
     </div>
     <div class="hint">The test uses the same code path as a real run, so if it
       arrives, real reports will too.</div>
@@ -1832,6 +2021,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- CONFIG -->
 <section id="tab-config" class="hidden">
+  <div id="unsaved-config" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Configuration</h2>
     <div id="configForm" class="grid"></div>
@@ -1845,6 +2035,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- LOGS -->
 <section id="tab-logs" class="hidden">
+  <div id="unsaved-logs" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Log storage</h2>
     <div class="grid">
@@ -1879,6 +2070,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- MAINTENANCE -->
 <section id="tab-maint" class="hidden">
+  <div id="unsaved-maint" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Version</h2>
     <div class="row">
@@ -2002,6 +2194,8 @@ function syncNotifyCards() {
 Object.values(METHOD_IDS).forEach((id) => { $(id).onchange = syncNotifyCards; });
 
 async function loadNotify() {
+  // Populating fields is not an edit.
+  setTimeout(() => markClean('notify'), 0);
   try {
     const data = await api("/api/config");
     const cfg = data.config, sensitive = data.sensitive;
@@ -2032,8 +2226,31 @@ function collectNotify() {
 $("btnSaveNotify").onclick = async () => {
   try {
     await post("/api/config", {config: collectNotify()});
+    markClean("notify");
     msg($("notifyMsg"), "Notification settings saved.", true);
   } catch (e) { msg($("notifyMsg"), e.message, false); }
+};
+
+$("btnDiagDiscord").onclick = async () => {
+  const btn = $("btnDiagDiscord");
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Checking…';
+  $("notifyOut").classList.add("hidden");
+  try {
+    // Save first, so the diagnosis reflects what is on screen.
+    await post("/api/config", {config: collectNotify()});
+    markClean("notify");
+    const r = await post("/api/notify/diagnose-discord", {});
+    const lines = r.steps.map((s) => (s.ok ? "PASS  " : "FAIL  ") + s.step + " — " + s.detail);
+    $("notifyOut").textContent = lines.join("\n");
+    $("notifyOut").classList.remove("hidden");
+    msg($("notifyMsg"), r.ok
+        ? "Discord DM works — check your direct messages."
+        : "Discord DM failed. The failing step is shown below.", r.ok);
+  } catch (e) {
+    msg($("notifyMsg"), e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = "Diagnose Discord DM";
+  }
 };
 
 $("btnTestNotify").onclick = async () => {
@@ -2056,6 +2273,7 @@ $("btnTestNotify").onclick = async () => {
 
 // --- log settings ---
 async function loadLogCfg() {
+  setTimeout(() => markClean('logs'), 0);
   try {
     const s = await api("/api/logs/stats");
     $("keepLogs").value = s.keep_logs === "false" ? "false" : "true";
@@ -2073,6 +2291,7 @@ $("btnSaveLogCfg").onclick = async () => {
       KEEP_LOGS: $("keepLogs").value,
       LOG_RETENTION_DAYS: $("retentionDays").value,
     }});
+    markClean("logs");
     msg($("logCfgMsg"), "Log settings saved.", true);
     loadLogCfg();
   } catch (e) { msg($("logCfgMsg"), e.message, false); }
@@ -2189,6 +2408,7 @@ $("btnSaveConfirm").onclick = async () => {
       CONFIRM_UPDATES: $("confirmUpdates").checked ? "true" : "false",
     }});
     CONFIRM_UPDATES = $("confirmUpdates").checked;
+    markClean("maint");
     msg($("confirmMsg"), CONFIRM_UPDATES
         ? "Updates will ask for confirmation."
         : "Updates will start immediately when clicked.", true);
@@ -2221,6 +2441,7 @@ function watchMaintenance() {
 }
 
 async function loadMaint() {
+  setTimeout(() => markClean('maint'), 0);
   loadChangelog();
   try {
     const cfg = (await api("/api/config")).config;
@@ -2349,6 +2570,7 @@ $("btnUninstall").onclick = async () => {
 
 // --- exclusions ---
 async function loadGuests() {
+  setTimeout(() => markClean('exclusions'), 0);
   const tbody = $("guestList");
   try {
     const data = await api("/api/guests");
@@ -2400,6 +2622,7 @@ $("btnSaveExcl").onclick = async () => {
     .filter((b) => b.checked).map((b) => b.dataset.vmid);
   try {
     const res = await post("/api/exclusions", {excluded: ids});
+    markClean("exclusions");
     msg($("exclMsg"), res.excluded.length
         ? "Excluded: " + res.excluded.join(", ")
         : "No guests are excluded.", true);
@@ -2498,6 +2721,7 @@ $("btnSaveSched").onclick = async () => {
     await post("/api/schedule", {cron: $("schedCron").value.trim()});
     const reboot = $("rebootTime").value.trim();
     if (reboot) await post("/api/config", {config: {REBOOT_TIME: reboot}});
+    markClean("schedule");
     msg($("schedMsg"), "Schedule saved and crontab updated.", true);
     poll();
   } catch (e) { msg($("schedMsg"), e.message, false); }
@@ -2534,6 +2758,7 @@ function buildConfigForm(cfg, sensitive) {
 }
 
 async function loadConfig() {
+  setTimeout(() => markClean('config'), 0);
   try {
     const data = await api("/api/config");
     buildConfigForm(data.config, data.sensitive);
@@ -2551,6 +2776,7 @@ $("btnSaveConfig").onclick = async () => {
   });
   try {
     const res = await post("/api/config", {config: cfg});
+    markClean("config");
     msg($("configMsg"), "Saved: " + res.saved.join(", "), true);
   } catch (e) { msg($("configMsg"), e.message, false); }
 };
@@ -2587,6 +2813,7 @@ async function showLog(name) {
   } catch (e) { $("logFile").textContent = e.message; }
 }
 
+watchForChanges();
 loadConfig();
 poll();
 setInterval(poll, 2000);
