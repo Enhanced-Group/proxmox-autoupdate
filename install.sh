@@ -913,6 +913,18 @@ echo ""
 # 8. Interactive Test Run Option
 # Both run modes send the report email, so either one verifies that the Mailgun
 # credentials, region and recipient are actually working end to end.
+#
+# Never offered unattended. The prompt reads EOF there, and the "Enter for 1"
+# default would silently start a full dry run of every guest as part of a
+# self-update — which is both surprising and takes the update lockfile, making
+# the panel report a scheduled run in progress.
+if [ "${UNATTENDED}" = true ]; then
+    echo ""
+    print_ok "Install complete ${C_DIM}(no test run — unattended)${C_NC}"
+    echo ""
+    exit 0
+fi
+
 echo -e "${C_BOLD}── Test Run ────────────────────────────────────────────────${C_NC}"
 echo ""
 echo -e "  ${C_BOLD}Run now to verify the setup?${C_NC}"

@@ -288,15 +288,14 @@ JSBLOCK_HEAD
         Ext.Msg.show({
             title: 'Auto-Update updated',
             message:
-                'Proxmox Auto-Update is now running version <b>' +
-                (version || 'the latest release') + '</b>.<br><br>' +
-                'This page is still running the previous version\'s interface. ' +
-                '<b>Reload every open Proxmox tab</b> to pick up the new one — ' +
-                'a hard refresh (<b>Ctrl+Shift+R</b>) if the buttons look wrong.',
+                'Now running version <b>' + (version || 'the latest release') +
+                '</b>.<br><br>' +
+                'This tab is still showing the previous version\'s interface — ' +
+                'reloading picks up the new one.',
             buttons: Ext.Msg.OKCANCEL,
             buttonText: {ok: 'Reload now', cancel: 'Later'},
             fn: function (choice) {
-                if (choice === 'ok') { window.location.reload(true); }
+                if (choice === 'ok') { window.location.reload(); }
             }
         });
     }
