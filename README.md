@@ -54,6 +54,21 @@ Run this on your Proxmox host **as `root`**:
 curl -sSL https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/main/install.sh | bash
 ```
 
+> **Don't want the web UI?** The installer asks, and the answer defaults to
+> **no** — say no and you get the updater and nothing else: no extra service, no
+> open port, no change to any Proxmox file.
+>
+> If you'd rather run the older release that predates the web UI entirely, it's
+> preserved on the **`no-web-ui`** branch (tag `v2.3-no-web-ui`):
+>
+> ```bash
+> curl -sSL https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/no-web-ui/install.sh | bash
+> ```
+>
+> Note that branch does **not** include the guest-update reliability fixes in
+> v3.0 — it still reports a failed job when `apt` exits non-zero for a benign
+> reason. Prefer `main` with the UI declined.
+
 The installer will prompt for:
 1. Mailgun API key, domain, and region (EU/US)
 2. Sender and recipient email addresses
