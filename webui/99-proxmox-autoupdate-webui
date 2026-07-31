@@ -1,0 +1,9 @@
+// Installed by proxmox-autoupdate.
+//
+// A pve-manager upgrade replaces /usr/share/pve-manager/js/pvemanagerlib.js
+// wholesale, which removes the Auto-Update toolbar button. This hook re-applies
+// it afterwards. The patcher is idempotent and exits immediately when the
+// button is already present, so the cost on unrelated apt runs is one grep.
+DPkg::Post-Invoke {
+    "if [ -x /usr/local/bin/pve-autoupdate-patch-webui ]; then /usr/local/bin/pve-autoupdate-patch-webui apply >/dev/null 2>&1 || true; fi";
+};

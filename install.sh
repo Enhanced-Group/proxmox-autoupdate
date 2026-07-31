@@ -8,7 +8,18 @@ set -euo pipefail
 TARGET_PATH="/usr/local/bin/update-everything.sh"
 CONFIG_FILE="/etc/proxmox-autoupdate.conf"
 LOG_DIR="/var/log/proxmox-autoupdate"
-GITHUB_RAW_URL="https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/main/update-everything.sh"
+# Branch to fetch from when running via `curl | bash`. Override to test a branch
+# before merging:  curl -sSL .../<branch>/install.sh | PAU_BRANCH=<branch> bash
+PAU_BRANCH="${PAU_BRANCH:-main}"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/${PAU_BRANCH}"
+GITHUB_RAW_URL="${GITHUB_RAW_BASE}/update-everything.sh"
+
+# Web control panel
+UI_BIN="/usr/local/bin/pve-autoupdate-ui"
+UI_PATCHER="/usr/local/bin/pve-autoupdate-patch-webui"
+UI_SERVICE="/etc/systemd/system/pve-autoupdate-ui.service"
+UI_APT_HOOK="/etc/apt/apt.conf.d/99-proxmox-autoupdate-webui"
+PVE_JS="/usr/share/pve-manager/js/pvemanagerlib.js"
 
 # --- ANSI Colors ---
 C_RED='\033[0;31m'
@@ -65,6 +76,14 @@ PREV_WIN_TIMEOUT=""
 PREV_START_WIN=""
 PREV_CRON=""
 PREV_REBOOT_TIME=""
+PREV_START_LXC=""
+PREV_START_LINUX_VMS=""
+PREV_LINUX_TIMEOUT=""
+PREV_APT_LOCK=""
+PREV_SNAPSHOT=""
+PREV_SNAPSHOT_KEEP=""
+PREV_WEBUI=""
+PREV_WEBUI_PORT=""
 
 if [ -f "${CONFIG_FILE}" ]; then
     echo ""
@@ -83,6 +102,29 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_START_LINUX_VMS="${START_STOPPED_LINUX_VMS:-}"
     PREV_CRON="${UPDATE_SCHEDULE_CRON:-}"
     PREV_REBOOT_TIME="${REBOOT_TIME:-}"
+    PREV_LINUX_TIMEOUT="${LINUX_UPDATE_TIMEOUT:-}"
+    PREV_APT_LOCK="${APT_LOCK_TIMEOUT:-}"
+    PREV_SNAPSHOT="${SNAPSHOT_BEFORE_UPDATE:-}"
+    PREV_SNAPSHOT_KEEP="${SNAPSHOT_KEEP:-}"
+    PREV_WEBUI="${ENABLE_WEB_UI:-}"
+    PREV_WEBUI_PORT="${WEB_UI_PORT:-}"
+fi
+
+# 1b. Dependencies
+# jq is required: the update script parses every guest-agent reply as JSON, and
+# regex-scraping that output fails silently in ways that look like timeouts.
+echo ""
+print_action "Checking dependencies..."
+if command -v jq >/dev/null 2>&1; then
+    print_ok "jq present"
+else
+    print_action "Installing jq..."
+    if DEBIAN_FRONTEND=noninteractive apt-get install -qy jq >/dev/null 2>&1; then
+        print_ok "jq installed"
+    else
+        print_fail "Could not install jq — run 'apt-get update && apt-get install -y jq' and re-run this installer."
+        exit 1
+    fi
 fi
 
 echo ""
@@ -263,6 +305,101 @@ case "${INPUT_START_LINUX_VMS}" in
 esac
 print_ok "Start stopped Linux VMs: ${START_STOPPED_LINUX_VMS}"
 
+# --- Linux Update Timeout ---
+echo ""
+DEFAULT_LINUX_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
+echo -e "  ${C_DIM}How long a Linux guest gets to finish its upgrade before being"
+echo -e "  reported as timed out. A large dist-upgrade on a slow mirror can"
+echo -e "  easily exceed 10 minutes.${C_NC}"
+read -rp "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: " INPUT_LINUX_TIMEOUT < /dev/tty
+LINUX_UPDATE_TIMEOUT="${INPUT_LINUX_TIMEOUT:-${DEFAULT_LINUX_TIMEOUT}}"
+print_ok "Linux timeout: ${LINUX_UPDATE_TIMEOUT}s"
+
+# --- APT Lock Timeout ---
+echo ""
+DEFAULT_APT_LOCK="${PREV_APT_LOCK:-600}"
+echo -e "  ${C_DIM}How long apt waits for the dpkg lock inside a guest. Distros with"
+echo -e "  unattended-upgrades enabled (Ubuntu by default) fail with exit code"
+echo -e "  100 if this is 0 and the two happen to overlap.${C_NC}"
+read -rp "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: " INPUT_APT_LOCK < /dev/tty
+APT_LOCK_TIMEOUT="${INPUT_APT_LOCK:-${DEFAULT_APT_LOCK}}"
+print_ok "APT lock wait: ${APT_LOCK_TIMEOUT}s"
+
+# --- Pre-update Snapshots ---
+echo ""
+echo -e "  ${C_BOLD}Take a snapshot of each guest before updating it?${C_NC}"
+echo -e "  ${C_DIM}(Needs a snapshot-capable storage backend: ZFS, LVM-thin, qcow2.${C_NC}"
+echo -e "  ${C_DIM} Uses disk space, but gives you a one-command rollback.)${C_NC}"
+DEFAULT_SNAPSHOT="${PREV_SNAPSHOT:-false}"
+if [ "${DEFAULT_SNAPSHOT}" = "true" ]; then
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No"
+else
+    echo -e "    ${C_CYAN}1)${C_NC} Yes"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+fi
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_SNAPSHOT < /dev/tty
+case "${INPUT_SNAPSHOT}" in
+    1) SNAPSHOT_BEFORE_UPDATE="true" ;;
+    2) SNAPSHOT_BEFORE_UPDATE="false" ;;
+    *) SNAPSHOT_BEFORE_UPDATE="${DEFAULT_SNAPSHOT}" ;;
+esac
+print_ok "Pre-update snapshots: ${SNAPSHOT_BEFORE_UPDATE}"
+
+DEFAULT_SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
+if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
+    read -rp "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: " INPUT_SNAPSHOT_KEEP < /dev/tty
+    SNAPSHOT_KEEP="${INPUT_SNAPSHOT_KEEP:-${DEFAULT_SNAPSHOT_KEEP}}"
+    print_ok "Keeping ${SNAPSHOT_KEEP} snapshot(s) per guest"
+else
+    SNAPSHOT_KEEP="${DEFAULT_SNAPSHOT_KEEP}"
+fi
+
+# --- Web Control Panel ---
+echo ""
+echo -e "  ${C_BOLD}Add an 'Auto-Update' button to the Proxmox web UI?${C_NC}"
+echo -e "  ${C_DIM}Places a button in the toolbar, left of Documentation. It opens a${C_NC}"
+echo -e "  ${C_DIM}panel to run updates, edit the schedule and config, and read logs.${C_NC}"
+echo -e "  ${C_DIM}Only root@pam can use it; access is authorised by your existing${C_NC}"
+echo -e "  ${C_DIM}Proxmox login session.${C_NC}"
+DEFAULT_WEBUI="${PREV_WEBUI:-false}"
+if [ "${DEFAULT_WEBUI}" = "true" ]; then
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No"
+else
+    echo -e "    ${C_CYAN}1)${C_NC} Yes"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+fi
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_WEBUI < /dev/tty
+case "${INPUT_WEBUI}" in
+    1) ENABLE_WEB_UI="true" ;;
+    2) ENABLE_WEB_UI="false" ;;
+    *) ENABLE_WEB_UI="${DEFAULT_WEBUI}" ;;
+esac
+
+WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
+if [ "${ENABLE_WEB_UI}" = "true" ]; then
+    read -rp "  Port for the control panel [Enter for ${WEB_UI_PORT}]: " INPUT_WEBUI_PORT < /dev/tty
+    WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
+    print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
+else
+    print_ok "Web control panel: disabled"
+fi
+
+# --- Validate numeric inputs before writing them out ---
+for NUM_PAIR in "WINDOWS_UPDATE_TIMEOUT:${WINDOWS_UPDATE_TIMEOUT}" \
+                "LINUX_UPDATE_TIMEOUT:${LINUX_UPDATE_TIMEOUT}" \
+                "APT_LOCK_TIMEOUT:${APT_LOCK_TIMEOUT}" \
+                "SNAPSHOT_KEEP:${SNAPSHOT_KEEP}" \
+                "WEB_UI_PORT:${WEB_UI_PORT}"; do
+    NUM_NAME="${NUM_PAIR%%:*}"
+    NUM_VALUE="${NUM_PAIR#*:}"
+    if ! [[ "${NUM_VALUE}" =~ ^[0-9]+$ ]]; then
+        echo ""
+        print_fail "${NUM_NAME} must be a positive integer (got '${NUM_VALUE}')"
+        exit 1
+    fi
+done
 
 # --- Schedule & Reboot Settings ---
 echo ""
@@ -323,6 +460,30 @@ EXCLUDE_IDS="${EXCLUDE_IDS}"
 # Windows Update timeout in seconds (default: 1200 = 20 minutes)
 WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT}"
 
+# How long a Linux guest gets to finish its upgrade (default: 1800 = 30 minutes)
+LINUX_UPDATE_TIMEOUT="${LINUX_UPDATE_TIMEOUT}"
+
+# How long apt waits for the dpkg lock inside a guest, in seconds.
+# Prevents spurious "exit code 100" failures when unattended-upgrades is
+# running at the same time (default: 600 = 10 minutes)
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT}"
+
+# Take a snapshot of each guest before updating it? ("true" or "false")
+# Requires snapshot-capable storage (ZFS, LVM-thin, qcow2).
+SNAPSHOT_BEFORE_UPDATE="${SNAPSHOT_BEFORE_UPDATE}"
+
+# How many auto-generated snapshots to keep per guest before pruning the oldest
+SNAPSHOT_KEEP="${SNAPSHOT_KEEP}"
+
+# Report what would be updated without changing anything ("true" or "false").
+# Leave this false for the scheduled run — use 'update-everything.sh --dry-run'
+# when you want a one-off preview.
+DRY_RUN="false"
+
+# Web control panel (toolbar button in the Proxmox UI)
+ENABLE_WEB_UI="${ENABLE_WEB_UI}"
+WEB_UI_PORT="${WEB_UI_PORT}"
+
 # Start stopped Windows VMs to update them? ("true" or "false")
 START_STOPPED_WINDOWS="${START_STOPPED_WINDOWS}"
 
@@ -357,6 +518,125 @@ chmod +x "${TARGET_PATH}"
 # 5. Create log directory
 mkdir -p "${LOG_DIR}"
 print_ok "Log directory: ${C_DIM}${LOG_DIR}/${C_NC}"
+
+# 5b. Web control panel
+# Fetch a support file either from the checkout we were run from, or from GitHub.
+# Downloads go to a temp file first so a failed fetch can't leave a truncated
+# executable in place of a working one.
+fetch_asset() {
+    local rel="$1" dest="$2"
+    if [ -f "${rel}" ]; then
+        cp -f "${rel}" "${dest}"
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp) || return 1
+    if curl -fsSL "${GITHUB_RAW_BASE}/${rel}" -o "${tmp}" && [ -s "${tmp}" ]; then
+        mv -f "${tmp}" "${dest}"
+        return 0
+    fi
+    rm -f "${tmp}"
+    print_fail "Could not download ${rel} from ${GITHUB_RAW_BASE}"
+    return 1
+}
+
+if [ "${ENABLE_WEB_UI}" = "true" ]; then
+    print_action "Installing web control panel..."
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        print_fail "python3 not found — required by the control panel."
+        print_fail "Install it with 'apt-get install -y python3', then re-run this installer."
+        exit 1
+    fi
+
+    UI_FETCH_OK=true
+    fetch_asset "webui/pve-autoupdate-ui" "${UI_BIN}"              || UI_FETCH_OK=false
+    fetch_asset "webui/patch-webui.sh" "${UI_PATCHER}"             || UI_FETCH_OK=false
+    fetch_asset "webui/pve-autoupdate-ui.service" "${UI_SERVICE}"  || UI_FETCH_OK=false
+    fetch_asset "webui/99-proxmox-autoupdate-webui" "${UI_APT_HOOK}" || UI_FETCH_OK=false
+    if [ "${UI_FETCH_OK}" != true ]; then
+        print_fail "Web control panel files could not be installed — skipping it."
+        print_fail "The scheduled updates themselves are unaffected."
+        ENABLE_WEB_UI="false"
+    fi
+fi
+
+if [ "${ENABLE_WEB_UI}" = "true" ]; then
+    chmod +x "${UI_BIN}" "${UI_PATCHER}"
+    chmod 644 "${UI_SERVICE}" "${UI_APT_HOOK}"
+
+    # The port lives in the unit file's environment, not the shell config, so the
+    # service picks it up without sourcing a root-only file.
+    if ! grep -q "^Environment=PAU_UI_PORT=" "${UI_SERVICE}"; then
+        sed -i "/^\[Service\]/a Environment=PAU_UI_PORT=${WEB_UI_PORT}" "${UI_SERVICE}"
+    else
+        sed -i "s|^Environment=PAU_UI_PORT=.*|Environment=PAU_UI_PORT=${WEB_UI_PORT}|" "${UI_SERVICE}"
+    fi
+
+    systemctl daemon-reload
+    systemctl enable pve-autoupdate-ui.service >/dev/null 2>&1 || true
+    if systemctl restart pve-autoupdate-ui.service; then
+        print_ok "Service running on port ${WEB_UI_PORT}"
+    else
+        print_fail "Service failed to start — check: journalctl -u pve-autoupdate-ui -n 50"
+    fi
+
+    # --- Certificate situation ---
+    # The panel is on its own port, which browsers treat as a separate site. If
+    # the node has a publicly-trusted certificate there is nothing to do; if it
+    # is still on the Proxmox self-signed one, say exactly how to fix it rather
+    # than leaving the user with a blank window.
+    CERT_PATH=""
+    for CANDIDATE in /etc/pve/local/pveproxy-ssl.pem /etc/pve/local/pve-ssl.pem; do
+        if [ -f "${CANDIDATE}" ]; then CERT_PATH="${CANDIDATE}"; break; fi
+    done
+
+    CERT_KIND="unknown"
+    if [ -n "${CERT_PATH}" ] && command -v openssl >/dev/null 2>&1; then
+        CERT_ISSUER=$(openssl x509 -in "${CERT_PATH}" -noout -issuer 2>/dev/null || true)
+        if echo "${CERT_ISSUER}" | grep -q "Proxmox Virtual Environment"; then
+            CERT_KIND="selfsigned"
+        elif [ -n "${CERT_ISSUER}" ]; then
+            CERT_KIND="ca"
+        fi
+    fi
+
+    case "${CERT_KIND}" in
+        ca)
+            print_ok "Certificate is CA-signed ${C_DIM}(${CERT_PATH})${C_NC}"
+            print_ok "No certificate step needed — the panel is trusted on port ${WEB_UI_PORT}"
+            ;;
+        selfsigned)
+            print_action "Certificate is the Proxmox self-signed one"
+            ;;
+        *)
+            print_action "Could not determine the certificate type"
+            ;;
+    esac
+
+    # The toolbar button. Non-fatal: the panel is still reachable by URL if the
+    # patch cannot be applied.
+    if [ -f "${PVE_JS}" ]; then
+        if "${UI_PATCHER}" apply; then
+            print_ok "Apt hook installed ${C_DIM}(re-applies the button after pve-manager upgrades)${C_NC}"
+        else
+            print_fail "Could not patch the Proxmox UI — the panel is still usable directly:"
+            print_fail "  https://$(hostname -f 2>/dev/null || hostname):${WEB_UI_PORT}/"
+        fi
+    else
+        print_fail "${PVE_JS} not found — skipping the toolbar button."
+    fi
+else
+    # Cleanly tear down a previously enabled panel.
+    if [ -f "${UI_SERVICE}" ] || [ -x "${UI_PATCHER}" ]; then
+        print_action "Removing previously installed web control panel..."
+        [ -x "${UI_PATCHER}" ] && "${UI_PATCHER}" remove >/dev/null 2>&1 || true
+        systemctl disable --now pve-autoupdate-ui.service >/dev/null 2>&1 || true
+        rm -f "${UI_SERVICE}" "${UI_APT_HOOK}" "${UI_BIN}" "${UI_PATCHER}"
+        systemctl daemon-reload
+        print_ok "Web control panel removed"
+    fi
+fi
 
 # 6. Idempotent Cron Configuration
 print_action "Configuring cron schedule..."
@@ -399,23 +679,119 @@ echo -e "  ${C_CYAN}Excluded:${C_NC}   ${EXCLUDE_IDS:-none}"
 echo -e "  ${C_CYAN}LXC:${C_NC}        Start stopped=${START_STOPPED_LXC}"
 echo -e "  ${C_CYAN}Linux VMs:${C_NC}  Start stopped=${START_STOPPED_LINUX_VMS}"
 echo -e "  ${C_CYAN}Win VMs:${C_NC}    Start stopped=${START_STOPPED_WINDOWS}, timeout=${WINDOWS_UPDATE_TIMEOUT}s"
+echo -e "  ${C_CYAN}Timeouts:${C_NC}   Linux=${LINUX_UPDATE_TIMEOUT}s, apt lock wait=${APT_LOCK_TIMEOUT}s"
+if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
+    echo -e "  ${C_CYAN}Snapshots:${C_NC}  enabled, keeping ${SNAPSHOT_KEEP} per guest"
+else
+    echo -e "  ${C_CYAN}Snapshots:${C_NC}  disabled"
+fi
 echo -e "  ${C_CYAN}Schedule:${C_NC}   ${UPDATE_SCHEDULE_CRON}"
 echo -e "  ${C_CYAN}Reboot:${C_NC}     ${REBOOT_TIME} (if kernel updated)"
+if [ "${ENABLE_WEB_UI}" = "true" ]; then
+    PANEL_URL="https://$(hostname -f 2>/dev/null || hostname):${WEB_UI_PORT}/"
+    echo -e "  ${C_CYAN}Web panel:${C_NC}  ${PANEL_URL}"
+    echo ""
+    if [ "${CERT_KIND:-unknown}" = "ca" ]; then
+        echo -e "  ${C_GREEN}Certificate:${C_NC} CA-signed — nothing to accept, the panel just works."
+        echo -e "  ${C_DIM}Renewals are picked up automatically without restarting the service.${C_NC}"
+    else
+        echo -e "  ${C_YELLOW}Certificate:${C_NC} this node uses the Proxmox self-signed certificate."
+        echo -e "  Browsers scope certificate exceptions per port, so port ${WEB_UI_PORT} needs"
+        echo -e "  approving once even though you already trust port 8006."
+        echo ""
+        echo -e "  ${C_BOLD}Pick one:${C_NC}"
+        echo -e "    ${C_CYAN}a)${C_NC} Open ${PANEL_URL} once and accept the warning."
+        echo -e "       ${C_DIM}Per browser, per machine. The UI prompts you if you skip this.${C_NC}"
+        echo -e "    ${C_CYAN}b)${C_NC} Set up ACME: ${C_BOLD}Datacenter → ACME${C_NC}, then Node → Certificates → Order."
+        echo -e "       ${C_DIM}Permanent, applies to every browser, and also removes the${C_NC}"
+        echo -e "       ${C_DIM}warning on the Proxmox UI itself. This service picks the new${C_NC}"
+        echo -e "       ${C_DIM}certificate up automatically when it renews.${C_NC}"
+        echo -e "    ${C_CYAN}c)${C_NC} Install the Proxmox root CA on your computer:"
+        echo -e "       ${C_DIM}/etc/pve/pve-root-ca.pem → your OS trust store. Also fixes 8006.${C_NC}"
+    fi
+    echo ""
+    echo -e "  ${C_DIM}Hard-refresh the Proxmox UI (Ctrl+Shift+R) to see the new button.${C_NC}"
+fi
 echo ""
 
 # 8. Interactive Test Run Option
-read -rp "  Would you like to trigger a test run now? (y/N): " RUN_TEST < /dev/tty
-if [[ "${RUN_TEST}" =~ ^[Yy]$ ]]; then
-    echo ""
-    echo -e "${C_BOLD}── Test Run ────────────────────────────────────────────────${C_NC}"
-    echo ""
-    "${TARGET_PATH}"
+# Both run modes send the report email, so either one verifies that the Mailgun
+# credentials, region and recipient are actually working end to end.
+echo -e "${C_BOLD}── Test Run ────────────────────────────────────────────────${C_NC}"
+echo ""
+echo -e "  ${C_BOLD}Run now to verify the setup?${C_NC}"
+echo -e "    ${C_CYAN}1)${C_NC} Dry run   ${C_DIM}— check everything and email the report,${C_NC}"
+echo -e "                  ${C_DIM}but install nothing and never reboot${C_NC}"
+echo -e "    ${C_CYAN}2)${C_NC} Full run  ${C_DIM}— update the host and every guest now,${C_NC}"
+echo -e "                  ${C_DIM}then email the report${C_NC}"
+echo -e "    ${C_CYAN}3)${C_NC} Skip      ${C_DIM}— wait for the scheduled run (${UPDATE_SCHEDULE_CRON})${C_NC}"
+echo ""
+read -rp "  Select 1-3 [Enter for 1]: " RUN_CHOICE < /dev/tty
 
+RUN_MODE=""
+case "${RUN_CHOICE:-1}" in
+    1) RUN_MODE="dry" ;;
+    2) RUN_MODE="full" ;;
+    3) RUN_MODE="skip" ;;
+    *)
+        print_fail "Unrecognised choice '${RUN_CHOICE}' — skipping the test run."
+        RUN_MODE="skip"
+        ;;
+esac
+
+if [ "${RUN_MODE}" = "full" ]; then
     echo ""
-    print_action "Cancelling queued midnight reboot timer..."
-    shutdown -c 2>/dev/null || true
-    print_ok "Pending reboot cancelled"
-    echo ""
-    echo -e "  ${C_GREEN}${C_BOLD}Test complete! ✓${C_NC}"
-    echo ""
+    echo -e "  ${C_YELLOW}${C_BOLD}This will update the host and every guest right now.${C_NC}"
+    read -rp "  Type 'yes' to confirm: " CONFIRM_FULL < /dev/tty
+    if [ "${CONFIRM_FULL}" != "yes" ]; then
+        print_action "Not confirmed — falling back to a dry run."
+        RUN_MODE="dry"
+    fi
 fi
+
+case "${RUN_MODE}" in
+    dry)
+        echo ""
+        echo -e "${C_BOLD}── Dry Run ─────────────────────────────────────────────────${C_NC}"
+        echo ""
+        RUN_RC=0
+        "${TARGET_PATH}" --dry-run || RUN_RC=$?
+        echo ""
+        if [ "${RUN_RC}" -eq 0 ]; then
+            print_ok "Dry run complete — nothing was installed or rebooted"
+            print_ok "Check ${C_BOLD}${RECIPIENT_EMAIL}${C_NC} for the report email"
+        else
+            print_fail "Dry run exited with code ${RUN_RC} — see ${LOG_DIR}/"
+        fi
+        echo ""
+        ;;
+    full)
+        echo ""
+        echo -e "${C_BOLD}── Full Run ────────────────────────────────────────────────${C_NC}"
+        echo ""
+        RUN_RC=0
+        "${TARGET_PATH}" || RUN_RC=$?
+
+        # A kernel update during this run would have queued a reboot. The user
+        # is sitting at the console right now, so cancel it and let them choose.
+        echo ""
+        print_action "Cancelling any queued reboot from this run..."
+        shutdown -c 2>/dev/null || true
+        print_ok "Pending reboot cancelled — reboot manually if the kernel changed"
+
+        echo ""
+        if [ "${RUN_RC}" -eq 0 ]; then
+            print_ok "Full run complete"
+            print_ok "Check ${C_BOLD}${RECIPIENT_EMAIL}${C_NC} for the report email"
+        else
+            print_fail "Run exited with code ${RUN_RC} — see ${LOG_DIR}/"
+        fi
+        echo ""
+        ;;
+    skip)
+        echo ""
+        print_ok "Skipped. First run: ${C_BOLD}${UPDATE_SCHEDULE_CRON}${C_NC}"
+        echo -e "  ${C_DIM}Test it any time with:  ${TARGET_PATH} --dry-run${C_NC}"
+        echo ""
+        ;;
+esac
