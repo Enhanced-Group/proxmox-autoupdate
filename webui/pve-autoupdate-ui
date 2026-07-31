@@ -1859,10 +1859,6 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  const typed = prompt(
-    "This updates the Proxmox host and every guest right now.\n\n" +
-    "Type UPDATE to confirm:");
-  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/run", {dry_run: false, confirm: "UPDATE"});
     msg($("runMsg"), "Full update started.", true);
@@ -2130,8 +2126,6 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  const typed = prompt("Update guest " + VMID + " now?\n\nType UPDATE to confirm:");
-  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/guest/run", {vmid: VMID, dry_run: false, confirm: "UPDATE"});
     msg($("runMsg"), "Update started.", true);
