@@ -8,11 +8,7 @@ install and nothing else. Earlier releases are in the git history and on the
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
-## 3.4.4 — 2026-07-31
-
-### Fixed
-- Check for updates could keep reporting the previous release for several minutes after one was published. `raw.githubusercontent.com` serves through a CDN that caches for a few minutes, and the check accepted whatever copy it was given. Requests now carry a unique query string and no-cache headers.
-- The changelog was fetched the same way and could be equally stale.
+## 3.4.5 — 2026-07-31
 
 ### Changed
-- "Up to date" now names the published version and the time of the check, so a genuine match can be told apart from a lookup that failed or returned something old.
+- When Discord rejects a bot token, the diagnostic now works out which credential was actually pasted — Application ID, Public Key or Client Secret — instead of only saying the token is invalid. If the value is the right shape, it says the token has been revoked or reset instead.

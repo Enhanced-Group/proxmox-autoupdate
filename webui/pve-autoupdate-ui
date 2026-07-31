@@ -841,6 +841,31 @@ def _discord_call(url, token, payload=None):
         return status, None, raw
 
 
+def identify_credential(value):
+    """Guess which Discord credential a string actually is.
+
+    The developer portal shows four values on adjacent pages and only one of
+    them is the bot token. Telling someone their token is invalid is far less
+    useful than telling them they pasted the Application ID.
+    """
+    v = value.strip()
+    if not v:
+        return "empty"
+    if re.fullmatch(r"[0-9]{17,20}", v):
+        return ("your Application ID (or a user ID) — a long run of digits. "
+                "The bot token is on the Bot page and contains dots.")
+    if re.fullmatch(r"[0-9a-fA-F]{64}", v):
+        return ("your Public Key — 64 hex characters. The bot token is on the "
+                "Bot page and contains dots.")
+    if "." not in v and re.fullmatch(r"[A-Za-z0-9_-]{28,40}", v):
+        return ("your Client Secret — no dots. The bot token is on the Bot "
+                "page, under the username, behind Reset Token.")
+    if v.count(".") == 2:
+        return None      # right shape; the token itself is simply not valid
+    return ("not the shape of a bot token — those are three dot-separated "
+            "parts, e.g. MTIzNDU2…….Gh1jKl.MnOpQr……")
+
+
 def diagnose_discord_dm(cfg):
     """Walk the DM flow one call at a time and report what each one did.
 
@@ -874,12 +899,17 @@ def diagnose_discord_dm(cfg):
             return False, steps
     else:
         msg = (body or {}).get("message") if isinstance(body, dict) else None
-        steps.append({"step": "Bot token", "ok": False,
-                      "detail": "HTTP %s — %s" % (status, msg or raw[:200])})
+        detail = "HTTP %s — %s" % (status, msg or raw[:200])
         if status == 401:
-            steps[-1]["detail"] += ("  This is not a valid bot token. Use the token "
-                                    "from Bot → Reset Token, not the client secret "
-                                    "or application ID.")
+            looks_like = identify_credential(token)
+            if looks_like:
+                detail += "  That value looks like %s" % looks_like
+            else:
+                detail += ("  The shape is right, so this token has been revoked "
+                           "or reset. Discord also revokes tokens automatically if "
+                           "they are ever committed to a public repository. "
+                           "Generate a new one with Bot → Reset Token.")
+        steps.append({"step": "Bot token", "ok": False, "detail": detail})
         return False, steps
 
     # 2 — can a DM channel be opened with this recipient?
