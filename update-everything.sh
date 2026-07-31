@@ -4,6 +4,10 @@
 # & Windows VM Updates via QEMU Guest Agent
 # ==============================================================================
 
+# Read by the web panel's "check for updates" and shown in its footer. Keep the
+# literal assignment on one line — it is grepped, not sourced.
+PAU_VERSION="3.1.0"
+
 set -u
 set -o pipefail
 
@@ -14,10 +18,15 @@ set -o pipefail
 CLI_DRY_RUN=""
 ONLY_IDS=""
 SEND_EMAIL="true"
+DETACH="false"
+RAW_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         -n|--dry-run)
             CLI_DRY_RUN="true"
+            ;;
+        --detach)
+            DETACH="true"
             ;;
         --only)
             ONLY_IDS="${2:-}"
@@ -41,8 +50,13 @@ Usage: update-everything.sh [options]
                     Proxmox host entirely. No reboot is ever scheduled in this
                     mode — it is for touching one guest without a full sweep.
 
-  --no-email        Do not send the report email. Useful when the output is
-                    already being watched live.
+  --no-email        Do not send any notification for this run. Useful when the
+                    output is already being watched live.
+
+  --detach          Hand the run to systemd and return immediately. Use this
+                    from the Proxmox web shell: the run then survives closing
+                    the browser tab, and is watchable with
+                    'journalctl -fu pve-autoupdate-run'.
 
   -h, --help        Show this message.
 
@@ -66,6 +80,40 @@ if [ -n "${ONLY_IDS}" ]; then
         echo "[!] --only expects comma-separated numeric IDs (got '${ONLY_IDS}')"
         exit 1
     fi
+fi
+
+# --- SURVIVE LOSING THE TERMINAL ---
+# The Proxmox web shell is a termproxy session: closing the browser tab makes it
+# exit and SIGHUP everything in the session. An update killed part way through
+# leaves dpkg half-configured, so refuse to die from a hangup.
+trap '' HUP
+
+# --detach re-execs the run under systemd so it is owned by the init system
+# rather than by the shell that launched it. Nothing else about the run changes.
+if [ "${DETACH}" = "true" ]; then
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        echo "[!] --detach needs systemd-run, which is not available here."
+        echo "    Use:  setsid nohup $0 <args> >/var/log/proxmox-autoupdate/detached.log 2>&1 &"
+        exit 1
+    fi
+    DETACHED_ARGS=()
+    for a in "${RAW_ARGS[@]}"; do
+        [ "${a}" = "--detach" ] || DETACHED_ARGS+=("${a}")
+    done
+    UNIT_NAME="pve-autoupdate-run"
+    systemctl reset-failed "${UNIT_NAME}.service" >/dev/null 2>&1 || true
+    if systemd-run --unit="${UNIT_NAME}" --collect --description="Proxmox Auto-Update (detached)" \
+            "$0" "${DETACHED_ARGS[@]+"${DETACHED_ARGS[@]}"}" >/dev/null 2>&1; then
+        echo "[*] Update started in the background as ${UNIT_NAME}.service"
+        echo "    It will keep running if you close this shell."
+        echo ""
+        echo "    Watch it:   journalctl -fu ${UNIT_NAME}"
+        echo "    Check it:   systemctl status ${UNIT_NAME}"
+        exit 0
+    fi
+    echo "[!] Could not start the detached unit — is one already running?"
+    echo "    Check:  systemctl status ${UNIT_NAME}"
+    exit 1
 fi
 
 # Ensure UK timezone formatting for date commands
@@ -107,22 +155,32 @@ fi
 # Spinner state
 _SPIN_PID=""
 
+# The spinner writes to /dev/tty rather than stdout so it never lands in the log.
+# If the terminal disappears mid-run — closing the Proxmox shell tab does exactly
+# that — those writes must not block or kill the run, so the fd is opened once,
+# up front, and every write is guarded. If it can't be opened, the spinner is
+# simply disabled for the rest of the run.
+_TTY_OK=false
+if [ "${INTERACTIVE}" = true ] && exec 9>/dev/tty 2>/dev/null; then
+    _TTY_OK=true
+fi
+
 start_spinner() {
     local msg="$1"
-    if [ "${INTERACTIVE}" = true ]; then
-        (
-            trap 'exit 0' TERM
-            local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-            local i=0
-            while true; do
-                printf "\r  \033[0;36m%s\033[0m %s" "${chars:$i:1}" "$msg" >/dev/tty 2>/dev/null
-                i=$(( (i + 1) % ${#chars} ))
-                sleep 0.08
-            done
-        ) &
-        _SPIN_PID=$!
-        disown "$_SPIN_PID" 2>/dev/null
-    fi
+    [ "${_TTY_OK}" = true ] || return 0
+    (
+        trap 'exit 0' TERM
+        trap '' HUP
+        local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        local i=0
+        while true; do
+            printf "\r  \033[0;36m%s\033[0m %s" "${chars:$i:1}" "$msg" >&9 2>/dev/null || exit 0
+            i=$(( (i + 1) % ${#chars} ))
+            sleep 0.08
+        done
+    ) &
+    _SPIN_PID=$!
+    disown "$_SPIN_PID" 2>/dev/null
 }
 
 stop_spinner() {
@@ -130,7 +188,7 @@ stop_spinner() {
         kill "${_SPIN_PID}" 2>/dev/null
         wait "${_SPIN_PID}" 2>/dev/null || true
         _SPIN_PID=""
-        printf "\r\033[K" >/dev/tty 2>/dev/null || true
+        [ "${_TTY_OK}" = true ] && { printf "\r\033[K" >&9 2>/dev/null || true; }
     fi
 }
 
@@ -139,10 +197,14 @@ stop_spinner() {
 # can be lost when the shell exits before the tee has written it out.
 cleanup() {
     stop_spinner
-    rm -f "${HTML_FILE:-}" "${MAILGUN_RESPONSE_FILE:-}"
+    rm -f "${HTML_FILE:-}" "${NOTIFY_RESPONSE_FILE:-}"
     if [ -n "${TEE_PID:-}" ]; then
         exec 1>&- 2>&-
         wait "${TEE_PID}" 2>/dev/null || true
+    fi
+    # KEEP_LOGS=false: the log existed only so this run could be watched live.
+    if [ "${KEEP_LOGS:-true}" = "false" ] && [ -n "${LOG_FILE:-}" ]; then
+        rm -f "${LOG_FILE}" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -222,13 +284,84 @@ fi
 # shellcheck source=/dev/null
 source "${CONFIG_FILE}"
 
-# Validate required config values
-for VAR_NAME in MAILGUN_API_KEY MAILGUN_DOMAIN MAILGUN_REGION RECIPIENT_EMAIL SENDER_EMAIL; do
-    if [ -z "${!VAR_NAME:-}" ]; then
-        echo -e "${C_RED}[!] FATAL: ${VAR_NAME} is not set in ${CONFIG_FILE}${C_NC}"
-        exit 1
-    fi
+# --- NOTIFICATIONS ---
+# Notification is a reporting layer, not a prerequisite for updating. Nothing
+# here is required: an unconfigured install still updates on schedule, it just
+# stays quiet. Channels can be added at any time without reinstalling.
+#
+# NOTIFY_METHODS is a comma-separated list of: email, discord, slack, webhook.
+# Empty or "none" disables notification entirely.
+NOTIFY_METHODS="${NOTIFY_METHODS:-}"
+
+MAILGUN_API_KEY="${MAILGUN_API_KEY:-}"
+MAILGUN_DOMAIN="${MAILGUN_DOMAIN:-}"
+MAILGUN_REGION="${MAILGUN_REGION:-EU}"
+SENDER_EMAIL="${SENDER_EMAIL:-}"
+RECIPIENT_EMAIL="${RECIPIENT_EMAIL:-}"
+
+DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
+SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
+GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL:-}"
+
+# Stay silent on clean runs, so the channel only fires when something needs you.
+NOTIFY_ON_FAILURE_ONLY="${NOTIFY_ON_FAILURE_ONLY:-false}"
+
+# Backwards compatibility: installs that predate NOTIFY_METHODS configured
+# Mailgun and nothing else, so honour that rather than going silent on upgrade.
+if [ -z "${NOTIFY_METHODS}" ] && [ -n "${MAILGUN_API_KEY}" ] && [ -n "${RECIPIENT_EMAIL}" ]; then
+    NOTIFY_METHODS="email"
+fi
+
+# Drop any channel that isn't actually configured, and say so once, rather than
+# failing a run over a reporting problem.
+NOTIFY_ACTIVE=""
+NOTIFY_DISABLED=""
+for METHOD in $(echo "${NOTIFY_METHODS}" | tr ',' ' '); do
+    case "${METHOD}" in
+        none|"") ;;
+        email)
+            if [ -n "${MAILGUN_API_KEY}" ] && [ -n "${MAILGUN_DOMAIN}" ] \
+               && [ -n "${SENDER_EMAIL}" ] && [ -n "${RECIPIENT_EMAIL}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} email"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} email(incomplete Mailgun settings)"
+            fi
+            ;;
+        discord)
+            if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} discord"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} discord(no URL)"
+            fi
+            ;;
+        slack)
+            if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} slack"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} slack(no URL)"
+            fi
+            ;;
+        webhook)
+            if [ -n "${GENERIC_WEBHOOK_URL}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} webhook"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} webhook(no URL)"
+            fi
+            ;;
+        *)
+            NOTIFY_DISABLED="${NOTIFY_DISABLED} ${METHOD}(unknown)"
+            ;;
+    esac
 done
+NOTIFY_ACTIVE=$(echo "${NOTIFY_ACTIVE}" | xargs || true)
+NOTIFY_DISABLED=$(echo "${NOTIFY_DISABLED}" | xargs || true)
+
+# Resolve Mailgun API base URL from region
+if [ "${MAILGUN_REGION}" = "EU" ]; then
+    MAILGUN_API_URL="https://api.eu.mailgun.net/v3/${MAILGUN_DOMAIN}/messages"
+else
+    MAILGUN_API_URL="https://api.mailgun.net/v3/${MAILGUN_DOMAIN}/messages"
+fi
 
 # Optional config values with defaults
 EXCLUDE_IDS="${EXCLUDE_IDS:-}"
@@ -261,6 +394,18 @@ SNAPSHOT_KEEP="${SNAPSHOT_KEEP:-3}"
 # Prefix identifying snapshots this script owns. Only these are ever pruned.
 SNAPSHOT_PREFIX="autoupdate"
 
+# --- LOGGING ---
+# KEEP_LOGS=false still writes a log during the run — the web UI streams it —
+# but deletes it on exit, so nothing accumulates on disk.
+KEEP_LOGS="${KEEP_LOGS:-true}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
+LOG_DIR="${LOG_DIR:-/var/log/proxmox-autoupdate}"
+
+# Where run history lives, so a report can say "this guest has failed 3 runs"
+# instead of treating every run as the first.
+STATE_DIR="/var/lib/proxmox-autoupdate"
+STATE_FILE="${STATE_DIR}/state.json"
+
 # Normalise booleans so a stray "TRUE"/"yes" in the config still behaves.
 normalise_bool() {
     case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -273,25 +418,21 @@ SNAPSHOT_BEFORE_UPDATE=$(normalise_bool "${SNAPSHOT_BEFORE_UPDATE}")
 START_STOPPED_WINDOWS=$(normalise_bool "${START_STOPPED_WINDOWS}")
 START_STOPPED_LXC=$(normalise_bool "${START_STOPPED_LXC}")
 START_STOPPED_LINUX_VMS=$(normalise_bool "${START_STOPPED_LINUX_VMS}")
+KEEP_LOGS=$(normalise_bool "${KEEP_LOGS}")
+NOTIFY_ON_FAILURE_ONLY=$(normalise_bool "${NOTIFY_ON_FAILURE_ONLY}")
 
 # --dry-run on the command line overrides the config file, never the reverse.
 [ -n "${CLI_DRY_RUN}" ] && DRY_RUN="true"
 
 # Validate the numeric settings — a typo here would otherwise surface as an
 # arithmetic error deep inside a poll loop.
-for _NUM_VAR in WINDOWS_UPDATE_TIMEOUT LINUX_UPDATE_TIMEOUT APT_LOCK_TIMEOUT SNAPSHOT_KEEP; do
+for _NUM_VAR in WINDOWS_UPDATE_TIMEOUT LINUX_UPDATE_TIMEOUT APT_LOCK_TIMEOUT \
+                SNAPSHOT_KEEP LOG_RETENTION_DAYS; do
     if ! [[ "${!_NUM_VAR}" =~ ^[0-9]+$ ]]; then
         echo -e "${C_RED}[!] FATAL: ${_NUM_VAR} must be a positive integer (got '${!_NUM_VAR}')${C_NC}"
         exit 1
     fi
 done
-
-# Resolve Mailgun API base URL from region
-if [ "${MAILGUN_REGION}" = "EU" ]; then
-    MAILGUN_API_URL="https://api.eu.mailgun.net/v3/${MAILGUN_DOMAIN}/messages"
-else
-    MAILGUN_API_URL="https://api.mailgun.net/v3/${MAILGUN_DOMAIN}/messages"
-fi
 
 # ==============================================================================
 # SYSTEM & LOG SETUP
@@ -303,28 +444,31 @@ TIMESTAMP=$(date '+%d/%m/%Y %H:%M:%S')
 HTML_FILE="/tmp/update_report_$$.html"
 
 # Logging: persist all output to a log file
-LOG_DIR="/var/log/proxmox-autoupdate"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/update_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 TEE_PID=$!
 
-# Prune logs older than 90 days
-find "${LOG_DIR}" -name "update_*.log" -mtime +90 -delete 2>/dev/null || true
+# Prune old logs. Retention of 0 means "keep forever".
+if [ "${LOG_RETENTION_DAYS}" -gt 0 ]; then
+    find "${LOG_DIR}" -name '*.log' -mtime +"${LOG_RETENTION_DAYS}" -delete 2>/dev/null || true
+fi
 
 # --- jq is a hard dependency ---
 # Every guest-agent response is parsed as JSON. Hand-rolled regex parsing of
 # pvesh output silently returns nothing when the shape changes, which shows up
 # as a bogus timeout rather than an error, so refuse to run without jq.
-if ! command -v jq >/dev/null 2>&1; then
-    print_action "jq not found — installing..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -qy jq >/dev/null 2>&1 || true
-fi
-if ! command -v jq >/dev/null 2>&1; then
-    echo -e "${C_RED}[!] FATAL: jq is required but could not be installed.${C_NC}"
-    echo "    Install it manually:  apt-get install -y jq"
-    exit 1
-fi
+for TOOL in jq python3; do
+    if ! command -v "${TOOL}" >/dev/null 2>&1; then
+        print_action "${TOOL} not found — installing..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -qy "${TOOL}" >/dev/null 2>&1 || true
+    fi
+    if ! command -v "${TOOL}" >/dev/null 2>&1; then
+        echo -e "${C_RED}[!] FATAL: ${TOOL} is required but could not be installed.${C_NC}"
+        echo "    Install it manually:  apt-get install -y jq python3"
+        exit 1
+    fi
+done
 
 # Summary counters
 LXC_UPDATED=0
@@ -769,6 +913,334 @@ format_upgradable_host() {
 }
 
 # ==============================================================================
+# RUN STATE
+# ==============================================================================
+# Persists across runs so a report can say "VM 101 has failed 3 runs in a row"
+# rather than treating every run as the first, and so the web UI can colour its
+# button from the last result without parsing logs.
+
+# Guests that failed this run: "<id>|<name>|<detail>" per line.
+FAILED_THIS_RUN=""
+REPEAT_OFFENDERS=""
+
+record_guest_failure() {
+    FAILED_THIS_RUN="${FAILED_THIS_RUN}$1|$2|$3
+"
+}
+
+# Merging this run into the stored history is fiddly enough — streaks that reset
+# only for guests the run actually covered — that expressing it as a jq pipeline
+# made it hard to read and harder to test. Python 3 is already required by the
+# web panel and ships with Proxmox, so the merge lives in one readable helper
+# that can be exercised directly.
+#
+# State updates are best-effort throughout: failing to record history must never
+# turn a successful update into a failed run.
+STATE_HELPER='
+import json, os, sys
+
+state_file, result, finished, log, scope = sys.argv[1:6]
+counts = json.loads(sys.argv[6])
+failures = []
+for line in sys.stdin.read().splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("|", 2)
+    failures.append({
+        "id": parts[0],
+        "name": parts[1] if len(parts) > 1 else "",
+        "detail": parts[2] if len(parts) > 2 else "",
+    })
+
+try:
+    with open(state_file) as fh:
+        state = json.load(fh)
+    if not isinstance(state, dict):
+        raise ValueError
+except (OSError, ValueError):
+    state = {}
+
+guests = state.get("guests") or {}
+if not isinstance(guests, dict):
+    guests = {}
+
+failed_ids = {f["id"] for f in failures}
+covered = None if scope == "all" else set(scope.split(","))
+
+# A guest only gets its streak cleared if this run actually looked at it — a
+# targeted run must not mark untouched guests as recovered.
+for gid, entry in list(guests.items()):
+    if gid in failed_ids or not isinstance(entry, dict):
+        continue
+    if covered is None or gid in covered:
+        entry["consecutive_failures"] = 0
+
+for f in failures:
+    previous = guests.get(f["id"]) or {}
+    try:
+        streak = int(previous.get("consecutive_failures") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    guests[f["id"]] = {
+        "name": f["name"],
+        "detail": f["detail"],
+        "last_failed": finished,
+        "consecutive_failures": streak + 1,
+    }
+
+last_run = {
+    "result": result, "finished": finished, "log": log,
+    "scope": scope, "counts": counts, "failed": sorted(failed_ids),
+}
+state["guests"] = guests
+state["last_run"] = last_run
+state["runs"] = ([last_run] + (state.get("runs") or []))[:20]
+
+tmp = state_file + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(state, fh, indent=2)
+os.replace(tmp, state_file)
+'
+
+state_write() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    mkdir -p "${STATE_DIR}" 2>/dev/null || return 0
+
+    local result="ok"
+    [ "${ERRORS_OCCURRED}" = true ] && result="error"
+    [ "${DRY_RUN}" = "true" ] && result="${result}-dryrun"
+
+    local counts
+    counts=$(printf '{"lxc_updated":%d,"lxc_errors":%d,"vm_updated":%d,"vm_errors":%d,"host_packages":%d,"mid_update":%d}' \
+        "${LXC_UPDATED}" "${LXC_ERRORS}" "${VM_UPDATED}" "${VM_ERRORS}" \
+        "${HOST_PKG_COUNT}" "${GUESTS_MID_UPDATE}")
+
+    printf '%s' "${FAILED_THIS_RUN}" | python3 -c "${STATE_HELPER}" \
+        "${STATE_FILE}" \
+        "${result}" \
+        "$(date -Is)" \
+        "$([ "${KEEP_LOGS}" = "true" ] && echo "${LOG_FILE}" || echo "")" \
+        "$([ -n "${ONLY_IDS}" ] && echo "${ONLY_IDS}" || echo "all")" \
+        "${counts}" 2>/dev/null || true
+
+    chmod 644 "${STATE_FILE}" 2>/dev/null || true
+}
+
+# Guests that have now failed more than once in a row — the ones worth chasing.
+compute_repeat_offenders() {
+    [ -s "${STATE_FILE}" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    REPEAT_OFFENDERS=$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        guests = (json.load(fh) or {}).get("guests") or {}
+except Exception:
+    sys.exit(0)
+items = [(gid, g) for gid, g in guests.items()
+         if isinstance(g, dict) and (g.get("consecutive_failures") or 0) > 1]
+items.sort(key=lambda kv: -kv[1]["consecutive_failures"])
+print(", ".join("%s (%s) x%d" % (g.get("name") or "guest", gid,
+                                 g["consecutive_failures"])
+                for gid, g in items))
+' "${STATE_FILE}" 2>/dev/null || true)
+}
+
+# ==============================================================================
+# NOTIFICATIONS
+# ==============================================================================
+# Every channel receives the same three things: a subject line, a plain-text
+# summary, and (for email) the HTML report. Adding a channel means adding one
+# notify_<name> function and a case in notify_all — nothing else changes.
+#
+# A failing notification never fails the run. The updates already happened; not
+# being able to talk about them is a lesser problem, reported and moved past.
+
+# Plain-text summary shared by all the webhook channels.
+build_text_summary() {
+    local status_line
+    if [ "${ERRORS_OCCURRED}" = true ]; then
+        status_line="Completed with errors"
+    else
+        status_line="Completed successfully"
+    fi
+    [ "${DRY_RUN}" = "true" ] && status_line="${status_line} (dry run — nothing installed)"
+    [ -n "${ONLY_IDS}" ] && status_line="${status_line} (targeted: ${ONLY_IDS})"
+
+    printf '%s\n\n' "${status_line}"
+    printf 'Host: %s\n' "${HOST_NAME}"
+    printf 'PVE:  %s\n\n' "${PVE_VERSION_AFTER:-unknown}"
+    printf 'LXC:  %s updated, %s current, %s errors\n' "${LXC_UPDATED}" "${LXC_CURRENT}" "${LXC_ERRORS}"
+    printf 'VMs:  %s updated, %s current, %s errors\n' "${VM_UPDATED}" "${VM_CURRENT}" "${VM_ERRORS}"
+    printf 'Host: %s packages\n' "${HOST_PKG_COUNT}"
+    if [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
+        printf '\n%s guest(s) left running mid-update — check them.\n' "${GUESTS_MID_UPDATE}"
+    fi
+    if [ "${REBOOT_NEEDED}" = true ]; then
+        printf '\nReboot scheduled at %s: %s\n' "${REBOOT_TIME}" "${REBOOT_REASON}"
+    fi
+    if [ -n "${REPEAT_OFFENDERS:-}" ]; then
+        printf '\nRepeatedly failing: %s\n' "${REPEAT_OFFENDERS}"
+    fi
+    if [ "${KEEP_LOGS}" = "true" ]; then
+        printf '\nLog: %s\n' "${LOG_FILE}"
+    fi
+}
+
+# Webhook payloads are built by Python rather than assembled as text, so JSON
+# escaping and the per-service length limits are handled by code that can be
+# tested directly instead of by string concatenation that cannot.
+#
+# Reads the message body on stdin; prints one JSON object on stdout.
+#   $1 = format (discord|slack|generic)   $2 = subject
+PAYLOAD_HELPER='
+import json, os, sys
+
+fmt, subject = sys.argv[1], sys.argv[2]
+body = sys.stdin.read()
+failed = os.environ.get("PAU_FAILED") == "true"
+dry = os.environ.get("PAU_DRY") == "true"
+
+if fmt == "discord":
+    # Discord rejects an embed description over 4096 characters.
+    text = body[:3900]
+    if len(body) > 3900:
+        text += "\n… truncated, see the log for the rest"
+    colour = 9807270 if dry else (15158332 if failed else 3066993)
+    payload = {"embeds": [{
+        "title": subject[:256],
+        "description": "```\n" + text + "\n```",
+        "color": colour,
+        "footer": {"text": os.environ.get("PAU_FOOTER", "")[:2048]},
+    }]}
+elif fmt == "slack":
+    text = body[:3500]
+    if len(body) > 3500:
+        text += "\n… truncated, see the log for the rest"
+    payload = {"text": "*" + subject + "*\n```" + text + "```"}
+else:
+    def num(name):
+        try:
+            return int(os.environ.get(name, "0"))
+        except ValueError:
+            return 0
+    payload = {
+        "title": subject,
+        "message": body,
+        "status": "error" if failed else "success",
+        "dry_run": dry,
+        "host": os.environ.get("PAU_HOST", ""),
+        "timestamp": os.environ.get("PAU_TIMESTAMP", ""),
+        "pve_version": os.environ.get("PAU_PVE", ""),
+        "log": os.environ.get("PAU_LOG", ""),
+        "reboot_scheduled": os.environ.get("PAU_REBOOT") == "true",
+        "repeat_offenders": os.environ.get("PAU_OFFENDERS", ""),
+        "counts": {
+            "lxc_updated": num("PAU_LXC_UPDATED"),
+            "lxc_errors": num("PAU_LXC_ERRORS"),
+            "vm_updated": num("PAU_VM_UPDATED"),
+            "vm_errors": num("PAU_VM_ERRORS"),
+            "host_packages": num("PAU_HOST_PKGS"),
+        },
+    }
+
+sys.stdout.write(json.dumps(payload))
+'
+
+build_payload() {
+    local fmt="$1" subject="$2" body="$3"
+    # Exported in a subshell rather than as a `VAR=x cmd` prefix: in a pipeline
+    # that prefix would apply to the left-hand command, not to the python3 on
+    # the right, and every field would silently come through empty.
+    (
+        export PAU_FAILED PAU_DRY PAU_HOST PAU_TIMESTAMP PAU_PVE PAU_LOG \
+               PAU_REBOOT PAU_OFFENDERS PAU_FOOTER PAU_LXC_UPDATED \
+               PAU_LXC_ERRORS PAU_VM_UPDATED PAU_VM_ERRORS PAU_HOST_PKGS
+        PAU_FAILED="$([ "${ERRORS_OCCURRED}" = true ] && echo true || echo false)"
+        PAU_DRY="${DRY_RUN}"
+        PAU_HOST="${HOST_NAME}"
+        PAU_TIMESTAMP="${TIMESTAMP}"
+        PAU_PVE="${PVE_VERSION_AFTER:-unknown}"
+        PAU_LOG="$([ "${KEEP_LOGS}" = "true" ] && echo "${LOG_FILE}" || echo "")"
+        PAU_REBOOT="$([ "${REBOOT_NEEDED}" = true ] && echo true || echo false)"
+        PAU_OFFENDERS="${REPEAT_OFFENDERS:-}"
+        PAU_FOOTER="${HOST_NAME} · ${TIMESTAMP}"
+        PAU_LXC_UPDATED="${LXC_UPDATED}"
+        PAU_LXC_ERRORS="${LXC_ERRORS}"
+        PAU_VM_UPDATED="${VM_UPDATED}"
+        PAU_VM_ERRORS="${VM_ERRORS}"
+        PAU_HOST_PKGS="${HOST_PKG_COUNT}"
+        printf '%s' "${body}" | python3 -c "${PAYLOAD_HELPER}" "${fmt}" "${subject}"
+    )
+}
+
+# POST a payload and report the outcome. Never fails the run.
+post_webhook() {
+    local label="$1" url="$2" payload="$3"
+    local code
+    code=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -X POST --data-binary "${payload}" "${url}" 2>/dev/null) || code="000"
+    if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
+        print_ok "${label} notified"
+    elif [ "${code}" = "000" ]; then
+        print_fail "${label} unreachable (network error or timeout)"
+    else
+        print_fail "${label} returned HTTP ${code}"
+    fi
+}
+
+notify_email() {
+    local subject="$1" html_file="$3"
+    NOTIFY_RESPONSE_FILE="/tmp/notify_response_$$.txt"
+    local code
+    code=$(curl -s --max-time 60 -o "${NOTIFY_RESPONSE_FILE}" -w "%{http_code}" \
+        --user "api:${MAILGUN_API_KEY}" \
+        "${MAILGUN_API_URL}" \
+        -F from="${SENDER_EMAIL}" \
+        -F to="${RECIPIENT_EMAIL}" \
+        -F subject="${subject}" \
+        -F html="<${html_file}" 2>&1) || true
+
+    if [ "${code}" = "200" ]; then
+        print_ok "Email sent to ${C_BOLD}${RECIPIENT_EMAIL}${C_NC}"
+    else
+        print_fail "Mailgun returned HTTP ${code}"
+        [ -f "${NOTIFY_RESPONSE_FILE}" ] && echo "     $(head -c 400 "${NOTIFY_RESPONSE_FILE}")"
+    fi
+    rm -f "${NOTIFY_RESPONSE_FILE}"
+}
+
+notify_discord() {
+    post_webhook "Discord" "${DISCORD_WEBHOOK_URL}" "$(build_payload discord "$1" "$2")"
+}
+
+notify_slack() {
+    post_webhook "Slack/Teams" "${SLACK_WEBHOOK_URL}" "$(build_payload slack "$1" "$2")"
+}
+
+# Generic: structured JSON, so ntfy/Gotify/Home Assistant/n8n and anything else
+# can pick out whichever fields it needs.
+notify_webhook() {
+    post_webhook "Webhook" "${GENERIC_WEBHOOK_URL}" "$(build_payload generic "$1" "$2")"
+}
+
+notify_all() {
+    local subject="$1" body="$2" html_file="$3"
+    start_spinner "Sending notifications (${NOTIFY_ACTIVE})..."
+    stop_spinner
+    local channel
+    for channel in ${NOTIFY_ACTIVE}; do
+        case "${channel}" in
+            email)   notify_email   "${subject}" "${body}" "${html_file}" ;;
+            discord) notify_discord "${subject}" "${body}" ;;
+            slack)   notify_slack   "${subject}" "${body}" ;;
+            webhook) notify_webhook "${subject}" "${body}" ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # HELPER: Escape text for inclusion in the HTML report
 # ==============================================================================
 html_escape() {
@@ -1050,6 +1522,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
                 print_fail "LXC ${CTID} (${CT_NAME}) — failed to start within 60s"
                 LXC_ERRORS=$((LXC_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${CTID}" "${CT_NAME}" "failed to start within 60s"
                 LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})</td><td><span class='status-badge badge-error'>Start Failed</span></td><td>Container did not reach running state within 60 seconds.</td></tr>"
                 continue
             fi
@@ -1057,6 +1530,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
             print_fail "LXC ${CTID} (${CT_NAME}) — pct start failed"
             LXC_ERRORS=$((LXC_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${CTID}" "${CT_NAME}" "pct start failed"
             LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})</td><td><span class='status-badge badge-error'>Start Failed</span></td><td>Failed to start container.</td></tr>"
             continue
         fi
@@ -1078,6 +1552,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
             print_fail "LXC ${CTID} (${CT_NAME}) — snapshot failed, skipping update${local_suffix}"
             LXC_ERRORS=$((LXC_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${CTID}" "${CT_NAME}" "snapshot failed, skipping update"
             LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})${html_suffix}</td><td><span class='status-badge badge-error'>Snapshot Failed</span></td><td>Pre-update snapshot could not be created; the update was skipped rather than run without a rollback point.</td></tr>"
             continue
         fi
@@ -1117,6 +1592,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
             print_warn "LXC ${CTID} (${CT_NAME}) — update timed out after ${LINUX_UPDATE_TIMEOUT}s${local_suffix}"
             LXC_ERRORS=$((LXC_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${CTID}" "${CT_NAME}" "update timed out"
             GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
             # An interrupted dpkg run must not be followed by a shutdown.
             CT_WAS_STOPPED=false
@@ -1126,6 +1602,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
             print_fail "LXC ${CTID} (${CT_NAME}) — update did not report a result${local_suffix}"
             LXC_ERRORS=$((LXC_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${CTID}" "${CT_NAME}" "update did not report a result"
             [ -z "${GU_DETAIL}" ] && GU_DETAIL="The guest update script produced no __RESULT__ marker."
             LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
             ;;
@@ -1133,6 +1610,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
             print_fail "LXC ${CTID} (${CT_NAME}) — ${GU_DETAIL:-update failed}${local_suffix}"
             LXC_ERRORS=$((LXC_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${CTID}" "${CT_NAME}" "${GU_DETAIL:-update failed}"
             LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
             ;;
         *)
@@ -1224,6 +1702,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                     print_fail "VM ${VMID} (${VM_NAME}) — guest agent not responding after ${agent_timeout}s"
                     VM_ERRORS=$((VM_ERRORS + 1))
                     ERRORS_OCCURRED=true
+                    record_guest_failure "${VMID}" "${VM_NAME}" "guest agent not responding"
                     VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Agent Timeout</span></td><td>VM started but QEMU Guest Agent did not respond within ${agent_timeout} seconds.</td></tr>"
                     # Shut it back down
                     print_stop "Stopping VM ${VMID} (${VM_NAME}) ${C_DIM}[restoring state]${C_NC}..."
@@ -1236,6 +1715,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                 print_fail "VM ${VMID} (${VM_NAME}) — failed to start within 60s"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "failed to start within 60s"
                 VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Start Failed</span></td><td>VM did not reach running state within 60 seconds.</td></tr>"
                 continue
             fi
@@ -1243,6 +1723,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_fail "VM ${VMID} (${VM_NAME}) — qm start failed"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "qm start failed"
             VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Start Failed</span></td><td>Failed to start VM.</td></tr>"
             continue
         fi
@@ -1282,6 +1763,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_fail "VM ${VMID} (${VM_NAME}) — snapshot failed, skipping update${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "snapshot failed, skipping update"
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Snapshot Failed</span></td><td>Pre-update snapshot could not be created; the update was skipped rather than run without a rollback point.</td></tr>"
             continue
         fi
@@ -1298,11 +1780,13 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_fail "VM ${VMID} (${VM_NAME}) — Windows Update exec failed${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "Windows Update exec failed"
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>Failed to execute Windows Update via guest agent.</td></tr>"
         elif [ "${WIN_OUTPUT}" = "API_ERROR" ]; then
             print_fail "VM ${VMID} (${VM_NAME}) — exec-status stopped responding${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "exec-status stopped responding"
             GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
             # The update may well still be running — do not shut this VM down.
             VM_WAS_STOPPED=false
@@ -1323,6 +1807,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_fail "VM ${VMID} (${VM_NAME}) — ${ERROR_MSG}${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "${ERROR_MSG}"
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(echo "${ERROR_MSG}" | html_escape)</td></tr>"
         elif echo "${WIN_OUTPUT}" | grep -q "^DRYRUN:"; then
             WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^DRYRUN://')
@@ -1342,6 +1827,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_fail "VM ${VMID} (${VM_NAME}) — unrecognised Windows Update output${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "unrecognised Windows Update output"
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>Windows Update returned output that could not be interpreted:<pre class='log-snippet'>$(echo "${WIN_OUTPUT}" | tail -n 20 | html_escape)</pre></td></tr>"
         fi
     else
@@ -1358,12 +1844,14 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                 print_fail "VM ${VMID} (${VM_NAME}) — guest exec failed${local_suffix}"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "guest exec failed"
                 VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>Failed to execute update command via guest agent.<div class='detail'>$(echo "${GU_DETAIL}" | html_escape)</div></td></tr>"
                 ;;
             apierror)
                 print_fail "VM ${VMID} (${VM_NAME}) — ${GU_DETAIL}${local_suffix}"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "${GU_DETAIL}"
                 GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
                 VM_WAS_STOPPED=false
                 VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Agent Lost</span></td><td>The guest agent stopped answering while the upgrade was running. The VM was left running; its state is unknown.</td></tr>"
@@ -1372,6 +1860,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                 print_fail "VM ${VMID} (${VM_NAME}) — ${GU_DETAIL}${local_suffix}"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "${GU_DETAIL}"
                 GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
                 VM_WAS_STOPPED=false
                 VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Unreadable Reply</span></td><td>$(echo "${GU_DETAIL}" | html_escape)<pre class='log-snippet'>$(echo "${GU_LOG}" | html_escape)</pre></td></tr>"
@@ -1380,6 +1869,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                 print_warn "VM ${VMID} (${VM_NAME}) — update timed out after ${LINUX_UPDATE_TIMEOUT}s${local_suffix}"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "update timed out"
                 GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
                 # Shutting down here would interrupt dpkg and break the guest.
                 VM_WAS_STOPPED=false
@@ -1394,6 +1884,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                 print_fail "VM ${VMID} (${VM_NAME}) — update did not report a result${local_suffix}"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "update did not report a result"
                 [ -z "${GU_DETAIL}" ] && GU_DETAIL="The guest update script produced no __RESULT__ marker."
                 VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
                 ;;
@@ -1401,6 +1892,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                 print_fail "VM ${VMID} (${VM_NAME}) — ${GU_DETAIL:-update failed}${local_suffix}"
                 VM_ERRORS=$((VM_ERRORS + 1))
                 ERRORS_OCCURRED=true
+                record_guest_failure "${VMID}" "${VM_NAME}" "${GU_DETAIL:-update failed}"
                 VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
                 ;;
             *)
@@ -1588,6 +2080,11 @@ if [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
     MID_UPDATE_SUMMARY_HTML="<br><strong>${GUESTS_MID_UPDATE} guest(s) left running mid-update — check them before the next run.</strong>"
 fi
 
+REPEAT_SUMMARY_HTML=""
+if [ -n "${REPEAT_OFFENDERS:-}" ]; then
+    REPEAT_SUMMARY_HTML="<br><strong>Failing repeatedly:</strong> $(echo "${REPEAT_OFFENDERS}" | html_escape)"
+fi
+
 cat <<EOF > "${HTML_FILE}"
 <!DOCTYPE html>
 <html>
@@ -1641,7 +2138,7 @@ cat <<EOF > "${HTML_FILE}"
       <strong>Summary:</strong><br>
       LXC: ${LXC_UPDATED} updated, ${LXC_CURRENT} current, ${LXC_STARTED} started from stopped, ${LXC_ERRORS} errors, ${LXC_SKIPPED} skipped, ${LXC_EXCLUDED} excluded<br>
       VMs: ${VM_UPDATED} updated, ${VM_CURRENT} current, ${VM_STARTED} started from stopped, ${VM_ERRORS} errors, ${VM_SKIPPED} skipped, ${VM_EXCLUDED} excluded<br>
-      Host: ${HOST_PKG_COUNT} packages${SNAPSHOT_SUMMARY_HTML}${MID_UPDATE_SUMMARY_HTML}
+      Host: ${HOST_PKG_COUNT} packages${SNAPSHOT_SUMMARY_HTML}${MID_UPDATE_SUMMARY_HTML}${REPEAT_SUMMARY_HTML}
     </div>
 
     <div class='section-title'>1. Proxmox Host Node (${HOST_NAME})</div>
@@ -1670,6 +2167,14 @@ cat <<EOF > "${HTML_FILE}"
 </html>
 EOF
 
+# Fold this run into the persistent state before notifying, so the summary can
+# mention guests that have been failing for several runs.
+state_write
+compute_repeat_offenders
+if [ -n "${REPEAT_OFFENDERS}" ]; then
+    print_warn "Repeatedly failing: ${C_BOLD}${REPEAT_OFFENDERS}${C_NC}"
+fi
+
 SUBJECT_PREFIX="[Proxmox]"
 [ "${DRY_RUN}" = "true" ] && SUBJECT_PREFIX="${SUBJECT_PREFIX}[DRY RUN]"
 [ -n "${ONLY_IDS}" ] && SUBJECT_PREFIX="${SUBJECT_PREFIX}[${ONLY_IDS}]"
@@ -1681,31 +2186,20 @@ else
 fi
 
 if [ "${SEND_EMAIL}" != "true" ]; then
-    print_skip "Report email suppressed ${C_DIM}[--no-email]${C_NC}"
-else
-
-start_spinner "Sending report via Mailgun ${MAILGUN_REGION}..."
-MAILGUN_RESPONSE_FILE="/tmp/mailgun_response_$$.txt"
-HTTP_CODE=$(curl -s -o "${MAILGUN_RESPONSE_FILE}" -w "%{http_code}" \
-    --user "api:${MAILGUN_API_KEY}" \
-    "${MAILGUN_API_URL}" \
-    -F from="${SENDER_EMAIL}" \
-    -F to="${RECIPIENT_EMAIL}" \
-    -F subject="${EMAIL_SUBJECT}" \
-    -F html="<${HTML_FILE}" 2>&1) || true
-stop_spinner
-
-if [ "${HTTP_CODE}" = "200" ]; then
-    print_ok "Report dispatched to ${C_BOLD}${RECIPIENT_EMAIL}${C_NC}"
-else
-    print_fail "Mailgun API returned HTTP ${HTTP_CODE}"
-    if [ -f "${MAILGUN_RESPONSE_FILE}" ]; then
-        echo "     Response: $(cat "${MAILGUN_RESPONSE_FILE}")"
+    print_skip "Notifications suppressed ${C_DIM}[--no-email]${C_NC}"
+elif [ -z "${NOTIFY_ACTIVE}" ]; then
+    if [ -n "${NOTIFY_DISABLED}" ]; then
+        print_warn "No usable notification channel: ${NOTIFY_DISABLED}"
+        echo -e "     ${C_DIM}Updates ran normally. Configure a channel in the web panel or ${CONFIG_FILE}.${C_NC}"
+    else
+        print_skip "No notification channel configured ${C_DIM}(updates still ran)${C_NC}"
     fi
+elif [ "${NOTIFY_ON_FAILURE_ONLY}" = "true" ] && [ "${ERRORS_OCCURRED}" != true ]; then
+    print_skip "Clean run — notification suppressed ${C_DIM}[NOTIFY_ON_FAILURE_ONLY]${C_NC}"
+else
+    [ -n "${NOTIFY_DISABLED}" ] && print_warn "Skipping unconfigured channel(s): ${NOTIFY_DISABLED}"
+    notify_all "${EMAIL_SUBJECT}" "$(build_text_summary)" "${HTML_FILE}"
 fi
-rm -f "${MAILGUN_RESPONSE_FILE}"
-
-fi   # end of email dispatch
 
 # ==============================================================================
 # 5. CONDITIONAL REBOOT

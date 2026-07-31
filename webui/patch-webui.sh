@@ -78,28 +78,26 @@ JSBLOCK_HEAD
     /* Is the control panel's certificate already trusted by this browser?
        /healthz needs no authentication, so a no-cors fetch either resolves
        (opaque response => TLS handshake succeeded) or rejects (untrusted or
-       unreachable). This is a definite answer rather than a guess based on a
-       timer, and it costs one request. */
+       unreachable). A definite answer rather than a guess based on a timer. */
     function probePanel() {
         return fetch(panelBase() + '/healthz', {mode: 'no-cors', cache: 'no-store'})
             .then(function () { return true; })
             .catch(function () { return false; });
     }
 
-    function showCertHelp() {
-        var url = panelBase() + '/';
+    function showCertHelp(url) {
         Ext.Msg.show({
             title: 'One-time certificate step',
             message:
                 'The control panel runs on port ' + OPEN_PORT + ', which your browser ' +
-                'treats as a separate site from the Proxmox UI on this port.<br><br>' +
-                'Your node is using a self-signed certificate, so that site has to be ' +
+                'treats as a separate site from the Proxmox UI.<br><br>' +
+                'Your node uses a self-signed certificate, so that site has to be ' +
                 'approved once.<br><br>' +
-                '<b>Click OK</b> to open it in a new tab, accept the warning, then close ' +
-                'the tab and click Auto-Update again.<br><br>' +
+                '<b>Click OK</b> to open it in a new tab, accept the warning, then ' +
+                'close the tab and try again.<br><br>' +
                 '<span style="opacity:.75">To remove this step permanently, set up ACME ' +
                 'under Datacenter &rarr; ACME, or install the Proxmox root CA on this ' +
-                'computer. Either one also removes the warning on the Proxmox UI itself.</span>',
+                'computer. Either also removes the warning on the Proxmox UI itself.</span>',
             buttons: Ext.Msg.OKCANCEL,
             fn: function (btn) {
                 if (btn === 'ok') { window.open(url, '_blank', 'noopener'); }
@@ -107,16 +105,9 @@ JSBLOCK_HEAD
         });
     }
 
-    function openPanel() {
-        probePanel().then(function (reachable) {
-            if (reachable) { openPanelWindow(); } else { showCertHelp(); }
-        });
-    }
-
-    function openPanelWindow() {
-        var url = panelBase() + '/';
+    function openWindow(title, url) {
         var win = Ext.create('Ext.window.Window', {
-            title: 'Proxmox Auto-Update',
+            title: title,
             width: Math.min(1100, Math.floor(window.innerWidth * 0.92)),
             height: Math.min(800, Math.floor(window.innerHeight * 0.9)),
             layout: 'fit',
@@ -139,133 +130,215 @@ JSBLOCK_HEAD
         win.show();
     }
 
-    function buttonConfig() {
-        return {
+    function openPanel(title, url) {
+        probePanel().then(function (reachable) {
+            if (reachable) { openWindow(title, url); } else { showCertHelp(url); }
+        });
+    }
+
+    /* ---- Last-run status, used to colour the node button ----
+       Requires credentials, so the panel returns CORS headers scoped to this
+       exact host. A failure here is silent: a missing status dot must never
+       interfere with the Proxmox UI. */
+    var statusCache = {value: null, fetched: 0};
+
+    function fetchStatus() {
+        var now = Date.now();
+        if (statusCache.value && (now - statusCache.fetched) < 25000) {
+            return Promise.resolve(statusCache.value);
+        }
+        return fetch(panelBase() + '/api/state', {
+            credentials: 'include', cache: 'no-store'
+        }).then(function (r) {
+            return r.ok ? r.json() : null;
+        }).then(function (data) {
+            statusCache = {value: data, fetched: Date.now()};
+            return data;
+        }).catch(function () { return null; });
+    }
+
+    function applyStatus(btn) {
+        if (!btn || btn.destroyed) { return; }
+        fetchStatus().then(function (state) {
+            if (!state || !btn.getEl || btn.destroyed) { return; }
+            var el = btn.getEl();
+            if (!el) { return; }
+            var result = (state.last_run && state.last_run.result) || '';
+            var colour = '', tip = 'Never run';
+            if (state.running) {
+                colour = '#ffb300'; tip = 'Update running now';
+            } else if (result.indexOf('error') === 0) {
+                colour = '#f44336';
+                tip = 'Last run reported errors' +
+                      (state.last_run.finished ? ' (' + state.last_run.finished + ')' : '');
+            } else if (result.indexOf('ok') === 0) {
+                colour = '#4caf50';
+                tip = 'Last run OK' +
+                      (state.last_run.finished ? ' (' + state.last_run.finished + ')' : '');
+            }
+            if (state.repeat_offenders) {
+                tip += '\nRepeatedly failing: ' + state.repeat_offenders;
+            }
+            var dom = el.dom.querySelector('.pau-dot');
+            if (!dom && colour) {
+                var span = document.createElement('span');
+                span.className = 'pau-dot';
+                span.style.cssText = 'display:inline-block;width:8px;height:8px;' +
+                    'border-radius:50%;margin-left:6px;vertical-align:middle';
+                var label = el.dom.querySelector('.x-btn-inner');
+                (label || el.dom).appendChild(span);
+                dom = span;
+            }
+            if (dom) { dom.style.background = colour || 'transparent'; }
+            btn.setTooltip(tip);
+        });
+    }
+
+    /* ---- Toolbar buttons ----
+       The button is added to the toolbar of whichever Config panel is on screen:
+       the node's (Reboot / Shutdown / Shell ...) or a guest's (Start / Shutdown /
+       Console ...). It is styled by copying ui/scale/baseCls off a button already
+       in that toolbar, so it matches its neighbours instead of rendering as flat
+       text the way a bare xtype:'button' does. */
+    function siblingStyle(tb) {
+        var items = tb.query('button');
+        for (var i = 0; i < items.length; i++) {
+            var b = items[i];
+            if (b.itemId === 'pauBtn') { continue; }
+            return {
+                ui: b.ui,
+                scale: b.scale,
+                baseCls: b.baseCls,
+                cls: b.cls
+            };
+        }
+        return {};
+    }
+
+    /* Windows guests are updated by the scheduled run only, so no button. The
+       tree record does not carry ostype, so ask the API once per vmid and
+       remember the answer. */
+    var ostypeCache = {};
+
+    function withOsType(node, vmid, cb) {
+        var key = node + '/' + vmid;
+        if (ostypeCache[key] !== undefined) { cb(ostypeCache[key]); return; }
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + node + '/qemu/' + vmid + '/config',
+            method: 'GET',
+            success: function (resp) {
+                var t = (resp.result && resp.result.data && resp.result.data.ostype) || '';
+                ostypeCache[key] = t;
+                cb(t);
+            },
+            failure: function () { ostypeCache[key] = ''; cb(''); }
+        });
+    }
+
+    function addButton(tb, cfg) {
+        var style = siblingStyle(tb);
+        var btn = tb.insert(0, Ext.apply({
             xtype: 'button',
-            itemId: 'pveAutoUpdateBtn',
-            text: 'Auto-Update',
+            itemId: 'pauBtn',
+            text: cfg.text,
             iconCls: 'fa fa-refresh',
-            margin: '0 5 0 0',
-            handler: openPanel
-        };
+            tooltip: cfg.tooltip,
+            handler: function () { openPanel(cfg.title, cfg.url); }
+        }, style));
+        tb.updateLayout();
+        if (cfg.status) {
+            applyStatus(btn);
+            var task = Ext.TaskManager.start({
+                interval: 30000,
+                run: function () {
+                    if (btn.destroyed) { return false; }
+                    applyStatus(btn);
+                    return true;
+                }
+            });
+            btn.on('destroy', function () { Ext.TaskManager.stop(task); });
+        }
+        return btn;
     }
 
-    /* ---- Per-guest "Auto-Update" tab, added after Permissions ----
-       PVE.qemu.Config and PVE.lxc.Config are already defined by the time this
-       block is parsed (it is appended to the end of the same file), so they can
-       be overridden directly. The item is added after callParent, once the
-       panel's own items exist, so we never have to know how they were built.
+    function decorate(panel) {
+        var rec = panel.pveSelNode;
+        if (!rec || !rec.data) { return; }
+        if (!panel.getDockedItems) { return; }
 
-       Everything is wrapped in try/catch: a Proxmox release that reshapes these
-       panels should cost us the tab, not break the guest view entirely. */
-    function addGuestTab(cfg, kind) {
-        var rec = cfg.pveSelNode;
-        if (!rec || !rec.data || !rec.data.vmid) { return; }
+        var tb = panel.getDockedItems('toolbar[dock="top"]')[0];
+        if (!tb || !tb.rendered || tb.query('#pauBtn').length) { return; }
+
+        var type = rec.data.type;
+        var node = rec.data.node;
         var vmid = rec.data.vmid;
-        var name = rec.data.name || '';
-        var url = panelBase() + '/guest?vmid=' + encodeURIComponent(vmid) +
-                  '&name=' + encodeURIComponent(name);
 
-        cfg.add({
-            xtype: 'panel',
-            title: 'Auto-Update',
-            itemId: 'pauGuestUpdate',
-            iconCls: 'fa fa-refresh',
-            border: false,
-            layout: 'fit',
-            bodyPadding: 0,
-            html: '<div style="padding:12px;font:13px sans-serif">Checking control panel…</div>',
-            listeners: {
-                /* Probe on first activation rather than embedding blindly, so an
-                   unaccepted certificate produces an explanation instead of a
-                   blank panel. */
-                activate: function (p) {
-                    if (p.pauLoaded) { return; }
-                    p.pauLoaded = true;
-                    probePanel().then(function (reachable) {
-                        if (reachable) {
-                            p.update('<iframe src="' + url +
-                                     '" style="width:100%;height:100%;border:0"' +
-                                     ' referrerpolicy="no-referrer"></iframe>');
-                        } else {
-                            p.pauLoaded = false;   /* let them retry after accepting */
-                            p.update(
-                                '<div style="padding:16px;font:13px/1.6 sans-serif">' +
-                                '<b>One-time certificate step</b><br><br>' +
-                                'The control panel runs on port ' + OPEN_PORT + ', which ' +
-                                'your browser treats as a separate site and has not yet ' +
-                                'been approved.<br><br>' +
-                                '<a href="' + url + '" target="_blank" rel="noopener">' +
-                                'Open it in a new tab</a>, accept the warning, then come ' +
-                                'back to this tab.<br><br>' +
-                                '<span style="opacity:.75">To remove this step for good, ' +
-                                'set up ACME under Datacenter &rarr; ACME, or install the ' +
-                                'Proxmox root CA on this computer.</span></div>');
-                        }
-                    });
-                }
-            }
-        });
-    }
+        if (type === 'node') {
+            addButton(tb, {
+                text: 'Update Everything',
+                tooltip: 'Update this node and all its guests',
+                title: 'Proxmox Auto-Update — ' + (rec.data.text || node),
+                url: panelBase() + '/',
+                status: true
+            });
+            return;
+        }
 
-    function overrideGuestConfig(cls, kind) {
-        if (!cls) { return; }
-        Ext.override(cls, {
-            initComponent: function () {
-                this.callParent(arguments);
-                try {
-                    addGuestTab(this, kind);
-                } catch (e) {
-                    if (window.console) {
-                        console.warn('proxmox-autoupdate: could not add guest tab', e);
-                    }
-                }
-            }
-        });
-    }
+        if (type !== 'lxc' && type !== 'qemu') { return; }
+        if (!vmid) { return; }
 
-    try {
-        overrideGuestConfig(PVE.qemu && PVE.qemu.Config, 'qemu');
-        overrideGuestConfig(PVE.lxc && PVE.lxc.Config, 'lxc');
-    } catch (e) {
-        if (window.console) {
-            console.warn('proxmox-autoupdate: guest config override failed', e);
+        var name = rec.data.name || rec.data.text || ('guest ' + vmid);
+        var add = function () {
+            /* Re-check: the panel may have been swapped out while the ostype
+               lookup was in flight. */
+            if (!tb.rendered || tb.destroyed || tb.query('#pauBtn').length) { return; }
+            addButton(tb, {
+                text: 'Update Now',
+                tooltip: 'Update only this guest. The host is not touched and no ' +
+                         'reboot is scheduled.',
+                title: 'Auto-Update — ' + name + ' (' + vmid + ')',
+                url: panelBase() + '/guest?vmid=' + encodeURIComponent(vmid) +
+                     '&name=' + encodeURIComponent(name),
+                status: false
+            });
+        };
+
+        if (type === 'qemu') {
+            withOsType(node, vmid, function (ostype) {
+                if (/^w/i.test(ostype)) { return; }   /* win*, wvista, w2k... */
+                add();
+            });
+        } else {
+            add();
         }
     }
 
-    /* The toolbar is built during workspace render, which happens after login.
-       Poll briefly for the Documentation button and insert just before it. */
+    /* Config panels are created and destroyed as you click around the tree, so
+       a one-shot override is not enough. A cheap periodic sweep is used instead:
+       it works regardless of how or when Proxmox builds those panels, which
+       matters because that construction differs between releases. */
     function install() {
-        var attempts = 0;
-        var task = Ext.TaskManager.start({
-            interval: 500,
+        Ext.TaskManager.start({
+            interval: 800,
             run: function () {
-                attempts++;
-                if (attempts > 120) { return false; }   /* give up after ~60s */
-
-                var doc = Ext.ComponentQuery.query('button[onlineHelp=pve_documentation_index]')[0];
-                if (!doc) {
-                    var candidates = Ext.ComponentQuery.query('toolbar button');
-                    for (var i = 0; i < candidates.length; i++) {
-                        if (candidates[i].text === 'Documentation') { doc = candidates[i]; break; }
+                try {
+                    var panels = Ext.ComponentQuery.query('panel[pveSelNode]');
+                    for (var i = 0; i < panels.length; i++) {
+                        if (panels[i].rendered && panels[i].isVisible()) {
+                            decorate(panels[i]);
+                        }
+                    }
+                } catch (e) {
+                    if (window.console) {
+                        console.warn('proxmox-autoupdate: toolbar sweep failed', e);
                     }
                 }
-                if (!doc || !doc.ownerCt) { return true; }
-
-                var tb = doc.ownerCt;
-                if (tb.down('#pveAutoUpdateBtn')) { return false; }
-
-                var idx = tb.items.indexOf(doc);
-                if (idx < 0) { idx = 0; }
-                tb.insert(idx, buttonConfig());
-                tb.updateLayout();
-                return false;
+                return true;
             }
         });
-        return task;
     }
 
-    Ext.onReady(function () { Ext.defer(install, 800); });
+    Ext.onReady(function () { Ext.defer(install, 1200); });
 })();
 /* ==== END proxmox-autoupdate button ==== */
 JSBLOCK
