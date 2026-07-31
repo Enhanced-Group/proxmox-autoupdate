@@ -528,11 +528,26 @@ done
     except OSError as exc:
         return False, "Cannot read %s: %s" % (UPDATE_SCRIPT, exc)
 
-    start = src.find("PAYLOAD_HELPER='")
-    end = src.find("notify_all()")
-    if start < 0 or end < 0 or end <= start:
-        return False, "Could not locate the notification helpers in the update script."
-    helpers = src[start:end]
+    # Delimited by explicit markers rather than by guessing at the first and
+    # last function: a helper that falls outside the range is not a syntax
+    # error, it is a function that is simply undefined when the test runs.
+    begin = src.find("# >>> PAU-NOTIFIER-BEGIN")
+    end = src.find("# <<< PAU-NOTIFIER-END")
+    if begin < 0 or end < 0 or end <= begin:
+        return False, ("Could not locate the notifier markers in %s. The update "
+                       "script may be older than this panel — reinstall to bring "
+                       "them back into step." % UPDATE_SCRIPT)
+    helpers = src[begin:end]
+
+    # Guard against the same class of mistake recurring.
+    required = ("cfg_escape()", "curl_cfg()", "build_payload()", "post_webhook()",
+                "notify_email()", "notify_discord()", "notify_slack()",
+                "notify_webhook()", "discord_resolve_target()", "discord_cfg()")
+    absent = [name for name in required if name not in helpers]
+    if absent:
+        return False, ("The notifier section is incomplete — missing %s. This is a "
+                       "packaging fault, not a configuration problem."
+                       % ", ".join(absent))
 
     # Email needs the HTML file argument; a plain-text body is fine for a test.
     body_file = ""
@@ -1350,8 +1365,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "Not found"})
 
     def _test_notification(self):
+        # Always 200: the request succeeded, and it is the *test* that passed or
+        # failed. Returning 400 made the browser's generic error path fire and
+        # report "HTTP 400", throwing away the explanation in the body — which
+        # is the one thing anyone needs from this button.
         ok, detail = send_test_notification(read_config())
-        self._json(200 if ok else 400, {"ok": ok, "detail": detail})
+        self._json(200, {"ok": ok, "detail": detail})
 
     def _self_update(self, body, user):
         if body.get("confirm") != "UPDATE":
