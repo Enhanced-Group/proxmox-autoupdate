@@ -597,6 +597,25 @@ def _version_tuple(v):
 CHANGELOG_URL = "%s/CHANGELOG.md" % GITHUB_RAW
 LOCAL_CHANGELOG = "/usr/local/share/proxmox-autoupdate/CHANGELOG.md"
 
+
+def _fetch_raw(url, limit=200_000):
+    """Fetch a raw GitHub file, bypassing the CDN cache.
+
+    raw.githubusercontent.com sits behind a CDN that serves a cached copy for
+    several minutes. Without this a check run shortly after a release keeps
+    reporting the previous version, which looks like the check is broken. A
+    unique query string gives the CDN nothing to match on; the no-cache headers
+    cover any proxy in between.
+    """
+    bust = "%s?cb=%d" % (url, int(time.time()))
+    req = urllib.request.Request(bust, headers={
+        "User-Agent": "proxmox-autoupdate",
+        "Cache-Control": "no-cache, max-age=0",
+        "Pragma": "no-cache",
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read(limit).decode("utf-8", errors="replace")
+
 VERSION_HEADING = re.compile(r"^##\s+([0-9][^\s—-]*)\s*[—-]?\s*(.*)$")
 SECTION_HEADING = re.compile(r"^###\s+(.+?)\s*$")
 BULLET = re.compile(r"^[-*]\s+(.*)$")
@@ -642,11 +661,8 @@ def parse_changelog(text, limit=1):
 
 def fetch_changelog():
     """Published changelog, falling back to the copy installed alongside us."""
-    req = urllib.request.Request(
-        CHANGELOG_URL, headers={"User-Agent": "proxmox-autoupdate"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.read(200_000).decode("utf-8", errors="replace"), None
+        return _fetch_raw(CHANGELOG_URL), None
     except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
         try:
             with open(LOCAL_CHANGELOG, encoding="utf-8") as fh:
@@ -663,13 +679,11 @@ def check_for_updates():
     silently onto a node that merely looked.
     """
     current = installed_version()
-    req = urllib.request.Request(
-        "%s/update-everything.sh" % GITHUB_RAW,
-        headers={"User-Agent": "proxmox-autoupdate"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            head = resp.read(4096).decode("utf-8", errors="replace")
+        # Read enough to be safe if the assignment ever moves further down the
+        # file — a check that silently reports "up to date" because it stopped
+        # reading too early is worse than a slightly larger fetch.
+        head = _fetch_raw("%s/update-everything.sh" % GITHUB_RAW, limit=65_536)
     except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
         return {"current": current, "latest": None,
                 "error": "Could not reach GitHub: %s" % exc}
@@ -688,6 +702,7 @@ def check_for_updates():
         "current": current,
         "latest": latest,
         "update_available": bool(behind),
+        "checked_at": time.strftime("%H:%M:%S"),
         "repo": "https://github.com/%s" % GITHUB_REPO,
         "command": "curl -sSL %s | bash" % INSTALL_SCRIPT_URL,
     }
@@ -2524,7 +2539,11 @@ $("btnCheckUpdate").onclick = async () => {
       loadChangelog();
     } else {
       latestVersion = null;
-      msg($("verMsg"), "Up to date (" + r.current + ").", true);
+      // Include what was actually published and when it was looked up, so
+      // "up to date" can be told apart from a stale or failed lookup.
+      msg($("verMsg"), "Up to date — you have " + r.current +
+                       ", published is " + (r.latest || "unknown") +
+                       " (checked " + (r.checked_at || "just now") + ").", true);
       $("btnSelfUpdate").classList.add("hidden");
     }
   } catch (e) { msg($("verMsg"), e.message, false); }
