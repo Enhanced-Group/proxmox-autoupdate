@@ -8,16 +8,12 @@ install and nothing else. Earlier releases are in the git history and on the
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
-## 3.4.1 — 2026-07-31
+## 3.4.2 — 2026-07-31
+
+### Added
+- **Diagnose Discord DM** button. It walks the DM flow one call at a time and reports which step fails and why — bad token, the bot's own ID, no shared server, or a rejected recipient — instead of a bare "400".
+- Unsaved-change tracking on every settings tab: a dot on the tab, a highlighted Save button, a banner, and a warning if you close the page with edits pending.
 
 ### Fixed
-- The Update Everything button overflowed into the Documentation button. It is now larger, sized by ExtJS rather than CSS, and no longer clips.
-- Discord direct messages reported a bare "400" with no cause. The actual message, error code and offending field are now shown.
-- An empty embed footer or description caused a 400 that looked like a configuration problem.
-- A bot token pasted with its "Bot " prefix is now accepted rather than producing "Bot Bot …".
-- Field-level Discord errors never appeared, because the extraction called `join()` on a path containing array indices.
-
-### Changed
-- The status indicator is now the button's icon — a coloured dot, green, red or pulsing amber — instead of a badge on the right.
-- The button says when it is updating **itself**, which is distinct from updating the guests, and prompts you to reload your Proxmox tabs once it finishes.
-- The changelog now carries only the current release.
+- The test notification aborted before sending on configs written by an older installer, because it sourced them under `set -u` without defaulting the newer keys.
+- A bot token pasted with its `Bot ` prefix is now accepted by the diagnostic as well as the notifier.
