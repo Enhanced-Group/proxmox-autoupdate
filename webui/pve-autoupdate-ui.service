@@ -1,0 +1,33 @@
+[Unit]
+Description=Proxmox Auto-Update web control panel
+Documentation=https://github.com/Enhanced-Group/proxmox-autoupdate
+After=network-online.target pveproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pve-autoupdate-ui
+Restart=on-failure
+RestartSec=5
+User=root
+
+# Deliberately NOT sandboxed with ProtectSystem/ProtectHome/ReadWritePaths.
+#
+# systemd's filesystem protections are inherited by child processes, and this
+# service exists to launch `update-everything.sh`, which runs `apt-get
+# dist-upgrade` on the host and drives pct/qm. Making /usr or /etc read-only
+# here would break the very thing the service is for, in ways that surface as
+# confusing mid-upgrade failures rather than a clean startup error.
+#
+# The meaningful security boundary is authentication, not confinement: every
+# request must carry a valid Proxmox session cookie for a user in ALLOWED_USERS,
+# and mutating requests additionally require a CSRF token. Treat access to this
+# port as equivalent to root shell access, and firewall it accordingly.
+
+# These are safe for children and cost nothing.
+RestrictRealtime=yes
+RestrictSUIDSGID=no
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
