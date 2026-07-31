@@ -86,29 +86,50 @@ JSBLOCK_HEAD
         var el = document.createElement('style');
         el.id = 'pau-style';
         el.textContent = [
-            '.pau-btn, .pau-btn .x-btn-button {',
-            '  background-color: #e57000 !important;',
-            '  background-image: none !important;',
-            '}',
+            /* box-sizing matters: without it the border below is added on top
+               of the width ExtJS measured at layout time, and the button
+               overflows into its neighbour. */
+            '.pau-btn, .pau-btn * { box-sizing: border-box !important; }',
             '.pau-btn {',
+            '  background: #e57000 !important;',
+            '  background-image: none !important;',
             '  border: 1px solid #b35700 !important;',
             '  border-radius: 3px !important;',
+            '  overflow: visible !important;',
             '}',
-            '.pau-btn .x-btn-inner, .pau-btn .x-btn-icon-el {',
+            '.pau-btn .x-btn-button {',
+            '  background: transparent !important;',
+            '  background-image: none !important;',
+            '}',
+            '.pau-btn .x-btn-inner {',
             '  color: #ffffff !important;',
             '  font-weight: 600 !important;',
             '}',
-            '.pau-btn.x-btn-over, .pau-btn.x-btn-over .x-btn-button,',
-            '.pau-btn:hover, .pau-btn:hover .x-btn-button {',
-            '  background-color: #ff8c1a !important;',
+            '.pau-btn.x-btn-over, .pau-btn.x-btn-focus, .pau-btn:hover {',
+            '  background: #ff8c1a !important;',
+            '  border-color: #c96200 !important;',
             '}',
-            '.pau-btn.x-btn-pressed, .pau-btn.x-btn-pressed .x-btn-button {',
-            '  background-color: #c96200 !important;',
+            '.pau-btn.x-btn-pressed, .pau-btn.x-btn-menu-active {',
+            '  background: #c96200 !important;',
             '}',
-            '.pau-dot {',
-            '  display: inline-block; width: 8px; height: 8px;',
-            '  border-radius: 50%; margin-left: 6px; vertical-align: middle;',
-            '}'
+            /* The status indicator *is* the icon — a coloured dot in the icon
+               slot, rather than a second badge tacked onto the right. */
+            '.pau-btn .x-btn-icon-el.pau-ico {',
+            '  background-image: none !important;',
+            '  position: relative;',
+            '}',
+            '.pau-btn .x-btn-icon-el.pau-ico::before {',
+            '  content: ""; position: absolute; top: 50%; left: 50%;',
+            '  width: 10px; height: 10px; margin: -5px 0 0 -5px;',
+            '  border-radius: 50%; background: #d9d9d9;',
+            '  box-shadow: 0 0 0 1px rgba(0,0,0,.25);',
+            '}',
+            '.pau-btn.pau-ok      .x-btn-icon-el.pau-ico::before { background: #46c46b; }',
+            '.pau-btn.pau-error   .x-btn-icon-el.pau-ico::before { background: #ff4d4d; }',
+            '.pau-btn.pau-running .x-btn-icon-el.pau-ico::before {',
+            '  background: #ffd24d; animation: pau-pulse 1.2s ease-in-out infinite;',
+            '}',
+            '@keyframes pau-pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }'
         ].join('\n');
         document.head.appendChild(el);
     }
@@ -182,7 +203,15 @@ JSBLOCK_HEAD
 
     function fetchStatus() {
         var now = Date.now();
-        if (statusCache.value && (now - statusCache.fetched) < 25000) {
+        /* Poll hard while something is happening so the label keeps up, and
+           back off to once every 25s when idle. */
+        var busy = statusCache.value &&
+                   (statusCache.value.running ||
+                    statusCache.value.pending ||
+                    statusCache.value.self_update === 'active' ||
+                    statusCache.value.self_update === 'activating');
+        var ttl = busy ? 3000 : 25000;
+        if (statusCache.value && (now - statusCache.fetched) < ttl) {
             return Promise.resolve(statusCache.value);
         }
         return fetch(panelBase() + '/api/state', {
@@ -195,36 +224,80 @@ JSBLOCK_HEAD
         }).catch(function () { return null; });
     }
 
+    /* Whether the tool is updating *itself* is deliberately distinct from a
+       guest update: a self-update swaps out this very file, so every open
+       Proxmox tab is left running stale JavaScript until it is reloaded. */
+    var selfUpdateSeen = false;
+
     function applyStatus(btn) {
         if (!btn || btn.destroyed) { return; }
         fetchStatus().then(function (state) {
             if (!state || !btn.getEl || btn.destroyed) { return; }
             var el = btn.getEl();
             if (!el) { return; }
+
             var result = (state.last_run && state.last_run.result) || '';
-            var colour = '', tip = 'Update this node and all its guests';
-            if (state.running) {
-                colour = '#ffe08a'; tip = 'Update running now';
-            } else if (result.indexOf('error') === 0) {
-                colour = '#ff5c5c'; tip = 'Last run reported errors';
-            } else if (result.indexOf('ok') === 0) {
-                colour = '#7bd88f'; tip = 'Last run completed cleanly';
+            var updatingSelf = state.self_update === 'active' ||
+                               state.self_update === 'activating' ||
+                               !!state.pending;
+
+            var cls = '', label = 'Update Everything';
+            var tip = 'Update this node and all its guests';
+
+            if (updatingSelf) {
+                cls = 'pau-running';
+                label = 'Updating Auto-Update…';
+                tip = 'Proxmox Auto-Update is updating itself' +
+                      (state.pending ? ' to ' + state.pending : '') +
+                      '.\nReload this page once it finishes.';
+                selfUpdateSeen = true;
+            } else if (state.running) {
+                cls = 'pau-running';
+                label = 'Updating…';
+                tip = 'An update run is in progress';
+            } else {
+                if (result.indexOf('error') === 0) {
+                    cls = 'pau-error'; tip = 'Last run reported errors';
+                } else if (result.indexOf('ok') === 0) {
+                    cls = 'pau-ok'; tip = 'Last run completed cleanly';
+                }
+                if (state.last_run && state.last_run.finished) {
+                    tip += ' (' + state.last_run.finished + ')';
+                }
+                if (state.repeat_offenders) {
+                    tip += '\nRepeatedly failing: ' + state.repeat_offenders;
+                }
+                /* The self-update finished while this tab was open, so the UI
+                   it is running came from the previous version. */
+                if (selfUpdateSeen) {
+                    selfUpdateSeen = false;
+                    promptReload(state.version);
+                }
             }
-            if (state.last_run && state.last_run.finished) {
-                tip += ' (' + state.last_run.finished + ')';
-            }
-            if (state.repeat_offenders) {
-                tip += '\nRepeatedly failing: ' + state.repeat_offenders;
-            }
-            var dot = el.dom.querySelector('.pau-dot');
-            if (!dot && colour) {
-                dot = document.createElement('span');
-                dot.className = 'pau-dot';
-                var label = el.dom.querySelector('.x-btn-inner');
-                (label || el.dom).appendChild(dot);
-            }
-            if (dot) { dot.style.background = colour || 'transparent'; }
+
+            ['pau-ok', 'pau-error', 'pau-running'].forEach(function (c) {
+                el.removeCls ? el.removeCls(c) : el.dom.classList.remove(c);
+            });
+            if (cls) { el.addCls ? el.addCls(cls) : el.dom.classList.add(cls); }
+            if (btn.getText() !== label) { btn.setText(label); }
             btn.setTooltip(tip);
+        });
+    }
+
+    function promptReload(version) {
+        Ext.Msg.show({
+            title: 'Auto-Update updated',
+            message:
+                'Proxmox Auto-Update is now running version <b>' +
+                (version || 'the latest release') + '</b>.<br><br>' +
+                'This page is still running the previous version\'s interface. ' +
+                '<b>Reload every open Proxmox tab</b> to pick up the new one — ' +
+                'a hard refresh (<b>Ctrl+Shift+R</b>) if the buttons look wrong.',
+            buttons: Ext.Msg.OKCANCEL,
+            buttonText: {ok: 'Reload now', cancel: 'Later'},
+            fn: function (choice) {
+                if (choice === 'ok') { window.location.reload(true); }
+            }
         });
     }
 
@@ -258,18 +331,30 @@ JSBLOCK_HEAD
                         xtype: 'button',
                         itemId: 'pauNodeBtn',
                         text: 'Update Everything',
-                        iconCls: 'fa fa-refresh',
+                        /* The icon slot holds the status dot. */
+                        iconCls: 'pau-ico',
                         cls: 'pau-btn',
-                        margin: '0 5 0 0',
+                        scale: 'medium',
+                        minWidth: 170,
+                        margin: '0 8 0 0',
                         handler: function () {
                             openPanel('Proxmox Auto-Update', panelBase() + '/');
                         }
                     });
+
+                    /* Lay out twice: the first pass can measure before the
+                       injected stylesheet has been applied, which is what left
+                       the button overlapping its neighbour. */
                     tb.updateLayout();
+                    Ext.defer(function () {
+                        if (!btn.destroyed && tb.updateLayout) { tb.updateLayout(); }
+                    }, 250);
 
                     applyStatus(btn);
+                    /* Ticks every 3s; fetchStatus decides whether that turns
+                       into an actual request or a cached answer. */
                     Ext.TaskManager.start({
-                        interval: 30000,
+                        interval: 3000,
                         run: function () {
                             if (btn.destroyed) { return false; }
                             applyStatus(btn);

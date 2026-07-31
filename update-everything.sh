@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="3.4.0"
+PAU_VERSION="3.4.1"
 
 set -u
 set -o pipefail
@@ -1114,17 +1114,25 @@ failed = os.environ.get("PAU_FAILED") == "true"
 dry = os.environ.get("PAU_DRY") == "true"
 
 if fmt == "discord":
-    # Discord rejects an embed description over 4096 characters.
-    text = body[:3900]
+    # Discord validates these strictly and answers a bare 400 when they are
+    # wrong: the description caps at 4096, the title at 256, and an embed
+    # footer with empty text is rejected outright rather than ignored.
+    text = body[:3900] or "(no output)"
     if len(body) > 3900:
-        text += "\n… truncated, see the log for the rest"
+        text += "\n… truncated, see the attached log for the rest"
     colour = 9807270 if dry else (15158332 if failed else 3066993)
-    payload = {"embeds": [{
-        "title": subject[:256],
+    embed = {
+        "title": (subject[:256] or "Proxmox Auto-Update"),
         "description": "```\n" + text + "\n```",
         "color": colour,
-        "footer": {"text": os.environ.get("PAU_FOOTER", "")[:2048]},
-    }]}
+    }
+    # Join only the parts that exist, so an unset host or timestamp cannot
+    # leave a lone separator as the footer text.
+    footer = " · ".join(p for p in (os.environ.get("PAU_HOST", "").strip(),
+                                    os.environ.get("PAU_TIMESTAMP", "").strip()) if p)
+    if footer:
+        embed["footer"] = {"text": footer[:2048]}
+    payload = {"embeds": [embed]}
 elif fmt == "slack":
     text = body[:3500]
     if len(body) > 3500:
@@ -1253,13 +1261,26 @@ discord_resolve_target() {
     [ -n "${DISCORD_TARGET_READY}" ] && return "${DISCORD_TARGET_READY}"
 
     if [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; then
+        # Tokens are commonly pasted straight out of the developer portal with
+        # the "Bot " prefix already attached, which would produce "Bot Bot ...".
+        local token="${DISCORD_BOT_TOKEN#Bot }"
+        token="${token# }"
+
+        if ! echo "${DISCORD_USER_ID}" | grep -qE '^[0-9]{15,25}$'; then
+            print_fail "Discord: DISCORD_USER_ID must be a numeric user ID, not a username"
+            echo "     ${C_DIM}Enable Developer Mode in Discord, right-click yourself, Copy User ID.${C_NC}"
+            DISCORD_TARGET_READY=1
+            return 1
+        fi
+
         local resp channel
         resp=$(curl -s --max-time 30 -X POST \
             "https://discord.com/api/v10/users/@me/channels" \
-            -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
+            -H "Authorization: Bot ${token}" \
             -H "Content-Type: application/json" \
             -d "{\"recipient_id\":\"${DISCORD_USER_ID}\"}" 2>/dev/null) || resp=""
         channel=$(printf '%s' "${resp}" | jq -r '.id // empty' 2>/dev/null || true)
+        DISCORD_BOT_TOKEN="${token}"
 
         if [ -n "${channel}" ]; then
             DISCORD_TARGET_URL="https://discord.com/api/v10/channels/${channel}/messages"
@@ -1268,12 +1289,24 @@ discord_resolve_target() {
             return 0
         fi
 
-        # Most often: the bot and the recipient share no server, or the token is
-        # wrong. Say which, rather than failing silently.
-        local why
+        # Report exactly what Discord said. "400" on its own is not something
+        # anyone can act on; the message and code identify the problem.
+        local why code_num details
         why=$(printf '%s' "${resp}" | jq -r '.message // empty' 2>/dev/null || true)
-        print_fail "Discord DM unavailable${why:+ — ${why}}"
-        [ -z "${why}" ] && echo "     ${C_DIM}Check the bot token, and that the bot shares a server with user ${DISCORD_USER_ID}.${C_NC}"
+        code_num=$(printf '%s' "${resp}" | jq -r '.code // empty' 2>/dev/null || true)
+        details=$(printf '%s' "${resp}" \
+            | jq -r '[(.errors // {}) | paths(scalars) as $p | "\($p|map(tostring)|join(".")): \(getpath($p))"] | join("; ")' \
+              2>/dev/null || true)
+
+        print_fail "Discord DM unavailable${why:+ — ${why}}${code_num:+ (code ${code_num})}"
+        [ -n "${details}" ] && echo "     ${C_DIM}${details}${C_NC}"
+        case "${code_num}" in
+            50007) echo "     ${C_DIM}That user does not accept DMs from this bot. The bot must share a${C_NC}"
+                   echo "     ${C_DIM}server with you, and your privacy settings must allow server DMs.${C_NC}" ;;
+            0|"")  [ -z "${why}" ] && echo "     ${C_DIM}No response from Discord — check network access.${C_NC}" ;;
+            *)     echo "     ${C_DIM}Check the bot token is a *bot* token, and the user ID is your own.${C_NC}" ;;
+        esac
+        [ -n "${resp}" ] && echo "     ${C_DIM}Raw: $(printf '%s' "${resp}" | head -c 240)${C_NC}"
 
         # Fall back to the webhook rather than losing the report entirely.
         if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
@@ -1390,11 +1423,21 @@ notify_discord() {
     local label="Discord"
     [ -n "${DISCORD_TARGET_AUTH}" ] && label="Discord DM"
 
-    local code
-    code=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" \
+    # Never POST an unusable body: Discord answers an empty or malformed payload
+    # with a 400 that looks identical to a configuration problem.
+    local payload
+    payload=$(build_payload discord "$1" "$2")
+    if [ -z "${payload}" ] || ! printf '%s' "${payload}" | jq -e . >/dev/null 2>&1; then
+        print_fail "${label}: could not build the message payload (is python3 working?)"
+        return 0
+    fi
+
+    local body_file code
+    body_file=$(mktemp)
+    code=$(curl -s --max-time 30 -o "${body_file}" -w "%{http_code}" \
         "${auth[@]+"${auth[@]}"}" \
         -H "Content-Type: application/json" \
-        -X POST --data-binary "$(build_payload discord "$1" "$2")" \
+        -X POST --data-binary "${payload}" \
         "${DISCORD_TARGET_URL}" 2>/dev/null) || code="000"
 
     if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
@@ -1402,8 +1445,16 @@ notify_discord() {
     elif [ "${code}" = "000" ]; then
         print_fail "${label} unreachable (network error or timeout)"
     else
-        print_fail "${label} returned HTTP ${code}"
+        local why details
+        why=$(jq -r '.message // empty' "${body_file}" 2>/dev/null || true)
+        details=$(jq -r '[(.errors // {}) | paths(scalars) as $p | "\($p|map(tostring)|join(".")): \(getpath($p))"] | join("; ")' \
+            "${body_file}" 2>/dev/null || true)
+        print_fail "${label} returned HTTP ${code}${why:+ — ${why}}"
+        [ -n "${details}" ] && echo "     ${C_DIM}${details}${C_NC}"
+        [ -z "${why}" ] && [ -s "${body_file}" ] && \
+            echo "     ${C_DIM}Raw: $(head -c 240 "${body_file}")${C_NC}"
     fi
+    rm -f "${body_file}"
 
     discord_attach_log "${DISCORD_TARGET_URL}"
 }

@@ -1056,14 +1056,20 @@ class Handler(BaseHTTPRequestHandler):
             status["version"] = installed_version()
             self._json(200, status)
         elif path == "/api/state":
-            # Consumed cross-origin by the toolbar button's status dot.
+            # Consumed cross-origin by the toolbar button's status dot. Includes
+            # the self-update fields so the button can say it is updating the
+            # tool rather than the guests — the two mean different things, and
+            # only one of them invalidates the page you are looking at.
             state = read_state()
             snap = JOB.snapshot()
+            maint = maintenance_status()
             self._json(200, {
                 "running": snap["running"] or lock_is_held(),
                 "last_run": state.get("last_run") or {},
                 "repeat_offenders": repeat_offenders_text(),
                 "version": installed_version(),
+                "self_update": maint["self_update"],
+                "pending": maint["pending"],
             })
         elif path == "/api/history":
             state = read_state()
@@ -1782,7 +1788,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
         <div>
           <label for="cfg2_DISCORD_USER_ID">Your Discord user ID</label>
           <input id="cfg2_DISCORD_USER_ID" data-key="DISCORD_USER_ID"
-                 placeholder="<your-user-id>">
+                 inputmode="numeric" placeholder="your numeric user ID">
           <div class="hint">Enable Developer Mode, then right-click yourself → Copy User ID.</div>
         </div>
       </div>
@@ -1880,6 +1886,11 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <span id="installStage" class="hint hidden" style="margin:0"></span>
     </div>
     <div id="maintProgress" class="progress"><div></div></div>
+    <div id="reloadWarning" class="msg show err hidden" style="margin-top:10px">
+      Updating the tool replaces the JavaScript the Proxmox UI is running.
+      When this finishes, reload <strong>every open Proxmox tab</strong> —
+      Ctrl+Shift+R — or they will keep running the old interface.
+    </div>
     <div id="verMsg" class="msg"></div>
     <div class="hint">Checking only reads the published version — it never
       installs anything on its own. Updating is always a deliberate action.</div>
@@ -2096,13 +2107,14 @@ function renderMaintState(v) {
   // panel itself restarts and the version briefly still reads as the old one.
   const stage = $("installStage");
   stage.classList.toggle("hidden", !busy);
+  $("reloadWarning").classList.toggle("hidden", !busy);
   if (busy) {
     btn.classList.remove("hidden");
     btn.innerHTML = '<span class="spinner"></span>Installing…';
     if (v.self_update === "active" || v.self_update === "activating") {
       stage.textContent = "Downloading and running the installer…";
     } else if (v.pending) {
-      stage.textContent = "Installed — waiting for the panel to restart on " +
+      stage.textContent = "Installed — waiting for the panel to come back on " +
                           v.pending + "…";
     } else {
       stage.textContent = "Working…";
@@ -2196,8 +2208,10 @@ function watchMaintenance() {
       clearInterval(maintPoll); maintPoll = null;
       // Only reached once the installed version matches what was being
       // installed, so this really does mean finished.
-      msg($("verMsg"), "Update complete — now running " + v.version + ".", true);
+      msg($("verMsg"), "Update complete — now running " + v.version +
+                       ". Reload your Proxmox tabs to pick up the new interface.", true);
       $("btnSelfUpdate").classList.add("hidden");
+      $("reloadWarning").classList.add("hidden");
       latestVersion = null;
       loadChangelog();
     }
