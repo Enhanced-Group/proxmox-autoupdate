@@ -5,6 +5,68 @@
 # ==============================================================================
 
 set -u
+set -o pipefail
+
+# --- ARGUMENTS ---
+# Parsed before anything else so --help works without a config file present.
+# CLI_DRY_RUN stays empty unless the flag is given, so the config file remains
+# authoritative when it isn't.
+CLI_DRY_RUN=""
+ONLY_IDS=""
+SEND_EMAIL="true"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run)
+            CLI_DRY_RUN="true"
+            ;;
+        --only)
+            ONLY_IDS="${2:-}"
+            shift
+            ;;
+        --only=*)
+            ONLY_IDS="${1#*=}"
+            ;;
+        --no-email)
+            SEND_EMAIL="false"
+            ;;
+        -h|--help)
+            cat <<'USAGE'
+Usage: update-everything.sh [options]
+
+  -n, --dry-run     Report what would be updated without changing anything.
+                    No packages are installed, no snapshots are taken and no
+                    reboot is scheduled. A report is still emailed.
+
+  --only <ids>      Update only these VM/CT IDs (comma-separated), and skip the
+                    Proxmox host entirely. No reboot is ever scheduled in this
+                    mode — it is for touching one guest without a full sweep.
+
+  --no-email        Do not send the report email. Useful when the output is
+                    already being watched live.
+
+  -h, --help        Show this message.
+
+All other settings come from /etc/proxmox-autoupdate.conf
+USAGE
+            exit 0
+            ;;
+        *)
+            echo "[!] Unknown option: $1 (try --help)"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# Normalise and validate the target list up front — a typo here should fail
+# immediately, not halfway through a sweep.
+if [ -n "${ONLY_IDS}" ]; then
+    ONLY_IDS=$(echo "${ONLY_IDS}" | tr -d '[:space:]')
+    if ! echo "${ONLY_IDS}" | grep -qE '^[0-9]+(,[0-9]+)*$'; then
+        echo "[!] --only expects comma-separated numeric IDs (got '${ONLY_IDS}')"
+        exit 1
+    fi
+fi
 
 # Ensure UK timezone formatting for date commands
 export TZ="Europe/London"
@@ -72,8 +134,18 @@ stop_spinner() {
     fi
 }
 
-# Ensure spinner is killed on script exit
-trap 'stop_spinner; rm -f "${HTML_FILE:-}" "${MAILGUN_RESPONSE_FILE:-}"' EXIT
+# Ensure spinner is killed and the log tee is flushed on script exit.
+# Closing stdout/stderr first lets `tee` see EOF, otherwise the tail of the run
+# can be lost when the shell exits before the tee has written it out.
+cleanup() {
+    stop_spinner
+    rm -f "${HTML_FILE:-}" "${MAILGUN_RESPONSE_FILE:-}"
+    if [ -n "${TEE_PID:-}" ]; then
+        exec 1>&- 2>&-
+        wait "${TEE_PID}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 # Output helpers — these go to both log and terminal
 print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
@@ -162,7 +234,57 @@ done
 EXCLUDE_IDS="${EXCLUDE_IDS:-}"
 WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT:-1200}"
 START_STOPPED_WINDOWS="${START_STOPPED_WINDOWS:-false}"
+START_STOPPED_LXC="${START_STOPPED_LXC:-true}"
+START_STOPPED_LINUX_VMS="${START_STOPPED_LINUX_VMS:-true}"
 REBOOT_TIME="${REBOOT_TIME:-00:00}"
+
+# How long a Linux guest (VM or LXC) gets to finish its upgrade, in seconds.
+# A real dist-upgrade over a slow mirror routinely exceeds five minutes.
+LINUX_UPDATE_TIMEOUT="${LINUX_UPDATE_TIMEOUT:-1800}"
+
+# How long apt waits for the dpkg/apt lock inside a guest before giving up.
+# Distros with unattended-upgrades enabled (Ubuntu by default) will otherwise
+# fail with exit code 100 whenever the two happen to overlap.
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-600}"
+
+# Dry run: report what would be upgraded without changing anything.
+# No packages are installed, no snapshots are taken, no reboot is scheduled.
+DRY_RUN="${DRY_RUN:-false}"
+
+# Take a snapshot of each guest before upgrading it ("true" or "false").
+# Requires a storage backend that supports snapshots (ZFS, LVM-thin, qcow2...).
+SNAPSHOT_BEFORE_UPDATE="${SNAPSHOT_BEFORE_UPDATE:-false}"
+
+# How many auto-generated snapshots to keep per guest before pruning the oldest.
+SNAPSHOT_KEEP="${SNAPSHOT_KEEP:-3}"
+
+# Prefix identifying snapshots this script owns. Only these are ever pruned.
+SNAPSHOT_PREFIX="autoupdate"
+
+# Normalise booleans so a stray "TRUE"/"yes" in the config still behaves.
+normalise_bool() {
+    case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|y|1|on) echo "true" ;;
+        *)               echo "false" ;;
+    esac
+}
+DRY_RUN=$(normalise_bool "${DRY_RUN}")
+SNAPSHOT_BEFORE_UPDATE=$(normalise_bool "${SNAPSHOT_BEFORE_UPDATE}")
+START_STOPPED_WINDOWS=$(normalise_bool "${START_STOPPED_WINDOWS}")
+START_STOPPED_LXC=$(normalise_bool "${START_STOPPED_LXC}")
+START_STOPPED_LINUX_VMS=$(normalise_bool "${START_STOPPED_LINUX_VMS}")
+
+# --dry-run on the command line overrides the config file, never the reverse.
+[ -n "${CLI_DRY_RUN}" ] && DRY_RUN="true"
+
+# Validate the numeric settings — a typo here would otherwise surface as an
+# arithmetic error deep inside a poll loop.
+for _NUM_VAR in WINDOWS_UPDATE_TIMEOUT LINUX_UPDATE_TIMEOUT APT_LOCK_TIMEOUT SNAPSHOT_KEEP; do
+    if ! [[ "${!_NUM_VAR}" =~ ^[0-9]+$ ]]; then
+        echo -e "${C_RED}[!] FATAL: ${_NUM_VAR} must be a positive integer (got '${!_NUM_VAR}')${C_NC}"
+        exit 1
+    fi
+done
 
 # Resolve Mailgun API base URL from region
 if [ "${MAILGUN_REGION}" = "EU" ]; then
@@ -185,13 +307,24 @@ LOG_DIR="/var/log/proxmox-autoupdate"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/update_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
+TEE_PID=$!
 
 # Prune logs older than 90 days
 find "${LOG_DIR}" -name "update_*.log" -mtime +90 -delete 2>/dev/null || true
 
-# Check for jq
-HAS_JQ=false
-command -v jq >/dev/null 2>&1 && HAS_JQ=true
+# --- jq is a hard dependency ---
+# Every guest-agent response is parsed as JSON. Hand-rolled regex parsing of
+# pvesh output silently returns nothing when the shape changes, which shows up
+# as a bogus timeout rather than an error, so refuse to run without jq.
+if ! command -v jq >/dev/null 2>&1; then
+    print_action "jq not found — installing..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -qy jq >/dev/null 2>&1 || true
+fi
+if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${C_RED}[!] FATAL: jq is required but could not be installed.${C_NC}"
+    echo "    Install it manually:  apt-get install -y jq"
+    exit 1
+fi
 
 # Summary counters
 LXC_UPDATED=0
@@ -211,18 +344,49 @@ VM_WIN_UPDATED=0
 VM_WIN_TIMEOUT=0
 
 HOST_PKG_COUNT=0
+SNAPSHOTS_TAKEN=0
+
+# Guests whose upgrade may still be running (timed out, or the agent went away).
+# Rebooting the host under them would interrupt dpkg, so this blocks the reboot.
+GUESTS_MID_UPDATE=0
 
 ERRORS_OCCURRED=false
 
 # ==============================================================================
 # HELPER: Check if an ID is in the exclusion list
 # ==============================================================================
+# Uses a fixed-string match — EXCLUDE_IDS is user input and would otherwise be
+# interpreted as a regex. Whitespace around commas is tolerated.
 is_excluded() {
     local id="$1"
-    if [ -n "${EXCLUDE_IDS}" ]; then
-        echo ",${EXCLUDE_IDS}," | grep -q ",${id}," && return 0
-    fi
+    [ -z "${EXCLUDE_IDS}" ] && return 1
+    local normalised
+    normalised=$(echo "${EXCLUDE_IDS}" | tr -d '[:space:]')
+    echo ",${normalised}," | grep -qF ",${id}," && return 0
     return 1
+}
+
+# ==============================================================================
+# HELPER: Is this guest in scope for this run?
+# ==============================================================================
+# With --only, everything outside the target list is silently passed over: it is
+# not "skipped" in the reporting sense, it simply isn't part of this run.
+is_targeted() {
+    local id="$1"
+    [ -z "${ONLY_IDS}" ] && return 0
+    echo ",${ONLY_IDS}," | grep -qF ",${id}," && return 0
+    return 1
+}
+
+# ==============================================================================
+# HELPER: Read a single field from `qm config` / `pct config`
+# ==============================================================================
+# Keeps values that contain spaces intact, unlike `awk '{print $2}'`.
+config_field() {
+    local cmd="$1" id="$2" key="$3"
+    "${cmd}" config "${id}" 2>/dev/null \
+        | sed -n "s/^${key}:[[:space:]]*//p" \
+        | head -1
 }
 
 # ==============================================================================
@@ -273,7 +437,8 @@ wait_for_agent() {
 detect_vm_os() {
     local vmid="$1"
     local os_info=""
-    os_info=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/get-osinfo" 2>/dev/null) || true
+    os_info=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/get-osinfo" \
+        --output-format json 2>/dev/null) || true
 
     if [ -n "$os_info" ]; then
         if echo "$os_info" | grep -qi "mswindows\|windows\|microsoft"; then
@@ -285,81 +450,447 @@ detect_vm_os() {
 }
 
 # ==============================================================================
+# HELPER: Take a pre-update snapshot, pruning old ones we own
+# ==============================================================================
+# Returns 0 on success (or when snapshots are disabled), 1 on failure.
+# Never fatal on its own — the caller decides whether to continue.
+take_snapshot() {
+    local kind="$1"   # "ct" or "vm"
+    local id="$2"
+    local cmd="pct"
+    [ "${kind}" = "vm" ] && cmd="qm"
+
+    [ "${SNAPSHOT_BEFORE_UPDATE}" != "true" ] && return 0
+    if [ "${DRY_RUN}" = "true" ]; then
+        print_skip "Snapshot of ${id} skipped ${C_DIM}[dry run]${C_NC}"
+        return 0
+    fi
+
+    # Prune oldest auto-snapshots first so we stay at SNAPSHOT_KEEP after adding
+    # one. Only names carrying our prefix are ever considered.
+    local existing prune_count
+    existing=$("${cmd}" listsnapshot "${id}" 2>/dev/null \
+        | grep -oE "${SNAPSHOT_PREFIX}[0-9_]*" | sort || true)
+    if [ -n "${existing}" ]; then
+        prune_count=$(( $(echo "${existing}" | wc -l) - SNAPSHOT_KEEP + 1 ))
+        if [ "${prune_count}" -gt 0 ]; then
+            echo "${existing}" | head -n "${prune_count}" | while read -r snap; do
+                [ -z "${snap}" ] && continue
+                "${cmd}" delsnapshot "${id}" "${snap}" >/dev/null 2>&1 || true
+            done
+        fi
+    fi
+
+    local snap_name="${SNAPSHOT_PREFIX}_$(date +%Y%m%d_%H%M%S)"
+    if "${cmd}" snapshot "${id}" "${snap_name}" \
+        --description "Pre-update snapshot taken by proxmox-autoupdate" >/dev/null 2>&1; then
+        SNAPSHOTS_TAKEN=$((SNAPSHOTS_TAKEN + 1))
+        return 0
+    fi
+    return 1
+}
+
+# ==============================================================================
+# HELPER: The update script that runs *inside* a Linux guest
+# ==============================================================================
+# Emitted once and shared by both the LXC and VM paths so the two can't drift.
+#
+# It communicates through sentinels rather than through its exit status, because
+# apt legitimately exits non-zero for reasons that are not update failures
+# (lock contention, needrestart, services that can't restart in a container).
+# Sentinels understood by the caller:
+#
+#   __PKG__ <name> (<old> -> <new>)   a package that was actually upgraded
+#   __HELD__ <name>                   still upgradable after the run
+#   __RESULT__ OK|FAIL|UNSUPPORTED    overall outcome
+#   __DETAIL__ <text>                 one-line reason when FAIL
+#   __LOG__ <text>                    trailing diagnostic output
+#
+# Everything is read from stdin by /bin/bash, so each command gets </dev/null to
+# stop apt from swallowing the rest of this script off the shared stdin.
+build_guest_update_script() {
+    cat <<GUESTSCRIPT
+export DEBIAN_FRONTEND=noninteractive
+# needrestart interactively prompts about service restarts on Ubuntu 22.04+ and
+# can exit non-zero; force it to act automatically and stay quiet.
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+export UCF_FORCE_CONFOLD=1
+
+APT_OPTS="-o DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT} -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+DRY_RUN="${DRY_RUN}"
+WORK_LOG=\$(mktemp 2>/dev/null || echo /tmp/.pau_log)
+
+emit_log() { tail -n 20 "\${WORK_LOG}" 2>/dev/null | sed 's/^/__LOG__ /' || true; }
+
+# Package name -> "old -> new" from \`apt list --upgradable\` output.
+list_upgradable() {
+    apt list --upgradable 2>/dev/null | grep '/' || true
+}
+
+# Turn "pkg/suite 2.0 amd64 [upgradable from: 1.0]" into "__PKG__ pkg (1.0 -> 2.0)".
+# The marker apt actually emits is "upgradable from:", not "from:".
+format_upgradable() {
+    awk -F'/' '{
+        pkg=\$1;
+        split(\$2, a, " ");
+        new_ver=a[2];
+        old_ver="";
+        if (match(\$0, /upgradable from: [^]]+/)) {
+            old_ver=substr(\$0, RSTART+17, RLENGTH-17);
+        }
+        if (old_ver == "")
+            print "__PKG__ " pkg " (" new_ver ")";
+        else
+            print "__PKG__ " pkg " (" old_ver " -> " new_ver ")";
+    }'
+}
+
+if command -v apt-get >/dev/null 2>&1; then
+    # The guest may have only just booted, so DNS and routing can lag behind the
+    # guest agent coming up. Retry rather than reporting a hard failure.
+    UPDATE_RC=1
+    ATTEMPT=1
+    while [ \${ATTEMPT} -le 5 ]; do
+        if apt-get \${APT_OPTS} update -qy </dev/null >"\${WORK_LOG}" 2>&1; then
+            UPDATE_RC=0
+            break
+        fi
+        UPDATE_RC=\$?
+        sleep 5
+        ATTEMPT=\$((ATTEMPT + 1))
+    done
+
+    if [ \${UPDATE_RC} -ne 0 ]; then
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ apt-get update failed after 5 attempts (exit \${UPDATE_RC})"
+        emit_log
+        exit 0
+    fi
+
+    BEFORE=\$(list_upgradable)
+
+    if [ -z "\${BEFORE}" ]; then
+        echo "__RESULT__ OK"
+        exit 0
+    fi
+
+    if [ "\${DRY_RUN}" = "true" ]; then
+        # Report the pending set without touching the system.
+        echo "\${BEFORE}" | format_upgradable
+        echo "__RESULT__ OK"
+        exit 0
+    fi
+
+    if apt-get \${APT_OPTS} dist-upgrade -qy </dev/null >"\${WORK_LOG}" 2>&1; then
+        UPGRADE_RC=0
+    else
+        UPGRADE_RC=\$?
+    fi
+
+    apt-get \${APT_OPTS} autoremove -qy </dev/null >/dev/null 2>&1 || true
+    apt-get \${APT_OPTS} autoclean -qy </dev/null >/dev/null 2>&1 || true
+
+    # Report what actually changed by diffing the upgradable set, rather than
+    # trusting the pre-upgrade list. Anything still listed did not get applied.
+    AFTER_NAMES=\$(list_upgradable | cut -d/ -f1)
+    echo "\${BEFORE}" | while IFS= read -r line; do
+        [ -z "\${line}" ] && continue
+        name=\${line%%/*}
+        # -x -F: whole-line fixed-string match, so names containing regex
+        # metacharacters (python3.12, libstdc++6) compare exactly.
+        if echo "\${AFTER_NAMES}" | grep -qxF "\${name}"; then
+            echo "__HELD__ \${name}"
+        else
+            echo "\${line}" | format_upgradable
+        fi
+    done
+
+    if [ \${UPGRADE_RC} -eq 0 ]; then
+        echo "__RESULT__ OK"
+    else
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ apt-get dist-upgrade exited \${UPGRADE_RC}"
+        emit_log
+    fi
+
+elif command -v dnf >/dev/null 2>&1; then
+    dnf -q check-update </dev/null 2>/dev/null | awk 'NF==3 {print "__PKG__ " \$1 " (" \$2 ")"}' || true
+    if [ "\${DRY_RUN}" = "true" ]; then
+        echo "__RESULT__ OK"
+    elif dnf -y upgrade -q </dev/null >"\${WORK_LOG}" 2>&1; then
+        echo "__RESULT__ OK"
+    else
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ dnf upgrade failed"
+        emit_log
+    fi
+
+elif command -v yum >/dev/null 2>&1; then
+    yum -q check-update </dev/null 2>/dev/null | awk 'NF==3 {print "__PKG__ " \$1 " (" \$2 ")"}' || true
+    if [ "\${DRY_RUN}" = "true" ]; then
+        echo "__RESULT__ OK"
+    elif yum -y update -q </dev/null >"\${WORK_LOG}" 2>&1; then
+        echo "__RESULT__ OK"
+    else
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ yum update failed"
+        emit_log
+    fi
+
+elif command -v apk >/dev/null 2>&1; then
+    apk update -q </dev/null >/dev/null 2>&1 || true
+    apk version -l '<' 2>/dev/null | awk 'NR>1 && NF>=3 {print "__PKG__ " \$1}' || true
+    if [ "\${DRY_RUN}" = "true" ]; then
+        echo "__RESULT__ OK"
+    elif apk upgrade -q </dev/null >"\${WORK_LOG}" 2>&1; then
+        echo "__RESULT__ OK"
+    else
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ apk upgrade failed"
+        emit_log
+    fi
+
+else
+    echo "__RESULT__ UNSUPPORTED"
+fi
+
+rm -f "\${WORK_LOG}" 2>/dev/null || true
+GUESTSCRIPT
+}
+
+# ==============================================================================
+# HELPER: Poll a guest-agent exec until it finishes
+# ==============================================================================
+# Sets the globals GX_STATE, GX_EXITCODE, GX_OUT and GX_ERR.
+#
+#   GX_STATE = done      the process exited; GX_EXITCODE holds its real status
+#              timeout   still running when the budget ran out
+#              apierror  exec-status could not be read after repeated retries
+#              badjson   exec-status replied, but not with parseable JSON
+#
+# Note that the agent's "exited" field is a boolean meaning "has finished", not
+# an exit status — the status lives in "exitcode". PVE renders it as either 1 or
+# true depending on version, so both are accepted.
+guest_exec_wait() {
+    local vmid="$1"
+    local exec_pid="$2"
+    local timeout="$3"
+    local poll_interval="${4:-5}"
+
+    GX_STATE="timeout"
+    GX_EXITCODE=""
+    GX_OUT=""
+    GX_ERR=""
+
+    local max_polls=$(( timeout / poll_interval ))
+    [ "${max_polls}" -lt 1 ] && max_polls=1
+    local wait_count=0
+    local consecutive_failures=0
+    local parse_failures=0
+
+    while [ ${wait_count} -lt ${max_polls} ]; do
+        local exec_status=""
+        if ! exec_status=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec-status" \
+                --pid "${exec_pid}" --output-format json 2>/dev/null); then
+            # A single hiccup on the API or the agent socket is not a failed
+            # update. Only give up after three consecutive misses.
+            consecutive_failures=$((consecutive_failures + 1))
+            if [ ${consecutive_failures} -ge 3 ]; then
+                GX_STATE="apierror"
+                return
+            fi
+            sleep ${poll_interval}
+            wait_count=$((wait_count + 1))
+            continue
+        fi
+        consecutive_failures=0
+
+        # A reply that isn't JSON will never become JSON on a later poll — it
+        # means --output-format json isn't being honoured. Fail fast and say so,
+        # rather than silently burning the whole timeout and reporting a bogus
+        # "timed out" for an update that actually ran.
+        local exited=""
+        if ! exited=$(echo "${exec_status}" | jq -r '.exited // empty' 2>/dev/null); then
+            parse_failures=$((parse_failures + 1))
+            if [ ${parse_failures} -ge 2 ]; then
+                GX_STATE="badjson"
+                GX_OUT="${exec_status}"
+                return
+            fi
+            sleep ${poll_interval}
+            wait_count=$((wait_count + 1))
+            continue
+        fi
+
+        case "${exited}" in
+            1|true)
+                GX_EXITCODE=$(echo "${exec_status}" | jq -r '.exitcode // 0' 2>/dev/null || echo 0)
+                GX_OUT=$(echo "${exec_status}" | jq -r '."out-data" // empty' 2>/dev/null || true)
+                GX_ERR=$(echo "${exec_status}" | jq -r '."err-data" // empty' 2>/dev/null || true)
+                # Flag truncation so a clipped package list isn't mistaken for a
+                # short one.
+                if [ "$(echo "${exec_status}" | jq -r '."out-truncated" // empty' 2>/dev/null)" = "true" ]; then
+                    GX_OUT="${GX_OUT}
+__LOG__ (output truncated by the guest agent)"
+                fi
+                GX_STATE="done"
+                return
+                ;;
+        esac
+
+        sleep ${poll_interval}
+        wait_count=$((wait_count + 1))
+    done
+
+    GX_STATE="timeout"
+}
+
+# ==============================================================================
+# HELPER: Format `apt list --upgradable` output for the host report
+# ==============================================================================
+# Same transformation the guest script applies, minus the __PKG__ marker (the
+# host has no sentinel protocol to speak). Note the marker apt emits is
+# "upgradable from:", not "from:".
+format_upgradable_host() {
+    awk -F'/' '{
+        pkg=$1;
+        split($2, a, " ");
+        new_ver=a[2];
+        old_ver="";
+        if (match($0, /upgradable from: [^]]+/)) {
+            old_ver=substr($0, RSTART+17, RLENGTH-17);
+        }
+        if (old_ver == "")
+            print pkg " (" new_ver ")";
+        else
+            print pkg " (" old_ver " -> " new_ver ")";
+    }'
+}
+
+# ==============================================================================
+# HELPER: Escape text for inclusion in the HTML report
+# ==============================================================================
+html_escape() {
+    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+# Render a package list as <li> items, or nothing when the list is empty.
+html_list() {
+    local items="$1"
+    [ -z "${items}" ] && return 0
+    echo "${items}" | html_escape | awk 'NF {print "<li>" $0 "</li>"}'
+}
+
+# Build the "Summary" cell shared by the LXC and VM tables.
+# Reads GU_PKGS / GU_HELD / GU_DETAIL / GU_LOG.
+guest_summary_html() {
+    local heading="$1"
+    local html=""
+    local pkg_count=0
+    [ -n "${GU_PKGS}" ] && pkg_count=$(echo "${GU_PKGS}" | grep -c . || true)
+
+    if [ "${pkg_count}" -gt 0 ]; then
+        html="<strong>${heading}</strong><ul class='pkg-list'>$(html_list "${GU_PKGS}")</ul>"
+    fi
+    if [ -n "${GU_HELD}" ]; then
+        html="${html}<strong>Held back (still upgradable):</strong><ul class='pkg-list'>$(html_list "${GU_HELD}")</ul>"
+    fi
+    if [ -n "${GU_DETAIL}" ]; then
+        html="${html}<div class='detail'>$(echo "${GU_DETAIL}" | html_escape)</div>"
+    fi
+    if [ -n "${GU_LOG}" ]; then
+        html="${html}<pre class='log-snippet'>$(echo "${GU_LOG}" | html_escape)</pre>"
+    fi
+    echo "${html}"
+}
+
+# ==============================================================================
+# HELPER: Turn sentinel output from a guest into result globals
+# ==============================================================================
+# Sets GU_STATE, GU_PKGS, GU_HELD, GU_DETAIL and GU_LOG.
+#
+# A missing __RESULT__ sentinel means the guest script did not run to
+# completion — the process was killed, the agent clipped the output, or the
+# shell died part way through. That is reported as "nosentinel" rather than
+# being treated as a clean run, because silently reporting "up to date" for a
+# guest that never finished is the worst possible failure mode here.
+parse_guest_result() {
+    local raw="$1"
+    GU_PKGS=$(echo "${raw}"   | sed -n 's/^__PKG__ //p'    || true)
+    GU_HELD=$(echo "${raw}"   | sed -n 's/^__HELD__ //p'   || true)
+    GU_DETAIL=$(echo "${raw}" | sed -n 's/^__DETAIL__ //p' | head -1 || true)
+    GU_LOG=$(echo "${raw}"    | sed -n 's/^__LOG__ //p'    || true)
+
+    local result=""
+    result=$(echo "${raw}" | sed -n 's/^__RESULT__ //p' | tail -1 || true)
+    case "${result}" in
+        OK)          GU_STATE="ok" ;;
+        FAIL)        GU_STATE="fail" ;;
+        UNSUPPORTED) GU_STATE="unsupported" ;;
+        *)           GU_STATE="nosentinel" ;;
+    esac
+}
+
+# ==============================================================================
 # HELPER: Run Linux updates inside a VM via guest agent
 # ==============================================================================
+# Sets the same GU_* globals as parse_guest_result, plus these extra states:
+#   execfail  the agent would not accept the command at all
+#   timeout   the upgrade was still running when the budget expired
+#   apierror  exec-status stopped answering
 update_linux_vm() {
     local vmid="$1"
-    local vm_output=""
-    local vm_error=""
 
-    # Execute update command via pvesh
+    GU_STATE="execfail"
+    GU_PKGS=""; GU_HELD=""; GU_DETAIL=""; GU_LOG=""
+
     local exec_result=""
-    exec_result=$(pvesh create "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec" \
-        --command "/bin/bash" \
-        --'input-data' "$(cat <<'VMSCRIPT'
-export DEBIAN_FRONTEND=noninteractive
-if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qy >/dev/null 2>&1
-    UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep '/' || true)
-    if [ -n "${UPGRADABLE}" ]; then
-        echo "${UPGRADABLE}" | awk -F'/' '{
-            pkg=$1;
-            split($2, a, " ");
-            new_ver=a[2];
-            match($0, /\[from: [^\]]+\]/);
-            old_ver=substr($0, RSTART+7, RLENGTH-8);
-            print pkg " (" old_ver " -> " new_ver ")"
-        }'
-        apt-get dist-upgrade -qy >/dev/null 2>&1 && apt-get autoremove -qy >/dev/null 2>&1
-    fi
-elif command -v yum >/dev/null 2>&1; then
-    yum -q check-update 2>/dev/null | awk 'NF==3 {print $1 " (" $2 ")"}' || true
-    yum -y update -q >/dev/null 2>&1
-elif command -v apk >/dev/null 2>&1; then
-    apk update -q 2>/dev/null
-    apk upgrade -q 2>&1
-fi
-VMSCRIPT
-)" 2>&1) || { echo "EXEC_FAILED"; return; }
-
-    # Extract PID
-    local exec_pid=""
-    if [ "${HAS_JQ}" = true ]; then
-        exec_pid=$(echo "${exec_result}" | jq -r '.pid // empty' 2>/dev/null || true)
-    else
-        exec_pid=$(echo "${exec_result}" | grep -oP '"pid"\s*:\s*\K\d+' 2>/dev/null || true)
-    fi
-
-    if [ -z "${exec_pid}" ]; then
-        echo "EXEC_FAILED"
+    if ! exec_result=$(pvesh create "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec" \
+            --command "/bin/bash" \
+            --'input-data' "$(build_guest_update_script)" \
+            --output-format json 2>&1); then
+        GU_DETAIL="guest agent rejected the exec request: $(echo "${exec_result}" | tail -1)"
         return
     fi
 
-    # Poll for completion (5 min timeout)
-    local wait_count=0
-    while [ ${wait_count} -lt 60 ]; do
-        local exec_status=""
-        exec_status=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec-status" --pid "${exec_pid}" 2>&1) || break
+    local exec_pid=""
+    exec_pid=$(echo "${exec_result}" | jq -r '.pid // empty' 2>/dev/null || true)
+    if [ -z "${exec_pid}" ]; then
+        GU_DETAIL="guest agent returned no PID for the exec request"
+        return
+    fi
 
-        local exited=""
-        if [ "${HAS_JQ}" = true ]; then
-            exited=$(echo "${exec_status}" | jq -r '.exited // empty' 2>/dev/null || true)
-        else
-            exited=$(echo "${exec_status}" | grep -oP '"exited"\s*:\s*\K\d+' 2>/dev/null || true)
-        fi
+    guest_exec_wait "${vmid}" "${exec_pid}" "${LINUX_UPDATE_TIMEOUT}" 5
 
-        if [ "${exited}" = "1" ]; then
-            if [ "${HAS_JQ}" = true ]; then
-                echo "${exec_status}" | jq -r '."out-data" // empty' 2>/dev/null || true
-            else
-                echo "${exec_status}" | grep -oP '"out-data"\s*:\s*"\K[^"]*' 2>/dev/null | sed 's/\\n/\n/g' || true
-            fi
+    case "${GX_STATE}" in
+        timeout)
+            GU_STATE="timeout"
             return
-        fi
-        sleep 5
-        wait_count=$((wait_count + 1))
-    done
-    echo "TIMEOUT"
+            ;;
+        apierror)
+            GU_STATE="apierror"
+            GU_DETAIL="exec-status stopped responding while the upgrade was running"
+            return
+            ;;
+        badjson)
+            GU_STATE="badjson"
+            GU_DETAIL="exec-status did not return JSON — check that this pvesh supports --output-format json"
+            GU_LOG=$(echo "${GX_OUT}" | head -n 10)
+            return
+            ;;
+    esac
+
+    parse_guest_result "${GX_OUT}"
+
+    # The guest script deliberately exits 0 and reports through sentinels, so a
+    # non-zero exit code here means the shell itself died — worth surfacing.
+    if [ "${GU_STATE}" = "nosentinel" ] && [ -n "${GX_EXITCODE}" ] && [ "${GX_EXITCODE}" != "0" ]; then
+        GU_DETAIL="guest shell exited ${GX_EXITCODE} without reporting a result"
+    fi
+    if [ -z "${GU_LOG}" ] && [ -n "${GX_ERR}" ]; then
+        GU_LOG=$(echo "${GX_ERR}" | tail -n 20)
+    fi
 }
 
 # ==============================================================================
@@ -385,12 +916,23 @@ try {
     foreach ($Update in $SearchResult.Updates) {
         $Names += $Update.Title
     }
+    if ($env:PAU_DRY_RUN -eq "true") {
+        Write-Output "DRYRUN:$Count"
+        foreach ($name in $Names) {
+            Write-Output $name
+        }
+        exit 0
+    }
     $Downloader = $Session.CreateUpdateDownloader()
     $Downloader.Updates = $SearchResult.Updates
     $DownloadResult = $Downloader.Download()
     $Installer = New-Object -ComObject Microsoft.Update.UpdateInstaller
     $Installer.Updates = $SearchResult.Updates
     $InstallResult = $Installer.Install()
+    if ($InstallResult.ResultCode -ne 2) {
+        Write-Output "ERROR:Install returned result code $($InstallResult.ResultCode) (HRESULT $($InstallResult.HResult))"
+        exit 0
+    }
     Write-Output "UPDATED:$Count"
     foreach ($name in $Names) {
         Write-Output $name
@@ -399,6 +941,13 @@ try {
     Write-Output "ERROR:$($_.Exception.Message)"
 }
 '
+
+    # Dry run is signalled through an env var so the script body stays identical
+    # between the two modes.
+    if [ "${DRY_RUN}" = "true" ]; then
+        ps_script="\$env:PAU_DRY_RUN = 'true'
+${ps_script}"
+    fi
 
     # Encode for PowerShell -EncodedCommand (UTF-16LE base64)
     local encoded_cmd=""
@@ -410,52 +959,35 @@ try {
     # Execute via guest agent
     local exec_result=""
     exec_result=$(pvesh create "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec" \
-        --command "powershell.exe -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded_cmd}" 2>&1) || {
+        --command "powershell.exe -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded_cmd}" \
+        --output-format json 2>&1) || {
         echo "EXEC_FAILED"
         return
     }
 
-    # Extract PID
     local exec_pid=""
-    if [ "${HAS_JQ}" = true ]; then
-        exec_pid=$(echo "${exec_result}" | jq -r '.pid // empty' 2>/dev/null || true)
-    else
-        exec_pid=$(echo "${exec_result}" | grep -oP '"pid"\s*:\s*\K\d+' 2>/dev/null || true)
-    fi
-
+    exec_pid=$(echo "${exec_result}" | jq -r '.pid // empty' 2>/dev/null || true)
     if [ -z "${exec_pid}" ]; then
         echo "EXEC_FAILED"
         return
     fi
 
-    # Poll for completion with configurable timeout
-    local poll_interval=10
-    local max_polls=$(( timeout / poll_interval ))
-    local wait_count=0
+    guest_exec_wait "${vmid}" "${exec_pid}" "${timeout}" 10
 
-    while [ ${wait_count} -lt ${max_polls} ]; do
-        local exec_status=""
-        exec_status=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec-status" --pid "${exec_pid}" 2>&1) || break
-
-        local exited=""
-        if [ "${HAS_JQ}" = true ]; then
-            exited=$(echo "${exec_status}" | jq -r '.exited // empty' 2>/dev/null || true)
-        else
-            exited=$(echo "${exec_status}" | grep -oP '"exited"\s*:\s*\K\d+' 2>/dev/null || true)
-        fi
-
-        if [ "${exited}" = "1" ]; then
-            if [ "${HAS_JQ}" = true ]; then
-                echo "${exec_status}" | jq -r '."out-data" // empty' 2>/dev/null || true
+    case "${GX_STATE}" in
+        timeout)  echo "TIMEOUT" ;;
+        apierror) echo "API_ERROR" ;;
+        badjson)  echo "ERROR:exec-status did not return JSON — check that this pvesh supports --output-format json" ;;
+        *)
+            if [ -n "${GX_OUT}" ]; then
+                echo "${GX_OUT}"
+            elif [ -n "${GX_ERR}" ]; then
+                echo "ERROR:$(echo "${GX_ERR}" | tail -1)"
             else
-                echo "${exec_status}" | grep -oP '"out-data"\s*:\s*"\K[^"]*' 2>/dev/null | sed 's/\\n/\n/g' || true
+                echo "ERROR:PowerShell produced no output (exit code ${GX_EXITCODE:-unknown})"
             fi
-            return
-        fi
-        sleep ${poll_interval}
-        wait_count=$((wait_count + 1))
-    done
-    echo "TIMEOUT"
+            ;;
+    esac
 }
 
 # ==============================================================================
@@ -464,10 +996,18 @@ try {
 
 print_banner
 
+if [ "${DRY_RUN}" = "true" ]; then
+    echo ""
+    echo -e "  ${C_YELLOW}${C_BOLD}DRY RUN${C_NC} — reporting only, nothing will be installed or rebooted"
+fi
+
 # Capture Proxmox VE Version BEFORE updates
 PVE_VERSION_BEFORE=$(pveversion 2>/dev/null | awk '{print $1}' || dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || echo "Unknown")
 echo ""
 echo -e "  PVE Version: ${C_BOLD}${PVE_VERSION_BEFORE}${C_NC}"
+if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
+    echo -e "  Snapshots:   ${C_BOLD}enabled${C_NC} ${C_DIM}(keeping ${SNAPSHOT_KEEP} per guest)${C_NC}"
+fi
 
 # ==============================================================================
 # 1. UPDATE LXC CONTAINERS
@@ -476,7 +1016,8 @@ section_header "LXC Containers"
 LXC_HTML=""
 
 for CTID in $(pct list | awk 'NR>1 {print $1}'); do
-    CT_NAME=$(pct config "${CTID}" | grep -E "^hostname:" | awk '{print $2}')
+    is_targeted "${CTID}" || continue
+    CT_NAME=$(config_field pct "${CTID}" hostname)
     [ -z "${CT_NAME}" ] && CT_NAME="LXC-${CTID}"
     CT_STATUS=$(pct status "${CTID}" | awk '{print $2}')
     CT_WAS_STOPPED=false
@@ -521,69 +1062,95 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
         fi
     fi
 
-    # Container is now running — perform update
-    start_spinner "Updating LXC ${CTID} (${CT_NAME})..."
-    CT_OUTPUT=""
-    CT_ERROR=""
-    CT_OUTPUT=$(pct exec "${CTID}" -- bash -c "
-        if command -v apt-get >/dev/null 2>&1; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qy >/dev/null 2>&1
-            UPGRADABLE=\$(apt list --upgradable 2>/dev/null | grep '/' || true)
-            if [ -n \"\${UPGRADABLE}\" ]; then
-                echo \"\${UPGRADABLE}\" | awk -F'/' '{
-                    pkg=\$1;
-                    split(\$2, a, \" \");
-                    new_ver=a[2];
-                    match(\$0, /\[from: [^\]]+\]/);
-                    old_ver=substr(\$0, RSTART+7, RLENGTH-8);
-                    print pkg \" (\" old_ver \" -> \" new_ver \")\"
-                }'
-                apt-get dist-upgrade -qy 2>&1 && apt-get autoremove -qy >/dev/null 2>&1
-            fi
-        elif command -v yum >/dev/null 2>&1; then
-            yum -q check-update 2>/dev/null | awk 'NF==3 {print \$1 \" (\" \$2 \")\"}' || true
-            yum -y update -q >/dev/null 2>&1
-        elif command -v apk >/dev/null 2>&1; then
-            apk update -q 2>/dev/null
-            apk upgrade -q 2>&1
-        else
-            echo '__UNSUPPORTED_PKG_MANAGER__'
-        fi
-    " 2>&1) || CT_ERROR="Command failed with exit code $?"
-    stop_spinner
-
     # Build suffix for display
     local_suffix=""
     [ "${CT_WAS_STOPPED}" = true ] && local_suffix=" ${C_DIM}[was stopped]${C_NC}"
     html_suffix=""
     [ "${CT_WAS_STOPPED}" = true ] && html_suffix=" <em style='color:#6c757d'>[was stopped]</em>"
 
-    if [ -n "${CT_ERROR}" ]; then
-        print_fail "LXC ${CTID} (${CT_NAME}) — ${CT_ERROR}${local_suffix}"
-        LXC_ERRORS=$((LXC_ERRORS + 1))
-        ERRORS_OCCURRED=true
-        ESCAPED_ERROR=$(echo "${CT_ERROR}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-        LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})${html_suffix}</td><td><span class='status-badge badge-error'>Error</span></td><td>${ESCAPED_ERROR}</td></tr>"
-    elif echo "${CT_OUTPUT}" | grep -q '__UNSUPPORTED_PKG_MANAGER__'; then
-        print_warn "LXC ${CTID} (${CT_NAME}) — unsupported package manager${local_suffix}"
-        LXC_SKIPPED=$((LXC_SKIPPED + 1))
-        LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})${html_suffix}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>No supported package manager found (apt/yum/apk).</td></tr>"
-    else
-        UPDATES=$(echo "${CT_OUTPUT}" | grep -E '^\S+\s+\(' || true)
-        if [ -n "${UPDATES}" ]; then
-            PKG_COUNT=$(echo "${UPDATES}" | wc -l)
-            print_ok "LXC ${CTID} (${CT_NAME}) — ${C_BOLD}${PKG_COUNT} packages updated${C_NC}${local_suffix}"
-            LXC_UPDATED=$((LXC_UPDATED + 1))
-            ESCAPED_UPDATES=$(echo "${UPDATES}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-            PKG_LIST_HTML=$(echo "${ESCAPED_UPDATES}" | awk '{print "<li>" $0 "</li>"}')
-            LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})${html_suffix}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${PKG_COUNT} package(s) updated:</strong><ul class='pkg-list'>${PKG_LIST_HTML}</ul></td></tr>"
+    # Snapshot before touching anything, if enabled
+    if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
+        start_spinner "Snapshotting LXC ${CTID} (${CT_NAME})..."
+        if take_snapshot ct "${CTID}"; then
+            stop_spinner
         else
-            print_ok "LXC ${CTID} (${CT_NAME}) — already up to date${local_suffix}"
-            LXC_CURRENT=$((LXC_CURRENT + 1))
-            LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})${html_suffix}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>System fully up to date.</td></tr>"
+            stop_spinner
+            print_fail "LXC ${CTID} (${CT_NAME}) — snapshot failed, skipping update${local_suffix}"
+            LXC_ERRORS=$((LXC_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})${html_suffix}</td><td><span class='status-badge badge-error'>Snapshot Failed</span></td><td>Pre-update snapshot could not be created; the update was skipped rather than run without a rollback point.</td></tr>"
+            continue
         fi
     fi
+
+    # Container is now running — perform update.
+    # `timeout` bounds the run: pct exec has no timeout of its own, so a guest
+    # that wedges on a package prompt would otherwise hang the whole job.
+    start_spinner "Updating LXC ${CTID} (${CT_NAME})..."
+    CT_OUTPUT=""
+    CT_RC=0
+    CT_OUTPUT=$(build_guest_update_script | timeout "${LINUX_UPDATE_TIMEOUT}" pct exec "${CTID}" -- /bin/bash 2>&1) || CT_RC=$?
+    stop_spinner
+
+    if [ "${CT_RC}" -eq 124 ]; then
+        GU_STATE="timeout"
+        GU_PKGS=""; GU_HELD=""; GU_DETAIL=""; GU_LOG=""
+    else
+        parse_guest_result "${CT_OUTPUT}"
+        if [ "${GU_STATE}" = "nosentinel" ] && [ "${CT_RC}" -ne 0 ]; then
+            GU_DETAIL="pct exec exited ${CT_RC} without a result from the guest"
+            GU_LOG=$(echo "${CT_OUTPUT}" | tail -n 20)
+        fi
+    fi
+
+    CT_LABEL="<strong>${CTID}</strong> ($(echo "${CT_NAME}" | html_escape))${html_suffix}"
+    PKG_COUNT=0
+    [ -n "${GU_PKGS}" ] && PKG_COUNT=$(echo "${GU_PKGS}" | grep -c . || true)
+
+    case "${GU_STATE}" in
+        unsupported)
+            print_warn "LXC ${CTID} (${CT_NAME}) — unsupported package manager${local_suffix}"
+            LXC_SKIPPED=$((LXC_SKIPPED + 1))
+            LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>No supported package manager found (apt/dnf/yum/apk).</td></tr>"
+            ;;
+        timeout)
+            print_warn "LXC ${CTID} (${CT_NAME}) — update timed out after ${LINUX_UPDATE_TIMEOUT}s${local_suffix}"
+            LXC_ERRORS=$((LXC_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+            # An interrupted dpkg run must not be followed by a shutdown.
+            CT_WAS_STOPPED=false
+            LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Update did not finish within ${LINUX_UPDATE_TIMEOUT}s. Container left running so dpkg can complete — check it manually.</td></tr>"
+            ;;
+        nosentinel)
+            print_fail "LXC ${CTID} (${CT_NAME}) — update did not report a result${local_suffix}"
+            LXC_ERRORS=$((LXC_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            [ -z "${GU_DETAIL}" ] && GU_DETAIL="The guest update script produced no __RESULT__ marker."
+            LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
+            ;;
+        fail)
+            print_fail "LXC ${CTID} (${CT_NAME}) — ${GU_DETAIL:-update failed}${local_suffix}"
+            LXC_ERRORS=$((LXC_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
+            ;;
+        *)
+            if [ "${PKG_COUNT}" -gt 0 ] && [ "${DRY_RUN}" = "true" ]; then
+                print_ok "LXC ${CTID} (${CT_NAME}) — ${C_BOLD}${PKG_COUNT} packages pending${C_NC} ${C_DIM}[dry run]${C_NC}${local_suffix}"
+                LXC_UPDATED=$((LXC_UPDATED + 1))
+                LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) would be upgraded:")</td></tr>"
+            elif [ "${PKG_COUNT}" -gt 0 ]; then
+                print_ok "LXC ${CTID} (${CT_NAME}) — ${C_BOLD}${PKG_COUNT} packages updated${C_NC}${local_suffix}"
+                LXC_UPDATED=$((LXC_UPDATED + 1))
+                LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) updated:")</td></tr>"
+            else
+                print_ok "LXC ${CTID} (${CT_NAME}) — already up to date${local_suffix}"
+                LXC_CURRENT=$((LXC_CURRENT + 1))
+                LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>System fully up to date.</td></tr>"
+            fi
+            ;;
+    esac
 
     # Restore stopped state if needed
     if [ "${CT_WAS_STOPPED}" = true ]; then
@@ -603,7 +1170,8 @@ section_header "Virtual Machines"
 VM_HTML=""
 
 for VMID in $(qm list | awk 'NR>1 {print $1}'); do
-    VM_NAME=$(qm config "${VMID}" | grep -E "^name:" | awk '{print $2}')
+    is_targeted "${VMID}" || continue
+    VM_NAME=$(config_field qm "${VMID}" name)
     [ -z "${VM_NAME}" ] && VM_NAME="VM-${VMID}"
     VM_STATUS=$(qm status "${VMID}" | awk '{print $2}')
     VM_WAS_STOPPED=false
@@ -622,7 +1190,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
         VM_WAS_STOPPED=true
 
         # Check if this is a Windows VM before starting (from config)
-        VM_OSTYPE_CONFIG=$(qm config "${VMID}" | grep -E "^ostype:" | awk '{print $2}')
+        VM_OSTYPE_CONFIG=$(config_field qm "${VMID}" ostype)
         if echo "${VM_OSTYPE_CONFIG}" | grep -qi "win"; then
             VM_OS_TYPE="windows"
             # Respect START_STOPPED_WINDOWS setting
@@ -702,6 +1270,23 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
     os_icon=""
     [ "${VM_OS_TYPE}" = "windows" ] && os_icon=" 🪟"
 
+    VM_LABEL="<strong>${VMID}</strong> ($(echo "${VM_NAME}" | html_escape))${os_icon}${html_suffix}"
+
+    # Snapshot before touching anything, if enabled
+    if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
+        start_spinner "Snapshotting VM ${VMID} (${VM_NAME})..."
+        if take_snapshot vm "${VMID}"; then
+            stop_spinner
+        else
+            stop_spinner
+            print_fail "VM ${VMID} (${VM_NAME}) — snapshot failed, skipping update${local_suffix}"
+            VM_ERRORS=$((VM_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Snapshot Failed</span></td><td>Pre-update snapshot could not be created; the update was skipped rather than run without a rollback point.</td></tr>"
+            continue
+        fi
+    fi
+
     # Route to the correct update handler
     if [ "${VM_OS_TYPE}" = "windows" ]; then
         # ---- WINDOWS VM UPDATE ----
@@ -713,73 +1298,127 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_fail "VM ${VMID} (${VM_NAME}) — Windows Update exec failed${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${os_icon}${html_suffix}</td><td><span class='status-badge badge-error'>Error</span></td><td>Failed to execute Windows Update via guest agent.</td></tr>"
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>Failed to execute Windows Update via guest agent.</td></tr>"
+        elif [ "${WIN_OUTPUT}" = "API_ERROR" ]; then
+            print_fail "VM ${VMID} (${VM_NAME}) — exec-status stopped responding${local_suffix}"
+            VM_ERRORS=$((VM_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+            # The update may well still be running — do not shut this VM down.
+            VM_WAS_STOPPED=false
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Agent Lost</span></td><td>The guest agent stopped answering while Windows Update was running. The VM was left running; its state is unknown.</td></tr>"
         elif [ "${WIN_OUTPUT}" = "TIMEOUT" ]; then
             print_warn "VM ${VMID} (${VM_NAME}) — Windows Update timed out after ${WINDOWS_UPDATE_TIMEOUT}s${local_suffix}"
             VM_WIN_TIMEOUT=$((VM_WIN_TIMEOUT + 1))
+            GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
             # Don't shut down a Windows VM mid-update! Leave it running.
             VM_WAS_STOPPED=false
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${os_icon}${html_suffix}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Windows Update did not complete within ${WINDOWS_UPDATE_TIMEOUT}s. VM left running to finish.</td></tr>"
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Windows Update did not complete within ${WINDOWS_UPDATE_TIMEOUT}s. VM left running to finish.</td></tr>"
         elif [ "${WIN_OUTPUT}" = "NO_UPDATES" ]; then
             print_ok "VM ${VMID} (${VM_NAME}) — Windows already up to date${local_suffix}"
             VM_CURRENT=$((VM_CURRENT + 1))
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${os_icon}${html_suffix}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>Windows is fully up to date.</td></tr>"
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>Windows is fully up to date.</td></tr>"
         elif echo "${WIN_OUTPUT}" | grep -q "^ERROR:"; then
             ERROR_MSG=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^ERROR://')
             print_fail "VM ${VMID} (${VM_NAME}) — ${ERROR_MSG}${local_suffix}"
             VM_ERRORS=$((VM_ERRORS + 1))
             ERRORS_OCCURRED=true
-            ESCAPED_ERROR=$(echo "${ERROR_MSG}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${os_icon}${html_suffix}</td><td><span class='status-badge badge-error'>Error</span></td><td>${ESCAPED_ERROR}</td></tr>"
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(echo "${ERROR_MSG}" | html_escape)</td></tr>"
+        elif echo "${WIN_OUTPUT}" | grep -q "^DRYRUN:"; then
+            WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^DRYRUN://')
+            WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2)
+            print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${WIN_COUNT} Windows updates pending${C_NC} ${C_DIM}[dry run]${C_NC}${local_suffix}"
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td><strong>${WIN_COUNT} update(s) would be installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
         elif echo "${WIN_OUTPUT}" | grep -q "^UPDATED:"; then
             WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^UPDATED://')
             WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2)
             print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${WIN_COUNT} Windows updates installed${C_NC}${local_suffix}"
             VM_WIN_UPDATED=$((VM_WIN_UPDATED + 1))
             VM_UPDATED=$((VM_UPDATED + 1))
-            ESCAPED_NAMES=$(echo "${WIN_NAMES}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-            PKG_LIST_HTML=$(echo "${ESCAPED_NAMES}" | awk '{print "<li>" $0 "</li>"}')
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${os_icon}${html_suffix}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${WIN_COUNT} update(s) installed:</strong><ul class='pkg-list'>${PKG_LIST_HTML}</ul></td></tr>"
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${WIN_COUNT} update(s) installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
         else
-            print_ok "VM ${VMID} (${VM_NAME}) — Windows checked${local_suffix}"
-            VM_CURRENT=$((VM_CURRENT + 1))
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${os_icon}${html_suffix}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>Windows is fully up to date.</td></tr>"
+            # Unrecognised output means the PowerShell script did not finish.
+            # Treating that as "up to date" would hide a broken guest.
+            print_fail "VM ${VMID} (${VM_NAME}) — unrecognised Windows Update output${local_suffix}"
+            VM_ERRORS=$((VM_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>Windows Update returned output that could not be interpreted:<pre class='log-snippet'>$(echo "${WIN_OUTPUT}" | tail -n 20 | html_escape)</pre></td></tr>"
         fi
     else
         # ---- LINUX VM UPDATE ----
         start_spinner "Updating VM ${VMID} (${VM_NAME})..."
-        LINUX_OUTPUT=$(update_linux_vm "${VMID}")
+        update_linux_vm "${VMID}"
         stop_spinner
 
-        if [ "${LINUX_OUTPUT}" = "EXEC_FAILED" ]; then
-            print_fail "VM ${VMID} (${VM_NAME}) — guest exec failed${local_suffix}"
-            VM_ERRORS=$((VM_ERRORS + 1))
-            ERRORS_OCCURRED=true
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${html_suffix}</td><td><span class='status-badge badge-error'>Error</span></td><td>Failed to execute update command via guest agent.</td></tr>"
-        elif [ "${LINUX_OUTPUT}" = "TIMEOUT" ]; then
-            print_warn "VM ${VMID} (${VM_NAME}) — update timed out${local_suffix}"
-            VM_ERRORS=$((VM_ERRORS + 1))
-            ERRORS_OCCURRED=true
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${html_suffix}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Update command timed out after 5 minutes.</td></tr>"
-        elif [ -n "${LINUX_OUTPUT}" ]; then
-            UPDATES=$(echo "${LINUX_OUTPUT}" | grep -E '^\S+\s+\(' || true)
-            if [ -n "${UPDATES}" ]; then
-                PKG_COUNT=$(echo "${UPDATES}" | wc -l)
-                print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${PKG_COUNT} packages updated${C_NC}${local_suffix}"
-                VM_UPDATED=$((VM_UPDATED + 1))
-                ESCAPED_UPDATES=$(echo "${UPDATES}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-                PKG_LIST_HTML=$(echo "${ESCAPED_UPDATES}" | awk '{print "<li>" $0 "</li>"}')
-                VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${html_suffix}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${PKG_COUNT} package(s) updated:</strong><ul class='pkg-list'>${PKG_LIST_HTML}</ul></td></tr>"
-            else
-                print_ok "VM ${VMID} (${VM_NAME}) — already up to date${local_suffix}"
-                VM_CURRENT=$((VM_CURRENT + 1))
-                VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${html_suffix}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>System fully up to date.</td></tr>"
-            fi
-        else
-            print_ok "VM ${VMID} (${VM_NAME}) — already up to date${local_suffix}"
-            VM_CURRENT=$((VM_CURRENT + 1))
-            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})${html_suffix}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>System fully up to date.</td></tr>"
-        fi
+        PKG_COUNT=0
+        [ -n "${GU_PKGS}" ] && PKG_COUNT=$(echo "${GU_PKGS}" | grep -c . || true)
+
+        case "${GU_STATE}" in
+            execfail)
+                print_fail "VM ${VMID} (${VM_NAME}) — guest exec failed${local_suffix}"
+                VM_ERRORS=$((VM_ERRORS + 1))
+                ERRORS_OCCURRED=true
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>Failed to execute update command via guest agent.<div class='detail'>$(echo "${GU_DETAIL}" | html_escape)</div></td></tr>"
+                ;;
+            apierror)
+                print_fail "VM ${VMID} (${VM_NAME}) — ${GU_DETAIL}${local_suffix}"
+                VM_ERRORS=$((VM_ERRORS + 1))
+                ERRORS_OCCURRED=true
+                GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+                VM_WAS_STOPPED=false
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Agent Lost</span></td><td>The guest agent stopped answering while the upgrade was running. The VM was left running; its state is unknown.</td></tr>"
+                ;;
+            badjson)
+                print_fail "VM ${VMID} (${VM_NAME}) — ${GU_DETAIL}${local_suffix}"
+                VM_ERRORS=$((VM_ERRORS + 1))
+                ERRORS_OCCURRED=true
+                GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+                VM_WAS_STOPPED=false
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Unreadable Reply</span></td><td>$(echo "${GU_DETAIL}" | html_escape)<pre class='log-snippet'>$(echo "${GU_LOG}" | html_escape)</pre></td></tr>"
+                ;;
+            timeout)
+                print_warn "VM ${VMID} (${VM_NAME}) — update timed out after ${LINUX_UPDATE_TIMEOUT}s${local_suffix}"
+                VM_ERRORS=$((VM_ERRORS + 1))
+                ERRORS_OCCURRED=true
+                GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+                # Shutting down here would interrupt dpkg and break the guest.
+                VM_WAS_STOPPED=false
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Update did not finish within ${LINUX_UPDATE_TIMEOUT}s. VM left running so dpkg can complete — check it manually.</td></tr>"
+                ;;
+            unsupported)
+                print_warn "VM ${VMID} (${VM_NAME}) — unsupported package manager${local_suffix}"
+                VM_SKIPPED=$((VM_SKIPPED + 1))
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>No supported package manager found (apt/dnf/yum/apk).</td></tr>"
+                ;;
+            nosentinel)
+                print_fail "VM ${VMID} (${VM_NAME}) — update did not report a result${local_suffix}"
+                VM_ERRORS=$((VM_ERRORS + 1))
+                ERRORS_OCCURRED=true
+                [ -z "${GU_DETAIL}" ] && GU_DETAIL="The guest update script produced no __RESULT__ marker."
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
+                ;;
+            fail)
+                print_fail "VM ${VMID} (${VM_NAME}) — ${GU_DETAIL:-update failed}${local_suffix}"
+                VM_ERRORS=$((VM_ERRORS + 1))
+                ERRORS_OCCURRED=true
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-error'>Error</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) upgraded before the failure:")</td></tr>"
+                ;;
+            *)
+                if [ "${PKG_COUNT}" -gt 0 ] && [ "${DRY_RUN}" = "true" ]; then
+                    print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${PKG_COUNT} packages pending${C_NC} ${C_DIM}[dry run]${C_NC}${local_suffix}"
+                    VM_UPDATED=$((VM_UPDATED + 1))
+                    VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) would be upgraded:")</td></tr>"
+                elif [ "${PKG_COUNT}" -gt 0 ]; then
+                    print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${PKG_COUNT} packages updated${C_NC}${local_suffix}"
+                    VM_UPDATED=$((VM_UPDATED + 1))
+                    VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) updated:")</td></tr>"
+                else
+                    print_ok "VM ${VMID} (${VM_NAME}) — already up to date${local_suffix}"
+                    VM_CURRENT=$((VM_CURRENT + 1))
+                    VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-no-updates'>No Updates</span></td><td>System fully up to date.</td></tr>"
+                fi
+                ;;
+        esac
     fi
 
     # Restore stopped state if needed
@@ -796,44 +1435,76 @@ done
 # ==============================================================================
 # 3. UPDATE PROXMOX HOST NODE
 # ==============================================================================
-section_header "Proxmox Host (${HOST_NAME})"
 HOST_UPDATE_FAILED=false
 
+# A targeted run deliberately leaves the host alone — the point of --only is to
+# touch one guest without a full sweep.
+if [ -n "${ONLY_IDS}" ]; then
+    section_header "Proxmox Host (${HOST_NAME})"
+    print_skip "Host update skipped ${C_DIM}[--only ${ONLY_IDS}]${C_NC}"
+    HOST_STATUS_BADGE="<span class='status-badge badge-dim'>Skipped</span>"
+    HOST_SUMMARY_TEXT="Host update skipped — this run targeted only ${ONLY_IDS}."
+    PVE_VERSION_AFTER="${PVE_VERSION_BEFORE}"
+    PVE_VERSION_CHANGE="${PVE_VERSION_AFTER} (Unchanged)"
+else
+
+section_header "Proxmox Host (${HOST_NAME})"
+
+# Same apt hardening the guests get: wait for the lock instead of failing, keep
+# existing conffiles, and let needrestart act without prompting.
+HOST_APT_OPTS=(
+    -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT}"
+    -o Dpkg::Options::=--force-confdef
+    -o Dpkg::Options::=--force-confold
+)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
 start_spinner "Checking for host updates..."
-apt-get update -qy >/dev/null 2>&1
+HOST_UPDATE_RC=0
+apt-get "${HOST_APT_OPTS[@]}" update -qy >/dev/null 2>&1 || HOST_UPDATE_RC=$?
 HOST_UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep '/' || true)
 stop_spinner
 
+if [ "${HOST_UPDATE_RC}" -ne 0 ]; then
+    print_warn "Host apt-get update exited ${HOST_UPDATE_RC} — package list may be stale"
+fi
+
 if [ -n "${HOST_UPGRADABLE}" ]; then
-    HOST_UPDATES=$(echo "${HOST_UPGRADABLE}" | awk -F'/' '{
-        pkg=$1;
-        split($2, a, " ");
-        new_ver=a[2];
-        match($0, /\[from: [^\]]+\]/);
-        old_ver=substr($0, RSTART+7, RLENGTH-8);
-        print pkg " (" old_ver " -> " new_ver ")"
-    }')
+    HOST_UPDATES=$(echo "${HOST_UPGRADABLE}" | format_upgradable_host)
 
     HOST_PKG_COUNT=$(echo "${HOST_UPDATES}" | wc -l)
 
-    start_spinner "Installing ${HOST_PKG_COUNT} host updates..."
-    if DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -qy -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" 2>&1; then
-        apt-get autoremove -qy >/dev/null 2>&1
-        apt-get autoclean -qy >/dev/null 2>&1
-        stop_spinner
-
-        print_ok "${C_BOLD}${HOST_PKG_COUNT} host packages updated${C_NC}"
-        HOST_STATUS_BADGE="<span class='status-badge badge-success'>Updated</span>"
-        ESCAPED_HOST_UPDATES=$(echo "${HOST_UPDATES}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-        PKG_LIST_HTML=$(echo "${ESCAPED_HOST_UPDATES}" | awk '{print "<li>" $0 "</li>"}')
-        HOST_SUMMARY_TEXT="<strong>${HOST_PKG_COUNT} host package(s) updated:</strong><ul class='pkg-list'>${PKG_LIST_HTML}</ul>"
+    if [ "${DRY_RUN}" = "true" ]; then
+        print_warn "${C_BOLD}${HOST_PKG_COUNT} host packages pending${C_NC} ${C_DIM}[dry run — nothing installed]${C_NC}"
+        HOST_STATUS_BADGE="<span class='status-badge badge-warning'>Pending</span>"
+        HOST_SUMMARY_TEXT="<strong>${HOST_PKG_COUNT} host package(s) would be updated:</strong><ul class='pkg-list'>$(html_list "${HOST_UPDATES}")</ul>"
     else
-        stop_spinner
-        HOST_UPDATE_FAILED=true
-        ERRORS_OCCURRED=true
-        HOST_STATUS_BADGE="<span class='status-badge badge-error'>Failed</span>"
-        HOST_SUMMARY_TEXT="<strong>apt-get dist-upgrade failed!</strong> Check log: ${LOG_FILE}"
-        print_fail "${C_RED}Host apt-get dist-upgrade FAILED — reboot will NOT be scheduled${C_NC}"
+        start_spinner "Installing ${HOST_PKG_COUNT} host updates..."
+        if apt-get "${HOST_APT_OPTS[@]}" dist-upgrade -qy </dev/null 2>&1; then
+            apt-get "${HOST_APT_OPTS[@]}" autoremove -qy </dev/null >/dev/null 2>&1 || true
+            apt-get "${HOST_APT_OPTS[@]}" autoclean -qy </dev/null >/dev/null 2>&1 || true
+            stop_spinner
+
+            # Verify rather than trust: anything still upgradable was held back.
+            HOST_HELD=$(apt list --upgradable 2>/dev/null | grep '/' | cut -d/ -f1 || true)
+            print_ok "${C_BOLD}${HOST_PKG_COUNT} host packages updated${C_NC}"
+            HOST_STATUS_BADGE="<span class='status-badge badge-success'>Updated</span>"
+            HOST_SUMMARY_TEXT="<strong>${HOST_PKG_COUNT} host package(s) updated:</strong><ul class='pkg-list'>$(html_list "${HOST_UPDATES}")</ul>"
+            if [ -n "${HOST_HELD}" ]; then
+                print_warn "Some host packages were held back: $(echo "${HOST_HELD}" | tr '\n' ' ')"
+                HOST_SUMMARY_TEXT="${HOST_SUMMARY_TEXT}<strong>Held back (still upgradable):</strong><ul class='pkg-list'>$(html_list "${HOST_HELD}")</ul>"
+            fi
+        else
+            HOST_APT_RC=$?
+            stop_spinner
+            HOST_UPDATE_FAILED=true
+            ERRORS_OCCURRED=true
+            HOST_STATUS_BADGE="<span class='status-badge badge-error'>Failed</span>"
+            HOST_SUMMARY_TEXT="<strong>apt-get dist-upgrade failed (exit ${HOST_APT_RC})!</strong> Check log: ${LOG_FILE}"
+            print_fail "${C_RED}Host apt-get dist-upgrade FAILED (exit ${HOST_APT_RC}) — reboot will NOT be scheduled${C_NC}"
+        fi
     fi
 else
     print_ok "Host is already fully up to date"
@@ -851,19 +1522,24 @@ else
     PVE_VERSION_CHANGE="${PVE_VERSION_AFTER} (Unchanged)"
 fi
 
+fi   # end of full-sweep-only host section
+
 # --- Determine if a reboot is needed ---
 REBOOT_NEEDED=false
 REBOOT_REASON=""
 RUNNING_KERNEL=$(uname -r)
 LATEST_KERNEL=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|/boot/vmlinuz-||' || true)
 
-if [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
+if [ -n "${ONLY_IDS}" ]; then
+    # Never reboot the host because of a targeted guest run.
+    REBOOT_REASON="Reboot not considered — targeted run (--only ${ONLY_IDS})"
+elif [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
     REBOOT_NEEDED=true
     REBOOT_REASON="Kernel updated: ${RUNNING_KERNEL} &rarr; ${LATEST_KERNEL}"
     print_warn "Kernel change detected: ${C_BOLD}${RUNNING_KERNEL} → ${LATEST_KERNEL}${C_NC}"
 fi
 
-if [ -f /var/run/reboot-required ]; then
+if [ -z "${ONLY_IDS}" ] && [ -f /var/run/reboot-required ]; then
     REBOOT_NEEDED=true
     [ -z "${REBOOT_REASON}" ] && REBOOT_REASON="System flagged reboot-required"
 fi
@@ -871,6 +1547,15 @@ fi
 if [ "${HOST_UPDATE_FAILED}" = true ]; then
     REBOOT_NEEDED=false
     REBOOT_REASON="Reboot SKIPPED — host update failed"
+elif [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
+    # Guests were left running because their upgrade had not finished. Taking
+    # the host down now would kill dpkg part way through inside them.
+    REBOOT_NEEDED=false
+    REBOOT_REASON="Reboot SKIPPED — ${GUESTS_MID_UPDATE} guest(s) may still be updating"
+    print_warn "Reboot suppressed: ${GUESTS_MID_UPDATE} guest(s) left running mid-update"
+elif [ "${DRY_RUN}" = "true" ] && [ "${REBOOT_NEEDED}" = true ]; then
+    REBOOT_NEEDED=false
+    REBOOT_REASON="Reboot would have been scheduled — suppressed by dry run"
 fi
 
 if [ "${REBOOT_NEEDED}" = true ]; then
@@ -884,6 +1569,24 @@ fi
 # 4. BUILD HTML REPORT & SEND VIA MAILGUN
 # ==============================================================================
 section_header "Report & Email"
+
+DRY_RUN_BANNER_HTML=""
+if [ "${DRY_RUN}" = "true" ]; then
+    DRY_RUN_BANNER_HTML="<div class='dry-run-box'>DRY RUN — nothing was installed, snapshotted or rebooted. This report lists what <em>would</em> have been done.</div>"
+fi
+if [ -n "${ONLY_IDS}" ]; then
+    DRY_RUN_BANNER_HTML="${DRY_RUN_BANNER_HTML}<div class='dry-run-box'>TARGETED RUN — only guest(s) <strong>${ONLY_IDS}</strong> were considered. The Proxmox host was not updated and no reboot was scheduled.</div>"
+fi
+
+SNAPSHOT_SUMMARY_HTML=""
+if [ "${SNAPSHOTS_TAKEN}" -gt 0 ]; then
+    SNAPSHOT_SUMMARY_HTML="<br>Snapshots: ${SNAPSHOTS_TAKEN} taken (keeping ${SNAPSHOT_KEEP} per guest)"
+fi
+
+MID_UPDATE_SUMMARY_HTML=""
+if [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
+    MID_UPDATE_SUMMARY_HTML="<br><strong>${GUESTS_MID_UPDATE} guest(s) left running mid-update — check them before the next run.</strong>"
+fi
 
 cat <<EOF > "${HTML_FILE}"
 <!DOCTYPE html>
@@ -909,6 +1612,9 @@ cat <<EOF > "${HTML_FILE}"
   .badge-dim { background: #e9ecef; color: #6c757d; }
   .pkg-list { font-size: 12px; margin: 5px 0 0 15px; padding: 0; list-style-type: disc; }
   .pkg-list li { font-family: 'Courier New', Courier, monospace; font-size: 11px; padding: 1px 0; }
+  .detail { margin-top: 8px; font-size: 12px; color: #721c24; }
+  .log-snippet { margin: 8px 0 0 0; padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; font-family: 'Courier New', Courier, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; color: #495057; }
+  .dry-run-box { background: #e2e3e5; border-left: 4px solid #6c757d; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 14px; font-weight: bold; color: #383d41; }
   .summary-box { background: #f8f9fa; border: 1px solid #dee2e6; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px; line-height: 1.8; }
   .footer { margin-top: 25px; font-size: 12px; color: #6c757d; text-align: center; border-top: 1px solid #eee; padding-top: 15px; }
 </style>
@@ -918,6 +1624,8 @@ cat <<EOF > "${HTML_FILE}"
     <div class='header'>
       <h1>Proxmox VE Maintenance Report</h1>
     </div>
+
+    ${DRY_RUN_BANNER_HTML}
 
     <div class='pve-box'>
       Proxmox VE Version: ${PVE_VERSION_CHANGE}
@@ -933,7 +1641,7 @@ cat <<EOF > "${HTML_FILE}"
       <strong>Summary:</strong><br>
       LXC: ${LXC_UPDATED} updated, ${LXC_CURRENT} current, ${LXC_STARTED} started from stopped, ${LXC_ERRORS} errors, ${LXC_SKIPPED} skipped, ${LXC_EXCLUDED} excluded<br>
       VMs: ${VM_UPDATED} updated, ${VM_CURRENT} current, ${VM_STARTED} started from stopped, ${VM_ERRORS} errors, ${VM_SKIPPED} skipped, ${VM_EXCLUDED} excluded<br>
-      Host: ${HOST_PKG_COUNT} packages
+      Host: ${HOST_PKG_COUNT} packages${SNAPSHOT_SUMMARY_HTML}${MID_UPDATE_SUMMARY_HTML}
     </div>
 
     <div class='section-title'>1. Proxmox Host Node (${HOST_NAME})</div>
@@ -962,11 +1670,19 @@ cat <<EOF > "${HTML_FILE}"
 </html>
 EOF
 
+SUBJECT_PREFIX="[Proxmox]"
+[ "${DRY_RUN}" = "true" ] && SUBJECT_PREFIX="${SUBJECT_PREFIX}[DRY RUN]"
+[ -n "${ONLY_IDS}" ] && SUBJECT_PREFIX="${SUBJECT_PREFIX}[${ONLY_IDS}]"
+
 if [ "${ERRORS_OCCURRED}" = true ]; then
-    EMAIL_SUBJECT="[Proxmox] ⚠ Update Report (ERRORS) - ${HOST_NAME} (${TIMESTAMP})"
+    EMAIL_SUBJECT="${SUBJECT_PREFIX} ⚠ Update Report (ERRORS) - ${HOST_NAME} (${TIMESTAMP})"
 else
-    EMAIL_SUBJECT="[Proxmox] ✓ Update Report - ${HOST_NAME} (${TIMESTAMP})"
+    EMAIL_SUBJECT="${SUBJECT_PREFIX} ✓ Update Report - ${HOST_NAME} (${TIMESTAMP})"
 fi
+
+if [ "${SEND_EMAIL}" != "true" ]; then
+    print_skip "Report email suppressed ${C_DIM}[--no-email]${C_NC}"
+else
 
 start_spinner "Sending report via Mailgun ${MAILGUN_REGION}..."
 MAILGUN_RESPONSE_FILE="/tmp/mailgun_response_$$.txt"
@@ -988,6 +1704,8 @@ else
     fi
 fi
 rm -f "${MAILGUN_RESPONSE_FILE}"
+
+fi   # end of email dispatch
 
 # ==============================================================================
 # 5. CONDITIONAL REBOOT
@@ -1022,16 +1740,28 @@ echo -e "  ${C_CYAN}LXC:${C_NC}  ${C_GREEN}${LXC_UPDATED} updated${C_NC}, ${LXC_
 echo -e "  ${C_CYAN}VMs:${C_NC}  ${C_GREEN}${VM_UPDATED} updated${C_NC} (${VM_WIN_UPDATED} Windows), ${VM_CURRENT} current, ${VM_STARTED} started+stopped, ${VM_ERRORS} errors, ${VM_WIN_TIMEOUT} timeouts"
 echo -e "  ${C_CYAN}Host:${C_NC} ${C_GREEN}${HOST_PKG_COUNT} packages${C_NC}"
 
+if [ "${SNAPSHOTS_TAKEN}" -gt 0 ]; then
+    echo -e "  ${C_CYAN}Snaps:${C_NC} ${SNAPSHOTS_TAKEN} taken (keeping ${SNAPSHOT_KEEP} per guest)"
+fi
+
+if [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
+    echo -e "  ${C_YELLOW}⚠ ${GUESTS_MID_UPDATE} guest(s) left running mid-update — check them manually${C_NC}"
+fi
+
 if [ "${REBOOT_NEEDED}" = true ]; then
     echo -e "  ${C_YELLOW}⚠ Reboot scheduled at ${REBOOT_TIME}${C_NC}"
+elif [ -n "${REBOOT_REASON}" ]; then
+    echo -e "  ${C_DIM}${REBOOT_REASON}${C_NC}"
 fi
 
 echo ""
 echo -e "${C_BOLD}${C_CYAN}══════════════════════════════════════════════════════════════${C_NC}"
+DRY_SUFFIX=""
+[ "${DRY_RUN}" = "true" ] && DRY_SUFFIX=" ${C_DIM}[dry run — nothing was changed]${C_NC}"
 if [ "${ERRORS_OCCURRED}" = true ]; then
-    echo -e "  ${C_RED}${C_BOLD}Update sequence complete — with errors${C_NC}"
+    echo -e "  ${C_RED}${C_BOLD}Update sequence complete — with errors${C_NC}${DRY_SUFFIX}"
 else
-    echo -e "  ${C_GREEN}${C_BOLD}Update sequence complete — all clear ✓${C_NC}"
+    echo -e "  ${C_GREEN}${C_BOLD}Update sequence complete — all clear ✓${C_NC}${DRY_SUFFIX}"
 fi
 echo -e "${C_BOLD}${C_CYAN}══════════════════════════════════════════════════════════════${C_NC}"
 echo ""
