@@ -261,13 +261,45 @@ JSBLOCK_HEAD
         return btn;
     }
 
+    /* A Config panel can have more than one docked top toolbar: the breadcrumb
+       bar carrying the title, and the action bar with Reboot / Start / Console.
+       Taking [0] put a duplicate button up beside the title. Pick the bar that
+       actually holds action buttons — which also guarantees there is a sibling
+       to copy styling from. */
+    function pickToolbar(panel) {
+        var bars = panel.getDockedItems('toolbar[dock="top"]');
+        var best = null, bestCount = 0;
+        for (var i = 0; i < bars.length; i++) {
+            if (!bars[i].rendered) { continue; }
+            var n = bars[i].query('button').length -
+                    bars[i].query('#pauBtn').length;
+            if (n > bestCount) { bestCount = n; best = bars[i]; }
+        }
+        return best;
+    }
+
+    /* Drop our button from every toolbar of this panel except the chosen one,
+       so an earlier sweep (or an earlier version) cannot leave a stray behind. */
+    function pruneStrays(panel, keep) {
+        var bars = panel.getDockedItems('toolbar[dock="top"]');
+        for (var i = 0; i < bars.length; i++) {
+            if (bars[i] === keep) { continue; }
+            var dupes = bars[i].query('#pauBtn');
+            for (var j = 0; j < dupes.length; j++) {
+                bars[i].remove(dupes[j], true);
+            }
+        }
+    }
+
     function decorate(panel) {
         var rec = panel.pveSelNode;
         if (!rec || !rec.data) { return; }
         if (!panel.getDockedItems) { return; }
 
-        var tb = panel.getDockedItems('toolbar[dock="top"]')[0];
-        if (!tb || !tb.rendered || tb.query('#pauBtn').length) { return; }
+        var tb = pickToolbar(panel);
+        if (!tb) { return; }
+        pruneStrays(panel, tb);
+        if (tb.query('#pauBtn').length) { return; }
 
         var type = rec.data.type;
         var node = rec.data.node;

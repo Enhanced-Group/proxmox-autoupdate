@@ -1157,9 +1157,98 @@ class Handler(BaseHTTPRequestHandler):
 # --- The page -----------------------------------------------------------------
 
 
+SHARED_JS = r"""
+const $ = (id) => document.getElementById(id);
+
+function msg(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg show " + (ok ? "ok" : "err");
+  if (ok) setTimeout(() => { el.className = "msg"; }, 6000);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({credentials: "same-origin"}, opts || {}));
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* non-JSON error page */ }
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+const post = (path, body) => api(path, {
+  method: "POST",
+  headers: {"Content-Type": "application/json", "X-PAU-CSRF": CSRF},
+  body: JSON.stringify(body || {}),
+});
+
+/* Proxmox-style dialog. Resolves false on cancel, true on confirm, or the typed
+   text when `requireText` is set.
+
+   Replaces confirm()/prompt(), which the browser renders as "An embedded page
+   at <host>:8007 says" — visually nothing like Proxmox, and it advertises the
+   iframe. */
+function dialog(opts) {
+  return new Promise((resolve) => {
+    const back = document.createElement("div");
+    back.className = "modal-back";
+    const needsText = !!opts.requireText;
+
+    back.innerHTML =
+      '<div class="modal" role="dialog" aria-modal="true">' +
+        '<div class="modal-head"></div>' +
+        '<div class="modal-body"><div class="mtext"></div>' +
+          (needsText
+            ? '<label style="margin-top:12px">Type <strong>' + opts.requireText +
+              '</strong> to confirm</label>' +
+              '<input type="text" autocomplete="off" spellcheck="false">'
+            : "") +
+        "</div>" +
+        '<div class="modal-foot">' +
+          '<button class="mcancel">' + (opts.cancelText || "Cancel") + "</button>" +
+          '<button class="' + (opts.danger ? "danger" : "primary") + ' mok">' +
+            (opts.okText || "OK") + "</button>" +
+        "</div>" +
+      "</div>";
+
+    back.querySelector(".modal-head").textContent = opts.title || "Confirm";
+    back.querySelector(".mtext").innerHTML = opts.message || "";
+
+    const input = back.querySelector("input");
+    const okBtn = back.querySelector(".mok");
+    if (needsText) { okBtn.disabled = true; }
+
+    const close = (value) => {
+      document.removeEventListener("keydown", onKey);
+      back.remove();
+      resolve(value);
+    };
+    const accept = () => {
+      if (needsText && input.value !== opts.requireText) { return; }
+      close(needsText ? input.value : true);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { close(false); }
+      if (e.key === "Enter" && !okBtn.disabled) { accept(); }
+    };
+
+    if (needsText) {
+      input.oninput = () => { okBtn.disabled = input.value !== opts.requireText; };
+    }
+    okBtn.onclick = accept;
+    back.querySelector(".mcancel").onclick = () => close(false);
+    back.onclick = (e) => { if (e.target === back) { close(false); } };
+    document.addEventListener("keydown", onKey);
+
+    document.body.appendChild(back);
+    (needsText ? input : okBtn).focus();
+  });
+}
+"""
+
+
 def render_page(user, csrf):
     return (PAGE_TEMPLATE
             .replace("{{CSS}}", SHARED_CSS)
+            .replace("{{JS}}", SHARED_JS)
             .replace("{{USER}}", html.escape(user))
             .replace("{{CSRF}}", csrf))
 
@@ -1168,6 +1257,7 @@ def render_guest_page(user, csrf, vmid, name):
     # vmid is already known to be all digits, so it is safe to inline into JS.
     return (GUEST_TEMPLATE
             .replace("{{CSS}}", SHARED_CSS)
+            .replace("{{JS}}", SHARED_JS)
             .replace("{{USER}}", html.escape(user))
             .replace("{{CSRF}}", csrf)
             .replace("{{VMID}}", html.escape(vmid))
@@ -1225,6 +1315,56 @@ SHARED_CSS = r"""  :root {
   .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .hidden { display: none; }
   .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+  /* --- Dialogs -------------------------------------------------------------
+     Browser confirm()/prompt() render as "An embedded page at host:8007 says",
+     which looks nothing like Proxmox and announces the iframe. These match the
+     ExtJS dialogs instead. */
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.55);
+                display: flex; align-items: center; justify-content: center;
+                z-index: 1000; animation: fadeIn .12s ease-out; }
+  .modal { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 3px; min-width: 340px; max-width: 520px;
+           box-shadow: 0 8px 28px rgba(0,0,0,.5);
+           animation: popIn .14s cubic-bezier(.2,.9,.3,1.2); }
+  .modal-head { padding: 8px 12px; border-bottom: 1px solid var(--border);
+                font-weight: 600; font-size: 13px; color: #4d9bd7; }
+  .modal-body { padding: 14px 12px; font-size: 13px; line-height: 1.55; }
+  .modal-body ul { margin: 8px 0 0 18px; padding: 0; }
+  .modal-body input { margin-top: 10px; }
+  .modal-foot { padding: 8px 12px; border-top: 1px solid var(--border);
+                display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-foot button { min-width: 78px; }
+  @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+  @keyframes popIn  { from { opacity: 0; transform: translateY(-8px) scale(.98) }
+                      to   { opacity: 1; transform: none } }
+
+  /* --- Activity ------------------------------------------------------------
+     A run can take many minutes with long silent stretches. Without motion the
+     panel is indistinguishable from one that has hung. */
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+  @keyframes stripes { from { background-position: 0 0 }
+                       to   { background-position: 32px 0 } }
+  @keyframes spin { to { transform: rotate(360deg) } }
+  @keyframes blink { 0%,49% { opacity: 1 } 50%,100% { opacity: 0 } }
+
+  .pill.run { animation: pulse 1.4s ease-in-out infinite; }
+
+  .spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px;
+             border: 2px solid rgba(255,255,255,.25); border-top-color: var(--accent);
+             border-radius: 50%; animation: spin .7s linear infinite;
+             vertical-align: -2px; }
+
+  .progress { height: 4px; border-radius: 2px; overflow: hidden;
+              background: var(--border); margin-top: 10px; display: none; }
+  .progress.active { display: block; }
+  .progress > div { height: 100%; width: 100%; background-image: linear-gradient(
+      90deg, var(--accent) 0 8px, rgba(230,92,0,.35) 8px 16px);
+      background-size: 32px 100%; animation: stripes .8s linear infinite; }
+
+  pre.live::after { content: '▌'; color: var(--accent); animation: blink 1s step-end infinite; }
+  .log-line-new { animation: fadeIn .25s ease-out; }
+  .stat { transition: color .25s ease; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   td, th { padding: 5px 7px; border-bottom: 1px solid var(--border); text-align: left; }
   a { color: var(--accent); }
@@ -1270,9 +1410,10 @@ PAGE_TEMPLATE = r"""<!doctype html>
       every guest, and may schedule a reboot if the kernel changes.
     </div>
     <div id="runMsg" class="msg"></div>
+    <div id="runProgress" class="progress"><div></div></div>
   </div>
   <div class="card">
-    <h2>Live output</h2>
+    <h2>Live output <span id="liveTag" class="pill run hidden">live</span></h2>
     <pre id="logView">No run started from this page yet.</pre>
   </div>
 </section>
@@ -1528,27 +1669,8 @@ const FIELDS = [
   ["REBOOT_TIME",            "Reboot time (HH:MM)",      "text"],
 ];
 
-const $ = (id) => document.getElementById(id);
+{{JS}}
 
-function msg(el, text, ok) {
-  el.textContent = text;
-  el.className = "msg show " + (ok ? "ok" : "err");
-  if (ok) setTimeout(() => { el.className = "msg"; }, 6000);
-}
-
-async function api(path, opts) {
-  const res = await fetch(path, Object.assign({credentials: "same-origin"}, opts || {}));
-  let data = {};
-  try { data = await res.json(); } catch (e) { /* non-JSON error page */ }
-  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
-  return data;
-}
-
-const post = (path, body) => api(path, {
-  method: "POST",
-  headers: {"Content-Type": "application/json", "X-PAU-CSRF": CSRF},
-  body: JSON.stringify(body || {}),
-});
 
 // --- tabs ---
 document.querySelectorAll(".tabs button").forEach((btn) => {
@@ -1655,7 +1777,13 @@ $("btnSaveLogCfg").onclick = async () => {
 };
 
 $("btnPurgeLogs").onclick = async () => {
-  if (!confirm("Delete all stored update logs?\n\nThe log of a run in progress is kept.")) return;
+  const go = await dialog({
+    title: "Delete stored logs",
+    message: "Delete every stored update log?<br><br>" +
+             "The log of a run currently in progress is kept.",
+    okText: "Delete", danger: true,
+  });
+  if (!go) return;
   try {
     const res = await post("/api/logs/purge", {});
     msg($("logCfgMsg"), "Deleted " + res.removed + " log file(s).", true);
@@ -1715,7 +1843,13 @@ $("btnCheckUpdate").onclick = async () => {
 };
 
 $("btnSelfUpdate").onclick = async () => {
-  if (prompt("Install the new version now?\n\nType UPDATE to confirm:") !== "UPDATE") return;
+  const ok = await dialog({
+    title: "Install update",
+    message: "Download and install the new version now?<br><br>" +
+             "The control panel will restart as part of this.",
+    requireText: "UPDATE", okText: "Install",
+  });
+  if (ok !== "UPDATE") return;
   try {
     const r = await post("/api/self/update", {confirm: "UPDATE"});
     msg($("verMsg"), r.detail, true);
@@ -1724,15 +1858,33 @@ $("btnSelfUpdate").onclick = async () => {
 
 $("btnUninstall").onclick = async () => {
   const purge = $("purgeToo").checked;
-  // Deliberately two steps: a plain-language confirm, then a typed word.
-  const warning = "This will remove Proxmox Auto-Update from this node:\n\n" +
-    "  • the updater and its schedule\n" +
-    "  • this control panel and its service\n" +
-    "  • the button in the Proxmox UI\n" +
-    (purge ? "  • your configuration and ALL logs\n" : "  • (config and logs will be kept)\n") +
-    "\nThis panel will stop responding once it starts.\n\nContinue?";
-  if (!confirm(warning)) return;
-  if (prompt("Final step.\n\nType UNINSTALL to confirm:") !== "UNINSTALL") {
+  // Deliberately two steps: plain language first, then a typed word.
+  const proceed = await dialog({
+    title: "Uninstall Proxmox Auto-Update",
+    danger: true,
+    okText: "Continue",
+    message:
+      "This removes from <strong>this node</strong>:" +
+      "<ul><li>the updater and its schedule</li>" +
+      "<li>this control panel and its service</li>" +
+      "<li>the Auto-Update buttons in the Proxmox UI</li>" +
+      (purge
+        ? "<li><strong>your configuration and all logs</strong></li></ul>"
+        : "</ul><p style='margin:10px 0 0'>Configuration and logs will be " +
+          "<strong>kept</strong>.</p>") +
+      "<p style='margin:10px 0 0;opacity:.8'>This panel will stop responding " +
+      "once it starts — that is expected.</p>",
+  });
+  if (!proceed) return;
+
+  const typed = await dialog({
+    title: "Confirm uninstall",
+    danger: true,
+    okText: "Uninstall",
+    requireText: "UNINSTALL",
+    message: "Last step — this cannot be undone from here.",
+  });
+  if (typed !== "UNINSTALL") {
     msg($("uninstallMsg"), "Cancelled.", false);
     return;
   }
@@ -1810,12 +1962,15 @@ async function poll() {
   try {
     const st = await api("/api/status");
     const pill = $("statusPill");
+    const busy = st.running || st.lock_held;
+
     if (st.running) {
       pill.className = "pill run";
-      pill.textContent = (st.dry_run ? "dry run" : "updating") + " …";
+      pill.innerHTML = '<span class="spinner"></span>' +
+                       (st.dry_run ? "dry run" : "updating") + "…";
     } else if (st.lock_held) {
       pill.className = "pill run";
-      pill.textContent = "scheduled run in progress";
+      pill.innerHTML = '<span class="spinner"></span>scheduled run in progress';
     } else if (st.returncode === 0) {
       pill.className = "pill ok"; pill.textContent = "last run OK";
     } else if (st.returncode !== null && st.returncode !== undefined) {
@@ -1825,8 +1980,14 @@ async function poll() {
     }
     $("schedDisplay").textContent = st.schedule || "not scheduled";
 
-    $("btnDry").disabled = st.running || st.lock_held;
-    $("btnFull").disabled = st.running || st.lock_held;
+    // Motion while a run is in flight: a long silent stretch mid-upgrade
+    // otherwise looks identical to a panel that has hung.
+    $("runProgress").classList.toggle("active", !!busy);
+    $("liveTag").classList.toggle("hidden", !busy);
+    $("logView").classList.toggle("live", !!busy);
+
+    $("btnDry").disabled = busy;
+    $("btnFull").disabled = busy;
 
     if (st.log && st.log !== activeLog) { activeLog = st.log; logOffset = 0; $("logView").textContent = ""; }
     if (activeLog) await pumpLog();
@@ -1859,9 +2020,16 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  const typed = prompt(
-    "This updates the Proxmox host and every guest right now.\n\n" +
-    "Type UPDATE to confirm:");
+  const typed = await dialog({
+    title: "Update everything now",
+    danger: true,
+    okText: "Update everything",
+    requireText: "UPDATE",
+    message:
+      "This updates the Proxmox host <strong>and every guest</strong> right now." +
+      "<p style='margin:10px 0 0;opacity:.8'>Excluded guests are still skipped. " +
+      "A reboot may be scheduled if the host kernel changes.</p>",
+  });
   if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/run", {dry_run: false, confirm: "UPDATE"});
@@ -2013,37 +2181,19 @@ GUEST_TEMPLATE = r"""<!doctype html>
     ever scheduled from here. No report email is sent — the output appears below.
   </div>
   <div id="runMsg" class="msg"></div>
+  <div id="runProgress" class="progress"><div></div></div>
 </div>
 
 <div class="card">
-  <h2>Output</h2>
+  <h2>Output <span id="liveTag" class="pill run hidden">live</span></h2>
   <pre id="logView">Nothing run yet.</pre>
 </div>
 
 <script>
 const CSRF = "{{CSRF}}";
 const VMID = "{{VMID}}";
-const $ = (id) => document.getElementById(id);
+{{JS}}
 
-function msg(el, text, ok) {
-  el.textContent = text;
-  el.className = "msg show " + (ok ? "ok" : "err");
-  if (ok) setTimeout(() => { el.className = "msg"; }, 6000);
-}
-
-async function api(path, opts) {
-  const res = await fetch(path, Object.assign({credentials: "same-origin"}, opts || {}));
-  let data = {};
-  try { data = await res.json(); } catch (e) {}
-  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
-  return data;
-}
-
-const post = (path, body) => api(path, {
-  method: "POST",
-  headers: {"Content-Type": "application/json", "X-PAU-CSRF": CSRF},
-  body: JSON.stringify(body || {}),
-});
 
 let allGuests = [];
 
@@ -2086,11 +2236,14 @@ async function poll() {
     const st = await api("/api/status");
     const pill = $("statusPill");
     const mine = st.only === VMID;
+    const busy = st.running || st.lock_held;
     if (st.running && mine) {
       pill.className = "pill run";
-      pill.textContent = st.dry_run ? "checking…" : "updating…";
-    } else if (st.running || st.lock_held) {
-      pill.className = "pill run"; pill.textContent = "another run in progress";
+      pill.innerHTML = '<span class="spinner"></span>' +
+                       (st.dry_run ? "checking…" : "updating…");
+    } else if (busy) {
+      pill.className = "pill run";
+      pill.innerHTML = '<span class="spinner"></span>another run in progress';
     } else if (st.returncode === 0 && mine) {
       pill.className = "pill ok"; pill.textContent = "last run OK";
     } else if (mine && st.returncode) {
@@ -2098,8 +2251,13 @@ async function poll() {
     } else {
       pill.className = "pill idle"; pill.textContent = "idle";
     }
-    $("btnDry").disabled = st.running || st.lock_held;
-    $("btnFull").disabled = st.running || st.lock_held;
+
+    $("runProgress").classList.toggle("active", !!(st.running && mine));
+    $("liveTag").classList.toggle("hidden", !(st.running && mine));
+    $("logView").classList.toggle("live", !!(st.running && mine));
+
+    $("btnDry").disabled = busy;
+    $("btnFull").disabled = busy;
 
     if (st.log && st.log !== activeLog && mine) {
       activeLog = st.log; logOffset = 0; $("logView").textContent = "";
@@ -2130,7 +2288,18 @@ $("btnDry").onclick = async () => {
 };
 
 $("btnFull").onclick = async () => {
-  const typed = prompt("Update guest " + VMID + " now?\n\nType UPDATE to confirm:");
+  const me = allGuests.find((g) => g.vmid === VMID);
+  const label = me ? (me.name + " (" + VMID + ")") : ("guest " + VMID);
+  const typed = await dialog({
+    title: "Update " + label,
+    danger: true,
+    okText: "Update now",
+    requireText: "UPDATE",
+    message:
+      "Update <strong>" + label + "</strong> now." +
+      "<p style='margin:10px 0 0;opacity:.8'>Only this guest is touched. The " +
+      "Proxmox host is not updated and no reboot is scheduled.</p>",
+  });
   if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
   try {
     await post("/api/guest/run", {vmid: VMID, dry_run: false, confirm: "UPDATE"});
