@@ -477,10 +477,11 @@ anything by itself. That split is deliberate: automatic self-update would mean a
 compromised or simply mistaken upstream could roll itself onto your node without
 anyone deciding to.
 
-If an update is available, the **changelog for the new version** is shown next
-to the button, alongside the one before it, so you can see what changes before
-committing to it. The full history lives in
-[CHANGELOG.md](CHANGELOG.md).
+If an update is available, the **changelog for that version** is shown next to
+the button, so you can see what changes before committing to it.
+[CHANGELOG.md](CHANGELOG.md) carries the current release only; earlier ones are
+in the git history and on the
+[releases page](https://github.com/Enhanced-Group/proxmox-autoupdate/releases).
 
 While installing, the button is disabled and reports which stage it's at. It
 stays disabled until the **new version number is confirmed running** — not
