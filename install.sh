@@ -117,6 +117,9 @@ PREV_SLACK=""
 PREV_GENERIC=""
 PREV_KEEP_LOGS=""
 PREV_LOG_RETENTION=""
+PREV_BOT_TOKEN=""
+PREV_USER_ID=""
+PREV_CONFIRM=""
 
 if [ -f "${CONFIG_FILE}" ]; then
     echo ""
@@ -148,6 +151,9 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_GENERIC="${GENERIC_WEBHOOK_URL:-}"
     PREV_KEEP_LOGS="${KEEP_LOGS:-}"
     PREV_LOG_RETENTION="${LOG_RETENTION_DAYS:-}"
+    PREV_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
+    PREV_USER_ID="${DISCORD_USER_ID:-}"
+    PREV_CONFIRM="${CONFIRM_UPDATES:-}"
 
     # Installs predating NOTIFY_METHODS had Mailgun and nothing else.
     if [ -z "${PREV_NOTIFY_METHODS}" ] && [ -n "${MAILGUN_API_KEY:-}" ]; then
@@ -185,6 +191,9 @@ echo -e "  ${C_DIM}up — without one they simply run quietly. You can add or ch
 echo -e "  ${C_DIM}channels later from the web panel or the config file.${C_NC}"
 echo ""
 
+DISCORD_BOT_TOKEN="${PREV_BOT_TOKEN}"
+DISCORD_USER_ID="${PREV_USER_ID}"
+CONFIRM_UPDATES="${PREV_CONFIRM:-true}"
 DEFAULT_METHODS="${PREV_NOTIFY_METHODS:-}"
 if [ -n "${DEFAULT_METHODS}" ]; then
     echo -e "  ${C_DIM}Currently enabled: ${DEFAULT_METHODS}${C_NC}"
@@ -264,14 +273,33 @@ else
     if echo ",${NOTIFY_METHODS}," | grep -q ",discord,"; then
         echo ""
         echo -e "  ${C_BOLD}Discord${C_NC}"
-        echo -e "  ${C_DIM}Server Settings → Integrations → Webhooks → New Webhook → Copy URL${C_NC}"
-        read -rp "  Webhook URL: " I <&3 || true
-        DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
-        if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
-            print_ok "Discord configured"
+        echo -e "    ${C_CYAN}1)${C_NC} Channel webhook  ${C_DIM}(Server Settings → Integrations → Webhooks)${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} Direct message   ${C_DIM}(bot token + your user ID)${C_NC}"
+        read -rp "  Select 1 or 2 [1]: " I <&3 || true
+        if [ "${I}" = "2" ]; then
+            echo -e "  ${C_DIM}The bot must share a server with you for Discord to allow the DM.${C_NC}"
+            echo -e "  ${C_DIM}It is never run as a process — the token is only used to POST.${C_NC}"
+            read -rp "  Bot token: " I <&3 || true
+            DISCORD_BOT_TOKEN="${I:-${PREV_BOT_TOKEN}}"
+            read -rp "  Your Discord user ID (numeric): " I <&3 || true
+            DISCORD_USER_ID="${I:-${PREV_USER_ID}}"
+            read -rp "  Fallback webhook URL (optional): " I <&3 || true
+            DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
+            if [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; then
+                print_ok "Discord DM configured"
+            else
+                print_fail "Both a bot token and a user ID are needed — dropping Discord."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
+            fi
         else
-            print_fail "No URL given — dropping Discord."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
+            read -rp "  Webhook URL: " I <&3 || true
+            DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
+            if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
+                print_ok "Discord configured"
+            else
+                print_fail "No URL given — dropping Discord."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
+            fi
         fi
     fi
 
@@ -595,6 +623,17 @@ DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL}"
 GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL}"
 
+# Discord direct message instead of a channel webhook. Set both and the report
+# is DM'd to that user; the webhook above stays as a fallback. The bot is never
+# run as a process — the token is only an Authorization header on two REST
+# calls made at report time.
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN}"
+DISCORD_USER_ID="${DISCORD_USER_ID}"
+
+# Ask before starting an update ("true" or "false"). Deleting logs and
+# uninstalling always confirm regardless.
+CONFIRM_UPDATES="${CONFIRM_UPDATES}"
+
 # Log retention. KEEP_LOGS=false still streams a run live, then deletes it.
 # LOG_RETENTION_DAYS=0 keeps logs forever.
 KEEP_LOGS="${KEEP_LOGS}"
@@ -681,6 +720,10 @@ else
     print_ok "Downloaded from GitHub"
 fi
 chmod +x "${TARGET_PATH}"
+
+# 4a. Changelog, so the panel can show it even without network access
+mkdir -p /usr/local/share/proxmox-autoupdate
+fetch_asset "CHANGELOG.md" "/usr/local/share/proxmox-autoupdate/CHANGELOG.md" || true
 
 # 4b. Uninstaller, so removal never depends on having the repo to hand
 if fetch_asset "uninstall.sh" "/usr/local/bin/pve-autoupdate-uninstall"; then
