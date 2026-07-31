@@ -261,32 +261,62 @@ JSBLOCK_HEAD
         return btn;
     }
 
-    /* A Config panel can have more than one docked top toolbar: the breadcrumb
-       bar carrying the title, and the action bar with Reboot / Start / Console.
-       Taking [0] put a duplicate button up beside the title. Pick the bar that
-       actually holds action buttons — which also guarantees there is a sibling
-       to copy styling from. */
-    function pickToolbar(panel) {
-        var bars = panel.getDockedItems('toolbar[dock="top"]');
-        var best = null, bestCount = 0;
-        for (var i = 0; i < bars.length; i++) {
-            if (!bars[i].rendered) { continue; }
-            var n = bars[i].query('button').length -
-                    bars[i].query('#pauBtn').length;
-            if (n > bestCount) { bestCount = n; best = bars[i]; }
+    /* Both the outer Config panel and the content panel inside it carry
+       pveSelNode, so decorating everything that matches produced two buttons —
+       one stranded up in the breadcrumb bar. Take the outermost match only. */
+    function outermostConfig() {
+        var panels = Ext.ComponentQuery.query('panel[pveSelNode]');
+        var visible = [];
+        for (var i = 0; i < panels.length; i++) {
+            if (panels[i].rendered && panels[i].isVisible()) { visible.push(panels[i]); }
         }
-        return best;
+        for (var a = 0; a < visible.length; a++) {
+            var nested = false;
+            for (var b = 0; b < visible.length; b++) {
+                if (a !== b && visible[a].isDescendantOf &&
+                    visible[a].isDescendantOf(visible[b])) { nested = true; break; }
+            }
+            if (!nested) { return visible[a]; }
+        }
+        return null;
     }
 
-    /* Drop our button from every toolbar of this panel except the chosen one,
-       so an earlier sweep (or an earlier version) cannot leave a stray behind. */
-    function pruneStrays(panel, keep) {
-        var bars = panel.getDockedItems('toolbar[dock="top"]');
-        for (var i = 0; i < bars.length; i++) {
-            if (bars[i] === keep) { continue; }
-            var dupes = bars[i].query('#pauBtn');
-            for (var j = 0; j < dupes.length; j++) {
-                bars[i].remove(dupes[j], true);
+    /* Where the button belongs: the toolbar of the content panel currently on
+       screen — the row inside the viewport, below the breadcrumb. The Config
+       panel's own tbar is the breadcrumb row (title on the left, Reboot /
+       Shutdown / Shell on the right), which is not where it was wanted.
+
+       Falls back to that outer bar only when the selected view has no toolbar
+       of its own, so there is always a button somewhere rather than none. */
+    function chooseToolbar(cfg) {
+        var inner = (typeof cfg.getActiveTab === 'function') ? cfg.getActiveTab() : null;
+        if (inner && inner.rendered && inner.getDockedItems) {
+            var bars = inner.getDockedItems('toolbar[dock="top"]');
+            for (var i = 0; i < bars.length; i++) {
+                if (bars[i].rendered) { return bars[i]; }
+            }
+        }
+        var outer = cfg.getDockedItems ? cfg.getDockedItems('toolbar[dock="top"]') : [];
+        for (var j = 0; j < outer.length; j++) {
+            if (outer[j].rendered &&
+                outer[j].query('button').length - outer[j].query('#pauBtn').length > 0) {
+                return outer[j];
+            }
+        }
+        return null;
+    }
+
+    /* One button, application-wide. Anything of ours outside the chosen toolbar
+       is removed, which also cleans up buttons left by an earlier version. */
+    function dedupe(keep) {
+        var all = Ext.ComponentQuery.query('#pauBtn');
+        for (var i = 0; i < all.length; i++) {
+            var btn = all[i];
+            if (btn.ownerCt === keep) { continue; }
+            if (btn.ownerCt && btn.ownerCt.remove) {
+                btn.ownerCt.remove(btn, true);
+            } else if (btn.destroy) {
+                btn.destroy();
             }
         }
     }
@@ -294,11 +324,10 @@ JSBLOCK_HEAD
     function decorate(panel) {
         var rec = panel.pveSelNode;
         if (!rec || !rec.data) { return; }
-        if (!panel.getDockedItems) { return; }
 
-        var tb = pickToolbar(panel);
+        var tb = chooseToolbar(panel);
         if (!tb) { return; }
-        pruneStrays(panel, tb);
+        dedupe(tb);
         if (tb.query('#pauBtn').length) { return; }
 
         var type = rec.data.type;
@@ -354,11 +383,11 @@ JSBLOCK_HEAD
             interval: 800,
             run: function () {
                 try {
-                    var panels = Ext.ComponentQuery.query('panel[pveSelNode]');
-                    for (var i = 0; i < panels.length; i++) {
-                        if (panels[i].rendered && panels[i].isVisible()) {
-                            decorate(panels[i]);
-                        }
+                    var cfg = outermostConfig();
+                    if (cfg) {
+                        decorate(cfg);
+                    } else {
+                        dedupe(null);   /* nothing selected — drop any leftovers */
                     }
                 } catch (e) {
                     if (window.console) {

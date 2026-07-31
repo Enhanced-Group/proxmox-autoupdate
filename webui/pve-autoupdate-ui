@@ -433,12 +433,47 @@ def send_test_notification(cfg):
     if not methods:
         return False, "No notification channels are enabled."
 
+    # Pre-flight. Without this an incomplete channel produces a bare "HTTP 400"
+    # from the provider, which says nothing about which field is missing —
+    # an empty Mailgun domain builds .../v3//messages, for instance.
+    problems = []
+    if "email" in methods:
+        missing = [k for k in ("MAILGUN_API_KEY", "MAILGUN_DOMAIN",
+                               "SENDER_EMAIL", "RECIPIENT_EMAIL")
+                   if not (cfg.get(k) or "").strip()]
+        if missing:
+            problems.append("Email is enabled but %s %s not set."
+                            % (", ".join(missing),
+                               "is" if len(missing) == 1 else "are"))
+        elif "@" not in (cfg.get("SENDER_EMAIL") or ""):
+            problems.append("SENDER_EMAIL does not look like an address.")
+    for method, key, label in (("discord", "DISCORD_WEBHOOK_URL", "Discord"),
+                               ("slack", "SLACK_WEBHOOK_URL", "Slack/Teams"),
+                               ("webhook", "GENERIC_WEBHOOK_URL", "Generic webhook")):
+        if method in methods and not (cfg.get(key) or "").strip():
+            problems.append("%s is enabled but %s is not set." % (label, key))
+    if problems:
+        return False, "\n".join(problems)
+
     script = r'''
 set -u
 CONFIG_FILE="%s"
 . "${CONFIG_FILE}"
 HOST_NAME=$(hostname -f 2>/dev/null || hostname)
 TIMESTAMP=$(date '+%%d/%%m/%%Y %%H:%%M:%%S')
+
+# The notifier reads MAILGUN_API_URL, which update-everything.sh derives from
+# the region *outside* the helper block copied in below. Derive it the same way
+# here, or notify_email would reference an unbound variable — or, with an empty
+# domain, POST to .../v3//messages and get a bare 400 back.
+MAILGUN_DOMAIN="${MAILGUN_DOMAIN:-}"
+MAILGUN_REGION="${MAILGUN_REGION:-EU}"
+if [ "${MAILGUN_REGION}" = "EU" ]; then
+    MAILGUN_API_URL="https://api.eu.mailgun.net/v3/${MAILGUN_DOMAIN}/messages"
+else
+    MAILGUN_API_URL="https://api.mailgun.net/v3/${MAILGUN_DOMAIN}/messages"
+fi
+
 ERRORS_OCCURRED=false; DRY_RUN=false; KEEP_LOGS=false; LOG_FILE=""
 REBOOT_NEEDED=false; REPEAT_OFFENDERS=""; PVE_VERSION_AFTER=$(pveversion 2>/dev/null | awk '{print $1}')
 LXC_UPDATED=0 LXC_ERRORS=0 VM_UPDATED=0 VM_ERRORS=0 HOST_PKG_COUNT=0
@@ -498,8 +533,13 @@ done
             except OSError:
                 pass
 
-    ok = "FAIL:" not in output and output != ""
-    return ok, output or "No output from the notifier."
+    # Success means the notifier explicitly said so. Treating "no output" as
+    # success would report a green tick for a channel that never ran.
+    ok = "OK:" in output and "FAIL:" not in output
+    if not output:
+        return False, ("The notifier produced no output at all — check "
+                       "'journalctl -u pve-autoupdate-ui' for details.")
+    return ok, output
 
 
 GITHUB_REPO = "Enhanced-Group/proxmox-autoupdate"
@@ -562,6 +602,36 @@ def check_for_updates():
         "update_available": bool(behind),
         "repo": "https://github.com/%s" % GITHUB_REPO,
         "command": "curl -sSL %s | bash" % INSTALL_SCRIPT_URL,
+    }
+
+
+SELFUPDATE_UNIT = "pve-autoupdate-selfupdate"
+UNINSTALL_UNIT = "pve-autoupdate-uninstall"
+
+
+def unit_state(unit):
+    """systemd's view of a transient unit: active, failed, inactive or unknown."""
+    try:
+        res = subprocess.run(["systemctl", "is-active", unit + ".service"],
+                             capture_output=True, text=True, timeout=10)
+        return (res.stdout or res.stderr).strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def maintenance_status():
+    """Whether a self-update or uninstall is in flight.
+
+    The panel restarts mid-self-update, so this cannot be tracked in memory —
+    it is read back from systemd, which survives the restart.
+    """
+    selfupd = unit_state(SELFUPDATE_UNIT)
+    uninst = unit_state(UNINSTALL_UNIT)
+    return {
+        "self_update": selfupd,
+        "uninstall": uninst,
+        "busy": selfupd in ("active", "activating")
+                or uninst in ("active", "activating"),
     }
 
 
@@ -894,7 +964,9 @@ class Handler(BaseHTTPRequestHandler):
             stats["retention_days"] = (cfg.get("LOG_RETENTION_DAYS") or "90")
             self._json(200, stats)
         elif path == "/api/self/version":
-            self._json(200, {"version": installed_version()})
+            status = maintenance_status()
+            status["version"] = installed_version()
+            self._json(200, status)
         elif path == "/api/config":
             cfg = read_config()
             payload = {k: cfg.get(k, "") for k in EDITABLE_KEYS}
@@ -983,21 +1055,30 @@ class Handler(BaseHTTPRequestHandler):
         if JOB.snapshot()["running"] or lock_is_held():
             self._json(409, {"error": "An update run is in progress — wait for it to finish."})
             return
+        if maintenance_status()["busy"]:
+            self._json(409, {"error": "A self-update or uninstall is already running."})
+            return
 
         # Runs detached: the installer replaces this very script and restarts
         # this service, so it cannot be a child of the request handling it.
-        command = ("curl -fsSL %s -o /tmp/pau-install.sh && "
-                   "bash /tmp/pau-install.sh --unattended; "
-                   "rm -f /tmp/pau-install.sh" % INSTALL_SCRIPT_URL)
-        ok, detail = run_detached(command, "pve-autoupdate-selfupdate")
+        # `set -o pipefail` and an explicit tmpdir keep a partial download from
+        # ever being executed.
+        command = (
+            "set -e; "
+            "d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; "
+            "curl -fsSL %s -o \"$d/install.sh\"; "
+            "test -s \"$d/install.sh\"; "
+            "bash \"$d/install.sh\" --unattended"
+        ) % INSTALL_SCRIPT_URL
+        ok, detail = run_detached(command, SELFUPDATE_UNIT)
         if not ok:
             self._json(500, {"error": "Could not start the update: %s" % detail})
             return
         sys.stderr.write("[ui] self-update started by %s\n" % user)
         self._json(200, {
             "started": True,
-            "detail": "Update started as %s. This panel will restart; "
-                      "reload in about a minute." % detail,
+            "detail": "Update started. This panel will restart part way through — "
+                      "the page will reconnect on its own.",
         })
 
     def _self_uninstall(self, body, user):
@@ -1021,7 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
                        "bash /tmp/pau-uninstall.sh --yes%s; "
                        "rm -f /tmp/pau-uninstall.sh" % (GITHUB_RAW, purge))
 
-        ok, detail = run_detached(command, "pve-autoupdate-uninstall")
+        ok, detail = run_detached(command, UNINSTALL_UNIT)
         if not ok:
             self._json(500, {"error": "Could not start the uninstall: %s" % detail})
             return
@@ -1616,6 +1697,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div id="verActions" class="row hidden" style="margin-top:10px">
       <button id="btnSelfUpdate" class="primary">Install update now</button>
     </div>
+    <div id="maintProgress" class="progress"><div></div></div>
     <div class="hint">Checking only reads the published version — it never
       installs anything on its own. Updating is always a deliberate action.</div>
   </div>
@@ -1792,10 +1874,50 @@ $("btnPurgeLogs").onclick = async () => {
 };
 
 // --- maintenance ---
+/* A self-update restarts this very service, so its progress can't live in the
+   page — it is read back from systemd and polled until the unit settles. */
+let maintPoll = null;
+
+function renderMaintState(v) {
+  const busy = !!v.busy;
+  const btn = $("btnSelfUpdate");
+  btn.disabled = busy;
+  btn.textContent = busy ? "Installing…" : "Install update now";
+  $("btnCheckUpdate").disabled = busy;
+  $("maintProgress").classList.toggle("active", busy);
+
+  if (v.self_update === "failed") {
+    msg($("verMsg"), "The update failed. Check: journalctl -u pve-autoupdate-selfupdate", false);
+  } else if (v.uninstall === "failed") {
+    msg($("uninstallMsg"), "The uninstall failed. Check: journalctl -u pve-autoupdate-uninstall", false);
+  }
+  return busy;
+}
+
+function watchMaintenance() {
+  if (maintPoll) return;
+  maintPoll = setInterval(async () => {
+    let v;
+    try {
+      v = await api("/api/self/version");
+    } catch (e) {
+      // The service restarts mid-update; keep waiting rather than erroring.
+      return;
+    }
+    $("verInstalled").textContent = v.version;
+    if (!renderMaintState(v)) {
+      clearInterval(maintPoll); maintPoll = null;
+      msg($("verMsg"), "Finished — now on version " + v.version + ".", true);
+      $("verActions").classList.add("hidden");
+    }
+  }, 3000);
+}
+
 async function loadMaint() {
   try {
     const v = await api("/api/self/version");
     $("verInstalled").textContent = v.version;
+    if (renderMaintState(v)) watchMaintenance();
   } catch (e) { $("verInstalled").textContent = "unknown"; }
 
   try {
@@ -1850,10 +1972,21 @@ $("btnSelfUpdate").onclick = async () => {
     requireText: "UPDATE", okText: "Install",
   });
   if (ok !== "UPDATE") return;
+  // Disable immediately: the request is quick, but the update it kicks off is
+  // not, and a second click would start a competing installer.
+  $("btnSelfUpdate").disabled = true;
+  $("btnSelfUpdate").textContent = "Installing…";
+  $("maintProgress").classList.add("active");
   try {
     const r = await post("/api/self/update", {confirm: "UPDATE"});
     msg($("verMsg"), r.detail, true);
-  } catch (e) { msg($("verMsg"), e.message, false); }
+    watchMaintenance();
+  } catch (e) {
+    msg($("verMsg"), e.message, false);
+    $("btnSelfUpdate").disabled = false;
+    $("btnSelfUpdate").textContent = "Install update now";
+    $("maintProgress").classList.remove("active");
+  }
 };
 
 $("btnUninstall").onclick = async () => {
