@@ -8,12 +8,11 @@ install and nothing else. Earlier releases are in the git history and on the
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
-## 3.4.3 — 2026-07-31
+## 3.4.4 — 2026-07-31
 
 ### Fixed
-- Updating the tool silently started a dry run of every guest. The installer's end-of-run prompt defaults to "dry run" on Enter, and unattended it reads end-of-input — so a self-update triggered it. That run also took the update lock, which is why the status said "scheduled run in progress" during an update.
-- The status now says **updating Auto-Update** while the tool updates itself, rather than reporting it as a guest update.
-- Elements marked hidden could stay on screen: `.hidden` was less specific than the rules it had to override, so the reload notice showed while idle and the "live" tag never went away.
+- Check for updates could keep reporting the previous release for several minutes after one was published. `raw.githubusercontent.com` serves through a CDN that caches for a few minutes, and the check accepted whatever copy it was given. Requests now carry a unique query string and no-cache headers.
+- The changelog was fetched the same way and could be equally stale.
 
 ### Changed
-- The reload notice is calmer and only appears while an update is actually running. When it finishes you are simply offered a reload, rather than warned.
+- "Up to date" now names the published version and the time of the check, so a genuine match can be told apart from a lookup that failed or returned something old.
