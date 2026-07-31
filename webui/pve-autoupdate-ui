@@ -589,11 +589,13 @@ SECTION_HEADING = re.compile(r"^###\s+(.+?)\s*$")
 BULLET = re.compile(r"^[-*]\s+(.*)$")
 
 
-def parse_changelog(text, limit=2):
+def parse_changelog(text, limit=1):
     """Turn CHANGELOG.md into [{version, date, sections: {name: [items]}}].
 
-    Only the newest two entries by default — what changed now, and what changed
-    the release before. The full history is on GitHub for anyone who wants it.
+    Just the current release: this is shown when offering an update, so it
+    should describe the version being installed and nothing else. The limit is
+    still enforced here rather than assumed, so a changelog that has picked up
+    older entries cannot flood the panel.
 
     Deliberately tolerant: an unrecognised line is skipped rather than aborting,
     so a formatting slip in the changelog never breaks the Maintenance tab.
