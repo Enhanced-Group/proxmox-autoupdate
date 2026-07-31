@@ -237,7 +237,7 @@ JSBLOCK_HEAD
 
     function addButton(tb, cfg) {
         var style = siblingStyle(tb);
-        var btn = tb.insert(0, Ext.apply({
+        var btn = tb.insert(insertIndex(tb), Ext.apply({
             xtype: 'button',
             itemId: 'pauBtn',
             text: cfg.text,
@@ -281,29 +281,32 @@ JSBLOCK_HEAD
         return null;
     }
 
-    /* Where the button belongs: the toolbar of the content panel currently on
-       screen — the row inside the viewport, below the breadcrumb. The Config
-       panel's own tbar is the breadcrumb row (title on the left, Reboot /
-       Shutdown / Shell on the right), which is not where it was wanted.
-
-       Falls back to that outer bar only when the selected view has no toolbar
-       of its own, so there is always a button somewhere rather than none. */
+    /* Where the button belongs: the toolbar holding the guest/node action
+       buttons — Start, Shutdown, Console, More on a guest; Reboot, Shutdown,
+       Shell, Bulk Actions on a node. That is the Config panel's own tbar, whose
+       left-hand end carries the title. */
     function chooseToolbar(cfg) {
-        var inner = (typeof cfg.getActiveTab === 'function') ? cfg.getActiveTab() : null;
-        if (inner && inner.rendered && inner.getDockedItems) {
-            var bars = inner.getDockedItems('toolbar[dock="top"]');
-            for (var i = 0; i < bars.length; i++) {
-                if (bars[i].rendered) { return bars[i]; }
-            }
-        }
-        var outer = cfg.getDockedItems ? cfg.getDockedItems('toolbar[dock="top"]') : [];
-        for (var j = 0; j < outer.length; j++) {
-            if (outer[j].rendered &&
-                outer[j].query('button').length - outer[j].query('#pauBtn').length > 0) {
-                return outer[j];
+        var bars = cfg.getDockedItems ? cfg.getDockedItems('toolbar[dock="top"]') : [];
+        for (var i = 0; i < bars.length; i++) {
+            if (!bars[i].rendered) { continue; }
+            if (bars[i].query('button').length - bars[i].query('#pauBtn').length > 0) {
+                return bars[i];
             }
         }
         return null;
+    }
+
+    /* Sit immediately before the first action button, so the button lands at
+       the left edge of the Start / Reboot group rather than at the far left of
+       the bar next to the title. */
+    function insertIndex(tb) {
+        var items = tb.items ? tb.items.getRange() : [];
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            if (it.itemId === 'pauBtn') { continue; }
+            if (it.isXType ? it.isXType('button') : it.xtype === 'button') { return i; }
+        }
+        return items.length;
     }
 
     /* One button, application-wide. Anything of ours outside the chosen toolbar
