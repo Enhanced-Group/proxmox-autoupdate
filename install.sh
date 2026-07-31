@@ -196,7 +196,7 @@ echo -e "  ${C_CYAN}4)${C_NC} Slack / Teams webhook"
 echo -e "  ${C_CYAN}5)${C_NC} Generic webhook (JSON POST)"
 echo ""
 echo -e "  ${C_DIM}Enter one or more numbers, e.g. \"3\" or \"2,3\".${C_NC}"
-read -rp "  Select [Enter to keep current]: " INPUT_METHODS <&3
+read -rp "  Select [Enter to keep current]: " INPUT_METHODS <&3 || true
 
 MAILGUN_API_KEY="${PREV_KEY}"
 MAILGUN_DOMAIN="${PREV_DOMAIN}"
@@ -234,27 +234,27 @@ else
         echo -e "  ${C_BOLD}Mailgun${C_NC}"
         while [ -z "${MAILGUN_API_KEY}" ]; do
             if [ -n "${PREV_KEY}" ]; then
-                read -rp "  API key [Enter to keep existing]: " I <&3
+                read -rp "  API key [Enter to keep existing]: " I <&3 || true
             else
-                read -rp "  API key: " I <&3
+                read -rp "  API key: " I <&3 || true
             fi
             MAILGUN_API_KEY="${I:-${PREV_KEY}}"
             [ -z "${MAILGUN_API_KEY}" ] && print_fail "Required for email."
         done
         while [ -z "${MAILGUN_DOMAIN}" ]; do
-            read -rp "  Domain (e.g. mg.example.com) [${PREV_DOMAIN}]: " I <&3
+            read -rp "  Domain (e.g. mg.example.com) [${PREV_DOMAIN}]: " I <&3 || true
             MAILGUN_DOMAIN="${I:-${PREV_DOMAIN}}"
             [ -z "${MAILGUN_DOMAIN}" ] && print_fail "Required for email."
         done
-        read -rp "  Region — 1 for EU, 2 for US [${MAILGUN_REGION}]: " I <&3
+        read -rp "  Region — 1 for EU, 2 for US [${MAILGUN_REGION}]: " I <&3 || true
         case "${I}" in 1) MAILGUN_REGION="EU" ;; 2) MAILGUN_REGION="US" ;; esac
         while [ -z "${SENDER_EMAIL}" ]; do
-            read -rp "  Sender address [${PREV_SENDER}]: " I <&3
+            read -rp "  Sender address [${PREV_SENDER}]: " I <&3 || true
             SENDER_EMAIL="${I:-${PREV_SENDER}}"
             [ -z "${SENDER_EMAIL}" ] && print_fail "Required for email."
         done
         while [ -z "${RECIPIENT_EMAIL}" ]; do
-            read -rp "  Recipient address [${PREV_RECIPIENT}]: " I <&3
+            read -rp "  Recipient address [${PREV_RECIPIENT}]: " I <&3 || true
             RECIPIENT_EMAIL="${I:-${PREV_RECIPIENT}}"
             [ -z "${RECIPIENT_EMAIL}" ] && print_fail "Required for email."
         done
@@ -265,7 +265,7 @@ else
         echo ""
         echo -e "  ${C_BOLD}Discord${C_NC}"
         echo -e "  ${C_DIM}Server Settings → Integrations → Webhooks → New Webhook → Copy URL${C_NC}"
-        read -rp "  Webhook URL: " I <&3
+        read -rp "  Webhook URL: " I <&3 || true
         DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
         if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
             print_ok "Discord configured"
@@ -278,7 +278,7 @@ else
     if echo ",${NOTIFY_METHODS}," | grep -q ",slack,"; then
         echo ""
         echo -e "  ${C_BOLD}Slack / Teams${C_NC}"
-        read -rp "  Webhook URL: " I <&3
+        read -rp "  Webhook URL: " I <&3 || true
         SLACK_WEBHOOK_URL="${I:-${PREV_SLACK}}"
         if [ -n "${SLACK_WEBHOOK_URL}" ]; then
             print_ok "Slack/Teams configured"
@@ -292,7 +292,7 @@ else
         echo ""
         echo -e "  ${C_BOLD}Generic webhook${C_NC}"
         echo -e "  ${C_DIM}Receives a JSON POST — ntfy, Gotify, Home Assistant, n8n...${C_NC}"
-        read -rp "  URL: " I <&3
+        read -rp "  URL: " I <&3 || true
         GENERIC_WEBHOOK_URL="${I:-${PREV_GENERIC}}"
         if [ -n "${GENERIC_WEBHOOK_URL}" ]; then
             print_ok "Generic webhook configured"
@@ -313,7 +313,7 @@ if [ -n "${NOTIFY_METHODS}" ]; then
     DEFAULT_FAIL_ONLY="${PREV_FAIL_ONLY:-false}"
     echo -e "  ${C_BOLD}Only notify when something fails?${C_NC}"
     echo -e "  ${C_DIM}A weekly \"nothing happened\" message trains you to ignore the channel.${C_NC}"
-    read -rp "  1 = only on failure, 2 = every run [current: ${DEFAULT_FAIL_ONLY}]: " I <&3
+    read -rp "  1 = only on failure, 2 = every run [current: ${DEFAULT_FAIL_ONLY}]: " I <&3 || true
     case "${I}" in
         1) NOTIFY_ON_FAILURE_ONLY="true" ;;
         2) NOTIFY_ON_FAILURE_ONLY="false" ;;
@@ -332,9 +332,9 @@ echo ""
 # --- Exclude IDs ---
 EXCLUDE_IDS=""
 if [ -n "${PREV_EXCLUDE}" ]; then
-    read -rp "  Exclude VM/CT IDs from updates [Enter for ${PREV_EXCLUDE}]: " INPUT_EXCLUDE <&3
+    read -rp "  Exclude VM/CT IDs from updates [Enter for ${PREV_EXCLUDE}]: " INPUT_EXCLUDE <&3 || true
 else
-    read -rp "  Exclude VM/CT IDs (comma-separated, or blank for none): " INPUT_EXCLUDE <&3
+    read -rp "  Exclude VM/CT IDs (comma-separated, or blank for none): " INPUT_EXCLUDE <&3 || true
 fi
 EXCLUDE_IDS="${INPUT_EXCLUDE:-${PREV_EXCLUDE}}"
 if [ -n "${EXCLUDE_IDS}" ]; then
@@ -346,7 +346,7 @@ fi
 # --- Windows Update Timeout ---
 WINDOWS_UPDATE_TIMEOUT=""
 DEFAULT_WIN_TIMEOUT="${PREV_WIN_TIMEOUT:-1200}"
-read -rp "  Windows Update timeout in seconds [Enter for ${DEFAULT_WIN_TIMEOUT}]: " INPUT_WIN_TIMEOUT <&3
+read -rp "  Windows Update timeout in seconds [Enter for ${DEFAULT_WIN_TIMEOUT}]: " INPUT_WIN_TIMEOUT <&3 || true
 WINDOWS_UPDATE_TIMEOUT="${INPUT_WIN_TIMEOUT:-${DEFAULT_WIN_TIMEOUT}}"
 print_ok "Windows timeout: ${WINDOWS_UPDATE_TIMEOUT}s"
 
@@ -362,7 +362,7 @@ else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
     echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_WIN <&3
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_WIN <&3 || true
 case "${INPUT_START_WIN}" in
     1) START_STOPPED_WINDOWS="true" ;;
     2) START_STOPPED_WINDOWS="false" ;;
@@ -382,7 +382,7 @@ else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
     echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_LXC <&3
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_LXC <&3 || true
 case "${INPUT_START_LXC}" in
     1) START_STOPPED_LXC="true" ;;
     2) START_STOPPED_LXC="false" ;;
@@ -402,7 +402,7 @@ else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
     echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_LINUX_VMS <&3
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_LINUX_VMS <&3 || true
 case "${INPUT_START_LINUX_VMS}" in
     1) START_STOPPED_LINUX_VMS="true" ;;
     2) START_STOPPED_LINUX_VMS="false" ;;
@@ -417,7 +417,7 @@ DEFAULT_LINUX_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
 echo -e "  ${C_DIM}How long a Linux guest gets to finish its upgrade before being"
 echo -e "  reported as timed out. A large dist-upgrade on a slow mirror can"
 echo -e "  easily exceed 10 minutes.${C_NC}"
-read -rp "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: " INPUT_LINUX_TIMEOUT <&3
+read -rp "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: " INPUT_LINUX_TIMEOUT <&3 || true
 LINUX_UPDATE_TIMEOUT="${INPUT_LINUX_TIMEOUT:-${DEFAULT_LINUX_TIMEOUT}}"
 print_ok "Linux timeout: ${LINUX_UPDATE_TIMEOUT}s"
 
@@ -427,7 +427,7 @@ DEFAULT_APT_LOCK="${PREV_APT_LOCK:-600}"
 echo -e "  ${C_DIM}How long apt waits for the dpkg lock inside a guest. Distros with"
 echo -e "  unattended-upgrades enabled (Ubuntu by default) fail with exit code"
 echo -e "  100 if this is 0 and the two happen to overlap.${C_NC}"
-read -rp "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: " INPUT_APT_LOCK <&3
+read -rp "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: " INPUT_APT_LOCK <&3 || true
 APT_LOCK_TIMEOUT="${INPUT_APT_LOCK:-${DEFAULT_APT_LOCK}}"
 print_ok "APT lock wait: ${APT_LOCK_TIMEOUT}s"
 
@@ -444,7 +444,7 @@ else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
     echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_SNAPSHOT <&3
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_SNAPSHOT <&3 || true
 case "${INPUT_SNAPSHOT}" in
     1) SNAPSHOT_BEFORE_UPDATE="true" ;;
     2) SNAPSHOT_BEFORE_UPDATE="false" ;;
@@ -454,7 +454,7 @@ print_ok "Pre-update snapshots: ${SNAPSHOT_BEFORE_UPDATE}"
 
 DEFAULT_SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
 if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
-    read -rp "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: " INPUT_SNAPSHOT_KEEP <&3
+    read -rp "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: " INPUT_SNAPSHOT_KEEP <&3 || true
     SNAPSHOT_KEEP="${INPUT_SNAPSHOT_KEEP:-${DEFAULT_SNAPSHOT_KEEP}}"
     print_ok "Keeping ${SNAPSHOT_KEEP} snapshot(s) per guest"
 else
@@ -476,7 +476,7 @@ else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
     echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_WEBUI <&3
+read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_WEBUI <&3 || true
 case "${INPUT_WEBUI}" in
     1) ENABLE_WEB_UI="true" ;;
     2) ENABLE_WEB_UI="false" ;;
@@ -485,7 +485,7 @@ esac
 
 WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
 if [ "${ENABLE_WEB_UI}" = "true" ]; then
-    read -rp "  Port for the control panel [Enter for ${WEB_UI_PORT}]: " INPUT_WEBUI_PORT <&3
+    read -rp "  Port for the control panel [Enter for ${WEB_UI_PORT}]: " INPUT_WEBUI_PORT <&3 || true
     WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
     print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
 else
@@ -497,7 +497,7 @@ echo ""
 DEFAULT_KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
 echo -e "  ${C_BOLD}Keep update logs on disk?${C_NC}"
 echo -e "  ${C_DIM}\"No\" still lets you watch a run live, then deletes the log after.${C_NC}"
-read -rp "  1 = keep, 2 = discard [current: ${DEFAULT_KEEP_LOGS}]: " INPUT_KEEP_LOGS <&3
+read -rp "  1 = keep, 2 = discard [current: ${DEFAULT_KEEP_LOGS}]: " INPUT_KEEP_LOGS <&3 || true
 case "${INPUT_KEEP_LOGS}" in
     1) KEEP_LOGS="true" ;;
     2) KEEP_LOGS="false" ;;
@@ -506,7 +506,7 @@ esac
 
 DEFAULT_LOG_RETENTION="${PREV_LOG_RETENTION:-90}"
 if [ "${KEEP_LOGS}" = "true" ]; then
-    read -rp "  Delete logs older than N days (0 = never) [${DEFAULT_LOG_RETENTION}]: " I <&3
+    read -rp "  Delete logs older than N days (0 = never) [${DEFAULT_LOG_RETENTION}]: " I <&3 || true
     LOG_RETENTION_DAYS="${I:-${DEFAULT_LOG_RETENTION}}"
     print_ok "Logs kept in ${LOG_DIR}/ for ${LOG_RETENTION_DAYS} day(s)"
 else
@@ -543,14 +543,14 @@ echo -e "    ${C_CYAN}3)${C_NC} Friday at 20:00  ${C_DIM}(0 20 * * 5)${C_NC}"
 echo -e "    ${C_CYAN}4)${C_NC} Friday at 10:00  ${C_DIM}(0 10 * * 5)${C_NC}"
 echo -e "    ${C_CYAN}5)${C_NC} Custom cron expression / time"
 
-read -rp "  Select 1-5 [Enter for ${DEFAULT_CRON}]: " INPUT_SCHED_CHOICE <&3
+read -rp "  Select 1-5 [Enter for ${DEFAULT_CRON}]: " INPUT_SCHED_CHOICE <&3 || true
 case "${INPUT_SCHED_CHOICE:-0}" in
     1) UPDATE_SCHEDULE_CRON="0 23 * * 5" ;;
     2) UPDATE_SCHEDULE_CRON="0 22 * * 5" ;;
     3) UPDATE_SCHEDULE_CRON="0 20 * * 5" ;;
     4) UPDATE_SCHEDULE_CRON="0 10 * * 5" ;;
     5)
-        read -rp "  Enter 5-field cron expression (e.g. 0 10 * * 5): " CUSTOM_CRON <&3
+        read -rp "  Enter 5-field cron expression (e.g. 0 10 * * 5): " CUSTOM_CRON <&3 || true
         UPDATE_SCHEDULE_CRON="${CUSTOM_CRON:-${DEFAULT_CRON}}"
         ;;
     "") UPDATE_SCHEDULE_CRON="${DEFAULT_CRON}" ;;
@@ -560,7 +560,7 @@ print_ok "Update schedule: ${UPDATE_SCHEDULE_CRON}"
 
 # --- Reboot Time ---
 DEFAULT_REBOOT_TIME="${PREV_REBOOT_TIME:-00:00}"
-read -rp "  Reboot time if kernel is updated (HH:MM format, e.g. 00:00, 01:00, 02:00) [Enter for ${DEFAULT_REBOOT_TIME}]: " INPUT_REBOOT_TIME <&3
+read -rp "  Reboot time if kernel is updated (HH:MM format, e.g. 00:00, 01:00, 02:00) [Enter for ${DEFAULT_REBOOT_TIME}]: " INPUT_REBOOT_TIME <&3 || true
 REBOOT_TIME="${INPUT_REBOOT_TIME:-${DEFAULT_REBOOT_TIME}}"
 print_ok "Scheduled reboot time: ${REBOOT_TIME}"
 
@@ -879,7 +879,7 @@ echo -e "    ${C_CYAN}2)${C_NC} Full run  ${C_DIM}— update the host and every 
 echo -e "                  ${C_DIM}then email the report${C_NC}"
 echo -e "    ${C_CYAN}3)${C_NC} Skip      ${C_DIM}— wait for the scheduled run (${UPDATE_SCHEDULE_CRON})${C_NC}"
 echo ""
-read -rp "  Select 1-3 [Enter for 1]: " RUN_CHOICE <&3
+read -rp "  Select 1-3 [Enter for 1]: " RUN_CHOICE <&3 || true
 
 RUN_MODE=""
 case "${RUN_CHOICE:-1}" in
@@ -895,7 +895,7 @@ esac
 if [ "${RUN_MODE}" = "full" ]; then
     echo ""
     echo -e "  ${C_YELLOW}${C_BOLD}This will update the host and every guest right now.${C_NC}"
-    read -rp "  Type 'yes' to confirm: " CONFIRM_FULL <&3
+    read -rp "  Type 'yes' to confirm: " CONFIRM_FULL <&3 || true
     if [ "${CONFIRM_FULL}" != "yes" ]; then
         print_action "Not confirmed — falling back to a dry run."
         RUN_MODE="dry"
