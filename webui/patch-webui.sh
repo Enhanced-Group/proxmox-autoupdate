@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Adds an "Auto-Update" button to the Proxmox web UI toolbar, immediately to the
-# left of the Documentation button.
+# Adds Auto-Update buttons to the Proxmox web UI: "Update Everything" in the top
+# toolbar beside Documentation, and "Update Now" between Start and Shutdown on
+# each container and Linux VM.
 #
 # The patch is *append-only*. Rather than splicing into pve-manager's toolbar
 # array literal — which differs between releases and is easy to corrupt — this
@@ -75,10 +76,47 @@ JSBLOCK_HEAD
         return 'https://' + window.location.hostname + ':' + OPEN_PORT;
     }
 
-    /* Is the control panel's certificate already trusted by this browser?
+    /* ---- Styling ----
+       A bare xtype:'button' inherits whatever `ui` the surrounding toolbar
+       implies and can render as flat text. The node button is deliberately
+       Proxmox orange so it reads as an action rather than a label; the guest
+       button copies its neighbours so it sits naturally beside Start. */
+    function injectStyles() {
+        if (document.getElementById('pau-style')) { return; }
+        var el = document.createElement('style');
+        el.id = 'pau-style';
+        el.textContent = [
+            '.pau-btn, .pau-btn .x-btn-button {',
+            '  background-color: #e57000 !important;',
+            '  background-image: none !important;',
+            '}',
+            '.pau-btn {',
+            '  border: 1px solid #b35700 !important;',
+            '  border-radius: 3px !important;',
+            '}',
+            '.pau-btn .x-btn-inner, .pau-btn .x-btn-icon-el {',
+            '  color: #ffffff !important;',
+            '  font-weight: 600 !important;',
+            '}',
+            '.pau-btn.x-btn-over, .pau-btn.x-btn-over .x-btn-button,',
+            '.pau-btn:hover, .pau-btn:hover .x-btn-button {',
+            '  background-color: #ff8c1a !important;',
+            '}',
+            '.pau-btn.x-btn-pressed, .pau-btn.x-btn-pressed .x-btn-button {',
+            '  background-color: #c96200 !important;',
+            '}',
+            '.pau-dot {',
+            '  display: inline-block; width: 8px; height: 8px;',
+            '  border-radius: 50%; margin-left: 6px; vertical-align: middle;',
+            '}'
+        ].join('\n');
+        document.head.appendChild(el);
+    }
+
+    /* ---- Certificate probe ----
        /healthz needs no authentication, so a no-cors fetch either resolves
-       (opaque response => TLS handshake succeeded) or rejects (untrusted or
-       unreachable). A definite answer rather than a guess based on a timer. */
+       (opaque response => the TLS handshake succeeded) or rejects. A definite
+       answer rather than a guess based on a timer. */
     function probePanel() {
         return fetch(panelBase() + '/healthz', {mode: 'no-cors', cache: 'no-store'})
             .then(function () { return true; })
@@ -136,10 +174,10 @@ JSBLOCK_HEAD
         });
     }
 
-    /* ---- Last-run status, used to colour the node button ----
-       Requires credentials, so the panel returns CORS headers scoped to this
-       exact host. A failure here is silent: a missing status dot must never
-       interfere with the Proxmox UI. */
+    /* ---- Last-run status for the node button ----
+       Needs credentials, so the panel returns CORS headers scoped to this exact
+       host. Failure here is silent: a missing status dot must never interfere
+       with the Proxmox UI. */
     var statusCache = {value: null, fetched: 0};
 
     function fetchStatus() {
@@ -164,60 +202,95 @@ JSBLOCK_HEAD
             var el = btn.getEl();
             if (!el) { return; }
             var result = (state.last_run && state.last_run.result) || '';
-            var colour = '', tip = 'Never run';
+            var colour = '', tip = 'Update this node and all its guests';
             if (state.running) {
-                colour = '#ffb300'; tip = 'Update running now';
+                colour = '#ffe08a'; tip = 'Update running now';
             } else if (result.indexOf('error') === 0) {
-                colour = '#f44336';
-                tip = 'Last run reported errors' +
-                      (state.last_run.finished ? ' (' + state.last_run.finished + ')' : '');
+                colour = '#ff5c5c'; tip = 'Last run reported errors';
             } else if (result.indexOf('ok') === 0) {
-                colour = '#4caf50';
-                tip = 'Last run OK' +
-                      (state.last_run.finished ? ' (' + state.last_run.finished + ')' : '');
+                colour = '#7bd88f'; tip = 'Last run completed cleanly';
+            }
+            if (state.last_run && state.last_run.finished) {
+                tip += ' (' + state.last_run.finished + ')';
             }
             if (state.repeat_offenders) {
                 tip += '\nRepeatedly failing: ' + state.repeat_offenders;
             }
-            var dom = el.dom.querySelector('.pau-dot');
-            if (!dom && colour) {
-                var span = document.createElement('span');
-                span.className = 'pau-dot';
-                span.style.cssText = 'display:inline-block;width:8px;height:8px;' +
-                    'border-radius:50%;margin-left:6px;vertical-align:middle';
+            var dot = el.dom.querySelector('.pau-dot');
+            if (!dot && colour) {
+                dot = document.createElement('span');
+                dot.className = 'pau-dot';
                 var label = el.dom.querySelector('.x-btn-inner');
-                (label || el.dom).appendChild(span);
-                dom = span;
+                (label || el.dom).appendChild(dot);
             }
-            if (dom) { dom.style.background = colour || 'transparent'; }
+            if (dot) { dot.style.background = colour || 'transparent'; }
             btn.setTooltip(tip);
         });
     }
 
-    /* ---- Toolbar buttons ----
-       The button is added to the toolbar of whichever Config panel is on screen:
-       the node's (Reboot / Shutdown / Shell ...) or a guest's (Start / Shutdown /
-       Console ...). It is styled by copying ui/scale/baseCls off a button already
-       in that toolbar, so it matches its neighbours instead of rendering as flat
-       text the way a bare xtype:'button' does. */
-    function siblingStyle(tb) {
-        var items = tb.query('button');
-        for (var i = 0; i < items.length; i++) {
-            var b = items[i];
-            if (b.itemId === 'pauBtn') { continue; }
-            return {
-                ui: b.ui,
-                scale: b.scale,
-                baseCls: b.baseCls,
-                cls: b.cls
-            };
-        }
-        return {};
+    /* ================= Node button: top toolbar, beside Documentation =======
+       Global rather than per-node: it updates the host and every guest, so it
+       does not belong to whatever happens to be selected in the tree. */
+    function installNodeButton() {
+        var attempts = 0;
+        Ext.TaskManager.start({
+            interval: 500,
+            run: function () {
+                attempts++;
+                if (attempts > 240) { return false; }
+                try {
+                    var doc = Ext.ComponentQuery.query(
+                        'button[onlineHelp=pve_documentation_index]')[0];
+                    if (!doc) {
+                        var all = Ext.ComponentQuery.query('toolbar button');
+                        for (var i = 0; i < all.length; i++) {
+                            if (all[i].text === 'Documentation') { doc = all[i]; break; }
+                        }
+                    }
+                    if (!doc || !doc.ownerCt) { return true; }
+
+                    var tb = doc.ownerCt;
+                    if (tb.query('#pauNodeBtn').length) { return false; }
+
+                    var idx = tb.items.indexOf(doc);
+                    if (idx < 0) { idx = 0; }
+                    var btn = tb.insert(idx, {
+                        xtype: 'button',
+                        itemId: 'pauNodeBtn',
+                        text: 'Update Everything',
+                        iconCls: 'fa fa-refresh',
+                        cls: 'pau-btn',
+                        margin: '0 5 0 0',
+                        handler: function () {
+                            openPanel('Proxmox Auto-Update', panelBase() + '/');
+                        }
+                    });
+                    tb.updateLayout();
+
+                    applyStatus(btn);
+                    Ext.TaskManager.start({
+                        interval: 30000,
+                        run: function () {
+                            if (btn.destroyed) { return false; }
+                            applyStatus(btn);
+                            return true;
+                        }
+                    });
+                    return false;
+                } catch (e) {
+                    if (window.console) {
+                        console.warn('proxmox-autoupdate: node button failed', e);
+                    }
+                    return false;
+                }
+            }
+        });
     }
 
-    /* Windows guests are updated by the scheduled run only, so no button. The
-       tree record does not carry ostype, so ask the API once per vmid and
-       remember the answer. */
+    /* ================= Guest button: between Start and Shutdown ============= */
+
+    /* Windows guests are updated by the scheduled run only. ostype is not on
+       the tree record, so ask the API once per guest and remember the answer. */
     var ostypeCache = {};
 
     function withOsType(node, vmid, cb) {
@@ -235,35 +308,47 @@ JSBLOCK_HEAD
         });
     }
 
-    function addButton(tb, cfg) {
-        var style = siblingStyle(tb);
-        var btn = tb.insert(insertIndex(tb), Ext.apply({
-            xtype: 'button',
-            itemId: 'pauBtn',
-            text: cfg.text,
-            iconCls: 'fa fa-refresh',
-            tooltip: cfg.tooltip,
-            handler: function () { openPanel(cfg.title, cfg.url); }
-        }, style));
-        tb.updateLayout();
-        if (cfg.status) {
-            applyStatus(btn);
-            var task = Ext.TaskManager.start({
-                interval: 30000,
-                run: function () {
-                    if (btn.destroyed) { return false; }
-                    applyStatus(btn);
-                    return true;
-                }
-            });
-            btn.on('destroy', function () { Ext.TaskManager.stop(task); });
+    /* The toolbar holding Start / Shutdown / Console / More. */
+    function guestToolbar(cfg) {
+        var bars = cfg.getDockedItems ? cfg.getDockedItems('toolbar[dock="top"]') : [];
+        for (var i = 0; i < bars.length; i++) {
+            if (!bars[i].rendered) { continue; }
+            if (bars[i].query('button').length - bars[i].query('#pauGuestBtn').length > 0) {
+                return bars[i];
+            }
         }
-        return btn;
+        return null;
+    }
+
+    /* Slot the button between Start and Shutdown. Matching on the Start button
+       and taking the next slot keeps it correct whether or not the guest is
+       running, and whatever else the release puts in that group. */
+    function guestIndex(tb) {
+        var items = tb.items ? tb.items.getRange() : [];
+        var firstButton = -1;
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            if (it.itemId === 'pauGuestBtn') { continue; }
+            var isBtn = it.isXType ? it.isXType('button') : it.xtype === 'button';
+            if (!isBtn) { continue; }
+            if (firstButton < 0) { firstButton = i; }
+            if (/^\s*start\s*$/i.test(it.text || '')) { return i + 1; }
+            if (/^\s*shutdown\s*$/i.test(it.text || '')) { return i; }
+        }
+        return firstButton >= 0 ? firstButton + 1 : items.length;
+    }
+
+    function siblingStyle(tb) {
+        var items = tb.query('button');
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].itemId === 'pauGuestBtn') { continue; }
+            return {ui: items[i].ui, scale: items[i].scale, baseCls: items[i].baseCls};
+        }
+        return {};
     }
 
     /* Both the outer Config panel and the content panel inside it carry
-       pveSelNode, so decorating everything that matches produced two buttons —
-       one stranded up in the breadcrumb bar. Take the outermost match only. */
+       pveSelNode; decorating everything that matches produced two buttons. */
     function outermostConfig() {
         var panels = Ext.ComponentQuery.query('panel[pveSelNode]');
         var visible = [];
@@ -281,120 +366,87 @@ JSBLOCK_HEAD
         return null;
     }
 
-    /* Where the button belongs: the toolbar holding the guest/node action
-       buttons — Start, Shutdown, Console, More on a guest; Reboot, Shutdown,
-       Shell, Bulk Actions on a node. That is the Config panel's own tbar, whose
-       left-hand end carries the title. */
-    function chooseToolbar(cfg) {
-        var bars = cfg.getDockedItems ? cfg.getDockedItems('toolbar[dock="top"]') : [];
-        for (var i = 0; i < bars.length; i++) {
-            if (!bars[i].rendered) { continue; }
-            if (bars[i].query('button').length - bars[i].query('#pauBtn').length > 0) {
-                return bars[i];
-            }
-        }
-        return null;
-    }
-
-    /* Sit immediately before the first action button, so the button lands at
-       the left edge of the Start / Reboot group rather than at the far left of
-       the bar next to the title. */
-    function insertIndex(tb) {
-        var items = tb.items ? tb.items.getRange() : [];
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (it.itemId === 'pauBtn') { continue; }
-            if (it.isXType ? it.isXType('button') : it.xtype === 'button') { return i; }
-        }
-        return items.length;
-    }
-
-    /* One button, application-wide. Anything of ours outside the chosen toolbar
-       is removed, which also cleans up buttons left by an earlier version. */
-    function dedupe(keep) {
-        var all = Ext.ComponentQuery.query('#pauBtn');
+    /* One guest button, application-wide, in the right slot. Anything of ours
+       that is elsewhere — or in the right toolbar but the wrong position, as
+       left by an earlier version — is removed so it can be re-added correctly. */
+    function reconcile(tb, wantIndex) {
+        var all = Ext.ComponentQuery.query('#pauGuestBtn');
+        var keep = null;
         for (var i = 0; i < all.length; i++) {
             var btn = all[i];
-            if (btn.ownerCt === keep) { continue; }
-            if (btn.ownerCt && btn.ownerCt.remove) {
-                btn.ownerCt.remove(btn, true);
-            } else if (btn.destroy) {
-                btn.destroy();
-            }
+            var here = tb && btn.ownerCt === tb;
+            var atRightSlot = here && tb.items.indexOf(btn) === wantIndex;
+            if (atRightSlot && !keep) { keep = btn; continue; }
+            if (btn.ownerCt && btn.ownerCt.remove) { btn.ownerCt.remove(btn, true); }
+            else if (btn.destroy) { btn.destroy(); }
         }
+        return keep;
     }
 
-    function decorate(panel) {
-        var rec = panel.pveSelNode;
-        if (!rec || !rec.data) { return; }
-
-        var tb = chooseToolbar(panel);
-        if (!tb) { return; }
-        dedupe(tb);
-        if (tb.query('#pauBtn').length) { return; }
+    function decorateGuest(cfg) {
+        var rec = cfg.pveSelNode;
+        if (!rec || !rec.data) { reconcile(null, -1); return; }
 
         var type = rec.data.type;
         var node = rec.data.node;
         var vmid = rec.data.vmid;
 
-        if (type === 'node') {
-            addButton(tb, {
-                text: 'Update Everything',
-                tooltip: 'Update this node and all its guests',
-                title: 'Proxmox Auto-Update — ' + (rec.data.text || node),
-                url: panelBase() + '/',
-                status: true
-            });
+        if ((type !== 'lxc' && type !== 'qemu') || !vmid) {
+            reconcile(null, -1);
             return;
         }
 
-        if (type !== 'lxc' && type !== 'qemu') { return; }
-        if (!vmid) { return; }
+        var tb = guestToolbar(cfg);
+        if (!tb) { return; }
 
         var name = rec.data.name || rec.data.text || ('guest ' + vmid);
-        var add = function () {
-            /* Re-check: the panel may have been swapped out while the ostype
-               lookup was in flight. */
-            if (!tb.rendered || tb.destroyed || tb.query('#pauBtn').length) { return; }
-            addButton(tb, {
+        var place = function () {
+            if (reconcile(tb, guestIndex(tb))) { return; }   /* already correct */
+            /* Recompute: removing a stale button shifts everything after it, so
+               an index taken before reconcile would be off by one. */
+            var want = guestIndex(tb);
+            var btn = tb.insert(want, Ext.apply({
+                xtype: 'button',
+                itemId: 'pauGuestBtn',
                 text: 'Update Now',
+                iconCls: 'fa fa-refresh',
                 tooltip: 'Update only this guest. The host is not touched and no ' +
                          'reboot is scheduled.',
-                title: 'Auto-Update — ' + name + ' (' + vmid + ')',
-                url: panelBase() + '/guest?vmid=' + encodeURIComponent(vmid) +
-                     '&name=' + encodeURIComponent(name),
-                status: false
-            });
+                handler: function () {
+                    openPanel('Auto-Update — ' + name + ' (' + vmid + ')',
+                              panelBase() + '/guest?vmid=' + encodeURIComponent(vmid) +
+                              '&name=' + encodeURIComponent(name));
+                }
+            }, siblingStyle(tb)));
+            tb.updateLayout();
+            return btn;
         };
 
         if (type === 'qemu') {
             withOsType(node, vmid, function (ostype) {
-                if (/^w/i.test(ostype)) { return; }   /* win*, wvista, w2k... */
-                add();
+                if (/^w/i.test(ostype)) { reconcile(null, -1); return; }
+                if (tb.rendered && !tb.destroyed) { place(); }
             });
         } else {
-            add();
+            place();
         }
     }
 
     /* Config panels are created and destroyed as you click around the tree, so
-       a one-shot override is not enough. A cheap periodic sweep is used instead:
-       it works regardless of how or when Proxmox builds those panels, which
-       matters because that construction differs between releases. */
+       a periodic sweep is used rather than a one-shot override: it works
+       regardless of how or when Proxmox builds them, which differs by release. */
     function install() {
+        injectStyles();
+        installNodeButton();
         Ext.TaskManager.start({
             interval: 800,
             run: function () {
                 try {
                     var cfg = outermostConfig();
-                    if (cfg) {
-                        decorate(cfg);
-                    } else {
-                        dedupe(null);   /* nothing selected — drop any leftovers */
-                    }
+                    if (cfg) { decorateGuest(cfg); } else { reconcile(null, -1); }
                 } catch (e) {
                     if (window.console) {
-                        console.warn('proxmox-autoupdate: toolbar sweep failed', e);
+                        console.warn('proxmox-autoupdate: guest sweep failed', e);
                     }
                 }
                 return true;
