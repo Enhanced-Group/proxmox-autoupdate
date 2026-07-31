@@ -334,7 +334,7 @@ and your user ID:
 
 ```bash
 DISCORD_BOT_TOKEN="..."              # bot token, not a webhook URL
-DISCORD_USER_ID="<your-user-id>" # Developer Mode → right-click yourself → Copy User ID
+DISCORD_USER_ID=""                   # Developer Mode → right-click yourself → Copy User ID
 ```
 
 With both set, the report is DM'd; a `DISCORD_WEBHOOK_URL` is kept as a fallback

@@ -4,6 +4,18 @@ Read by the web panel's Maintenance tab, so the heading format matters:
 `## <version> — <YYYY-MM-DD>`, then `### Added` / `### Fixed` / `### Changed`
 sections of bullet points. Newest version first.
 
+## 3.4.1 — 2026-07-31
+
+### Fixed
+- The Update Everything button overflowed into the Documentation button; it is now larger, sized correctly, and no longer clips.
+- Discord DM failures reported a bare "400" with no cause. The actual Discord message, error code and offending field are now shown.
+- An empty embed footer or description produced a 400 that looked like a configuration problem.
+- A bot token pasted with its "Bot " prefix is now accepted.
+
+### Changed
+- The status indicator is the button's icon — a coloured dot — instead of a badge on the right.
+- The button says when it is updating *itself*, and prompts you to reload your Proxmox tabs once done.
+
 ## 3.4.0 — 2026-07-31
 
 ### Added
