@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="3.4.5"
+PAU_VERSION="3.5.0"
 
 set -u
 set -o pipefail
@@ -1099,6 +1099,31 @@ build_text_summary() {
     fi
 }
 
+# ---- Keeping credentials out of the process list ----
+# A process's full command line is readable from /proc by any local user, so an
+# argument is not a safe place for a secret. Webhook URLs are credentials in
+# their own right — anyone holding one can post to that channel — as are the
+# Mailgun key and the Discord bot token.
+#
+# curl reads options from a config file, and `--config -` reads that from
+# stdin, which never appears in `ps`. Each caller emits its URL and any auth
+# header this way instead of passing them as arguments.
+
+# Escape a value for a curl config double-quoted string.
+cfg_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Usage: curl_cfg <url> [extra directive ...]
+curl_cfg() {
+    printf 'url = "%s"\n' "$(cfg_escape "$1")"
+    shift
+    local directive
+    for directive in "$@"; do
+        printf '%s\n' "${directive}"
+    done
+}
+
 # Webhook payloads are built by Python rather than assembled as text, so JSON
 # escaping and the per-service length limits are handled by code that can be
 # tested directly instead of by string concatenation that cannot.
@@ -1198,9 +1223,10 @@ build_payload() {
 post_webhook() {
     local label="$1" url="$2" payload="$3"
     local code
-    code=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" \
+    code=$(curl_cfg "${url}" | curl -s --config - --max-time 30 \
+        -o /dev/null -w "%{http_code}" \
         -H "Content-Type: application/json" \
-        -X POST --data-binary "${payload}" "${url}" 2>/dev/null) || code="000"
+        -X POST --data-binary "${payload}" 2>/dev/null) || code="000"
     if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
         print_ok "${label} notified"
     elif [ "${code}" = "000" ]; then
@@ -1214,13 +1240,14 @@ notify_email() {
     local subject="$1" html_file="$3"
     NOTIFY_RESPONSE_FILE="/tmp/notify_response_$$.txt"
     local code
-    code=$(curl -s --max-time 60 -o "${NOTIFY_RESPONSE_FILE}" -w "%{http_code}" \
-        --user "api:${MAILGUN_API_KEY}" \
-        "${MAILGUN_API_URL}" \
-        -F from="${SENDER_EMAIL}" \
-        -F to="${RECIPIENT_EMAIL}" \
-        -F subject="${subject}" \
-        -F html="<${html_file}" 2>&1) || true
+    # API key goes in via stdin, not --user, so it stays out of `ps`.
+    code=$(curl_cfg "${MAILGUN_API_URL}" "user = \"api:$(cfg_escape "${MAILGUN_API_KEY}")\"" \
+        | curl -s --config - --max-time 60 \
+            -o "${NOTIFY_RESPONSE_FILE}" -w "%{http_code}" \
+            -F from="${SENDER_EMAIL}" \
+            -F to="${RECIPIENT_EMAIL}" \
+            -F subject="${subject}" \
+            -F html="<${html_file}" 2>&1) || true
 
     if [ "${code}" = "200" ]; then
         print_ok "Email sent to ${C_BOLD}${RECIPIENT_EMAIL}${C_NC}"
@@ -1274,11 +1301,11 @@ discord_resolve_target() {
         fi
 
         local resp channel
-        resp=$(curl -s --max-time 30 -X POST \
-            "https://discord.com/api/v10/users/@me/channels" \
-            -H "Authorization: Bot ${token}" \
-            -H "Content-Type: application/json" \
-            -d "{\"recipient_id\":\"${DISCORD_USER_ID}\"}" 2>/dev/null) || resp=""
+        resp=$(curl_cfg "https://discord.com/api/v10/users/@me/channels" \
+                "header = \"Authorization: Bot $(cfg_escape "${token}")\"" \
+            | curl -s --config - --max-time 30 -X POST \
+                -H "Content-Type: application/json" \
+                -d "{\"recipient_id\":\"${DISCORD_USER_ID}\"}" 2>/dev/null) || resp=""
         channel=$(printf '%s' "${resp}" | jq -r '.id // empty' 2>/dev/null || true)
         DISCORD_BOT_TOKEN="${token}"
 
@@ -1330,18 +1357,19 @@ discord_resolve_target() {
     return 1
 }
 
-# curl args for the resolved target: adds the bot Authorization header when
-# talking to the API, and nothing extra for a webhook.
-discord_auth_args() {
+# Emits the curl config for the resolved target: the URL always, plus the bot
+# Authorization header when talking to the API. Read by curl from stdin so
+# neither the webhook URL nor the token is ever an argument.
+discord_cfg() {
     if [ -n "${DISCORD_TARGET_AUTH}" ]; then
-        printf '%s\n%s\n' "-H" "${DISCORD_TARGET_AUTH}"
+        curl_cfg "${DISCORD_TARGET_URL}" \
+            "header = \"$(cfg_escape "${DISCORD_TARGET_AUTH}")\""
+    else
+        curl_cfg "${DISCORD_TARGET_URL}"
     fi
 }
 
 discord_attach_log() {
-    local url="$1"
-    local -a auth=()
-    mapfile -t auth < <(discord_auth_args)
     [ "${KEEP_LOGS}" = "true" ] || return 0
     [ -s "${LOG_FILE}" ] || return 0
 
@@ -1359,11 +1387,10 @@ discord_attach_log() {
 
     if [ "${size}" -le "${DISCORD_MAX_UPLOAD}" ]; then
         local code
-        code=$(curl -s --max-time 180 -o /dev/null -w "%{http_code}" \
-            "${auth[@]+"${auth[@]}"}" \
+        code=$(discord_cfg | curl -s --config - --max-time 180 \
+            -o /dev/null -w "%{http_code}" \
             -F "payload_json={\"content\":\"Full log\"}" \
-            -F "files[0]=@${flat};type=text/plain" \
-            "${url}" 2>/dev/null) || code="000"
+            -F "files[0]=@${flat};type=text/plain" 2>/dev/null) || code="000"
         case "${code}" in
             200|204) print_ok "Discord log attached" ;;
             *)       print_warn "Discord log upload returned HTTP ${code}" ;;
@@ -1392,11 +1419,10 @@ discord_attach_log() {
         local named="${workdir}/$(basename "${LOG_FILE}" .log).part${index}of${total}.log"
         mv "${part}" "${named}"
         local code
-        code=$(curl -s --max-time 180 -o /dev/null -w "%{http_code}" \
-            "${auth[@]+"${auth[@]}"}" \
+        code=$(discord_cfg | curl -s --config - --max-time 180 \
+            -o /dev/null -w "%{http_code}" \
             -F "payload_json={\"content\":\"Full log — part ${index} of ${total}\"}" \
-            -F "files[0]=@${named};type=text/plain" \
-            "${url}" 2>/dev/null) || code="000"
+            -F "files[0]=@${named};type=text/plain" 2>/dev/null) || code="000"
         case "${code}" in
             200|204) ;;
             *) failed=$((failed + 1)) ;;
@@ -1418,8 +1444,6 @@ notify_discord() {
         return 0
     fi
 
-    local -a auth=()
-    mapfile -t auth < <(discord_auth_args)
     local label="Discord"
     [ -n "${DISCORD_TARGET_AUTH}" ] && label="Discord DM"
 
@@ -1434,11 +1458,10 @@ notify_discord() {
 
     local body_file code
     body_file=$(mktemp)
-    code=$(curl -s --max-time 30 -o "${body_file}" -w "%{http_code}" \
-        "${auth[@]+"${auth[@]}"}" \
+    code=$(discord_cfg | curl -s --config - --max-time 30 \
+        -o "${body_file}" -w "%{http_code}" \
         -H "Content-Type: application/json" \
-        -X POST --data-binary "${payload}" \
-        "${DISCORD_TARGET_URL}" 2>/dev/null) || code="000"
+        -X POST --data-binary "${payload}" 2>/dev/null) || code="000"
 
     if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
         print_ok "${label} notified"
