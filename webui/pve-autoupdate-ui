@@ -1,0 +1,1486 @@
+#!/usr/bin/env python3
+"""
+Proxmox Auto-Update — web control service.
+
+Serves a small control panel on its own HTTPS port. The Proxmox web UI gets a
+toolbar button (see patch-webui.sh) that opens this page in a window, so none of
+the update logic has to live inside pve-manager's own files.
+
+Authentication reuses Proxmox's session: the caller must present a valid
+PVEAuthCookie, which is verified against the local PVE API on every request.
+Only members of ALLOWED_USERS may do anything at all.
+
+Standard library only — Proxmox ships Python 3 but no extra packages.
+"""
+
+import html
+import json
+import os
+import re
+import signal
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from secrets import compare_digest, token_urlsafe
+
+# --- Paths and constants ------------------------------------------------------
+
+LISTEN_PORT = int(os.environ.get("PAU_UI_PORT", "8007"))
+LISTEN_ADDR = os.environ.get("PAU_UI_ADDR", "0.0.0.0")
+
+UPDATE_SCRIPT = "/usr/local/bin/update-everything.sh"
+CONFIG_FILE = "/etc/proxmox-autoupdate.conf"
+LOG_DIR = "/var/log/proxmox-autoupdate"
+LOCKFILE = "/var/run/proxmox-autoupdate.lock"
+CRON_MARKER = "# proxmox-autoupdate"
+
+# Certificate: prefer the operator's custom cert so the browser trusts this port
+# exactly as it trusts 8006. Falls back to the self-signed node cert.
+CERT_CANDIDATES = [
+    ("/etc/pve/local/pveproxy-ssl.pem", "/etc/pve/local/pveproxy-ssl.key"),
+    ("/etc/pve/local/pve-ssl.pem", "/etc/pve/local/pve-ssl.key"),
+]
+
+# Only these realms/users may control updates. These actions are root-equivalent.
+ALLOWED_USERS = {"root@pam"}
+
+# Config keys the UI is allowed to write, with their validators.
+INT_RE = re.compile(r"^[0-9]+$")
+BOOL_VALUES = {"true", "false"}
+CRON_RE = re.compile(r"^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s*$")
+TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+IDLIST_RE = re.compile(r"^[0-9]*([,\s]*[0-9]+)*$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _v_int(v):
+    return bool(INT_RE.match(v))
+
+
+def _v_bool(v):
+    return v in BOOL_VALUES
+
+
+def _v_cron(v):
+    return bool(CRON_RE.match(v))
+
+
+def _v_time(v):
+    return bool(TIME_RE.match(v))
+
+
+def _v_idlist(v):
+    return v == "" or bool(IDLIST_RE.match(v))
+
+
+def _v_email(v):
+    return bool(EMAIL_RE.match(v))
+
+
+def _v_region(v):
+    return v in {"EU", "US"}
+
+
+def _v_nonempty(v):
+    return len(v.strip()) > 0 and "\n" not in v and '"' not in v
+
+
+EDITABLE_KEYS = {
+    "MAILGUN_API_KEY": _v_nonempty,
+    "MAILGUN_DOMAIN": _v_nonempty,
+    "MAILGUN_REGION": _v_region,
+    "SENDER_EMAIL": _v_email,
+    "RECIPIENT_EMAIL": _v_email,
+    "EXCLUDE_IDS": _v_idlist,
+    "WINDOWS_UPDATE_TIMEOUT": _v_int,
+    "LINUX_UPDATE_TIMEOUT": _v_int,
+    "APT_LOCK_TIMEOUT": _v_int,
+    "START_STOPPED_WINDOWS": _v_bool,
+    "START_STOPPED_LXC": _v_bool,
+    "START_STOPPED_LINUX_VMS": _v_bool,
+    "SNAPSHOT_BEFORE_UPDATE": _v_bool,
+    "SNAPSHOT_KEEP": _v_int,
+    "UPDATE_SCHEDULE_CRON": _v_cron,
+    "REBOOT_TIME": _v_time,
+}
+
+SENSITIVE_KEYS = {"MAILGUN_API_KEY"}
+
+
+# --- Job state ----------------------------------------------------------------
+
+
+class Job:
+    """Tracks the single update run this service may have started."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.log_path = None
+        self.dry_run = False
+        self.only = None
+        self.started_at = None
+        self.finished_at = None
+        self.returncode = None
+        self.started_by = None
+
+    def snapshot(self):
+        with self.lock:
+            running = self.proc is not None and self.proc.poll() is None
+            if self.proc is not None and not running and self.returncode is None:
+                self.returncode = self.proc.returncode
+                self.finished_at = time.time()
+            return {
+                "running": running,
+                "dry_run": self.dry_run,
+                "only": self.only,
+                "log": os.path.basename(self.log_path) if self.log_path else None,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "returncode": self.returncode,
+                "started_by": self.started_by,
+            }
+
+    def start(self, dry_run, user, only=None, no_email=False):
+        """Launch a run. `only` limits it to a comma-separated set of guest IDs."""
+        with self.lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return False, "An update is already running."
+
+            if not os.path.isfile(UPDATE_SCRIPT) or not os.access(UPDATE_SCRIPT, os.X_OK):
+                return False, "%s is missing or not executable." % UPDATE_SCRIPT
+
+            os.makedirs(LOG_DIR, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            if only:
+                kind = "guest%s" % only.replace(",", "-")
+            else:
+                kind = "dryrun" if dry_run else "manual"
+            self.log_path = os.path.join(LOG_DIR, "webui_%s_%s.log" % (kind, stamp))
+
+            cmd = [UPDATE_SCRIPT]
+            if dry_run:
+                cmd.append("--dry-run")
+            if only:
+                cmd += ["--only", only]
+            if no_email:
+                cmd.append("--no-email")
+
+            scope = "guest %s" % only if only else "everything"
+            logfh = open(self.log_path, "wb", buffering=0)
+            logfh.write(
+                ("=== started from web UI by %s at %s (%s, %s) ===\n"
+                 % (user, time.strftime("%d/%m/%Y %H:%M:%S"),
+                    "dry run" if dry_run else "full run", scope)).encode()
+            )
+            try:
+                # start_new_session so the run survives a service restart and is
+                # not killed by our own process group teardown.
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=logfh,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    env=dict(os.environ, TERM="dumb"),
+                )
+            except OSError as exc:
+                logfh.close()
+                return False, "Could not start the update script: %s" % exc
+
+            self.dry_run = dry_run
+            self.only = only
+            self.started_at = time.time()
+            self.finished_at = None
+            self.returncode = None
+            self.started_by = user
+            return True, os.path.basename(self.log_path)
+
+
+JOB = Job()
+
+
+# --- Helpers ------------------------------------------------------------------
+
+
+def lock_is_held():
+    """True when some other run (usually cron) currently holds the lockfile."""
+    if not os.path.exists(LOCKFILE):
+        return False
+    try:
+        out = subprocess.run(
+            ["fuser", LOCKFILE], capture_output=True, timeout=5
+        )
+        return out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def read_config():
+    """Parse the shell config into a dict. Only simple KEY="value" lines."""
+    values = {}
+    if not os.path.isfile(CONFIG_FILE):
+        return values
+    with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            key = key.strip()
+            raw = raw.strip()
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+                raw = raw[1:-1]
+            values[key] = raw
+    return values
+
+
+def write_config(updates):
+    """Rewrite the config in place, preserving comments, ordering and mode 600."""
+    existing = []
+    if os.path.isfile(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as fh:
+            existing = fh.readlines()
+
+    seen = set()
+    out = []
+    for line in existing:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.partition("=")[0].strip()
+            if key in updates:
+                out.append('%s="%s"\n' % (key, updates[key]))
+                seen.add(key)
+                continue
+        out.append(line)
+
+    missing = [k for k in updates if k not in seen]
+    if missing:
+        out.append("\n# Added by the web UI\n")
+        for key in missing:
+            out.append('%s="%s"\n' % (key, updates[key]))
+
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.writelines(out)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def excluded_ids():
+    raw = read_config().get("EXCLUDE_IDS", "")
+    return {part for part in re.split(r"[,\s]+", raw) if part}
+
+
+def set_excluded_ids(ids):
+    """Persist the exclusion list, normalised and sorted numerically."""
+    clean = sorted({str(int(i)) for i in ids}, key=int)
+    write_config({"EXCLUDE_IDS": ",".join(clean)})
+    return clean
+
+
+def list_guests():
+    """Every VM and container on this cluster, with its exclusion state.
+
+    Uses /cluster/resources so one call covers both types and every node,
+    rather than scraping `pct list` and `qm list` separately.
+    """
+    try:
+        res = subprocess.run(
+            ["pvesh", "get", "/cluster/resources", "--type", "vm",
+             "--output-format", "json"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if res.returncode != 0:
+            return [], (res.stderr.strip() or "pvesh returned %d" % res.returncode)
+        raw = json.loads(res.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return [], str(exc)
+
+    skip = excluded_ids()
+    guests = []
+    for item in raw:
+        vmid = item.get("vmid")
+        if vmid is None:
+            continue
+        guests.append({
+            "vmid": str(vmid),
+            "name": item.get("name") or ("guest-%s" % vmid),
+            "type": "lxc" if item.get("type") == "lxc" else "qemu",
+            "status": item.get("status", "unknown"),
+            "node": item.get("node", ""),
+            "excluded": str(vmid) in skip,
+        })
+    guests.sort(key=lambda g: int(g["vmid"]))
+    return guests, None
+
+
+def read_crontab():
+    try:
+        res = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        return res.stdout if res.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def current_schedule():
+    for line in read_crontab().splitlines():
+        if UPDATE_SCRIPT in line and not line.strip().startswith("#"):
+            return " ".join(line.split()[:5])
+    return ""
+
+
+def write_schedule(expr):
+    """Replace our crontab entry, leaving every other entry untouched."""
+    kept = [
+        line
+        for line in read_crontab().splitlines()
+        if UPDATE_SCRIPT not in line and line.strip() != CRON_MARKER
+    ]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    kept.append(CRON_MARKER)
+    kept.append("%s %s >> %s/cron.log 2>&1" % (expr, UPDATE_SCRIPT, LOG_DIR))
+    payload = "\n".join(kept) + "\n"
+
+    proc = subprocess.run(["crontab", "-"], input=payload, text=True,
+                          capture_output=True, timeout=10)
+    if proc.returncode != 0:
+        raise ValueError(proc.stderr.strip() or "crontab rejected the schedule")
+
+
+def list_logs(limit=40):
+    if not os.path.isdir(LOG_DIR):
+        return []
+    entries = []
+    for name in os.listdir(LOG_DIR):
+        if not name.endswith(".log"):
+            continue
+        path = os.path.join(LOG_DIR, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        entries.append({"name": name, "size": st.st_size, "mtime": st.st_mtime})
+    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    return entries[:limit]
+
+
+def safe_log_path(name):
+    """Resolve a log name to a path inside LOG_DIR, or None if it escapes."""
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return None
+    path = os.path.realpath(os.path.join(LOG_DIR, name))
+    if os.path.dirname(path) != os.path.realpath(LOG_DIR):
+        return None
+    return path if os.path.isfile(path) else None
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\r")
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+# --- Authentication -----------------------------------------------------------
+
+TICKET_RE = re.compile(r"^PVE:([^:]+):")
+
+_ssl_noverify = ssl.create_default_context()
+_ssl_noverify.check_hostname = False
+_ssl_noverify.verify_mode = ssl.CERT_NONE
+
+
+def verify_ticket(ticket):
+    """Validate a PVEAuthCookie against the local PVE API. Returns username or None.
+
+    The signature check is delegated to pvedaemon rather than reimplemented:
+    if the API accepts the cookie, it is genuine and unexpired.
+    """
+    if not ticket:
+        return None
+    match = TICKET_RE.match(ticket)
+    if not match:
+        return None
+    user = match.group(1)
+
+    req = urllib.request.Request(
+        "https://127.0.0.1:8006/api2/json/access/permissions",
+        headers={"Cookie": "PVEAuthCookie=%s" % ticket},
+    )
+    try:
+        with urllib.request.urlopen(req, context=_ssl_noverify, timeout=8) as resp:
+            if resp.status != 200:
+                return None
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, OSError, ssl.SSLError):
+        return None
+    return user
+
+
+# CSRF: a token bound to the ticket, handed out with the page and required on
+# every mutating request. Cross-origin script cannot read our HTML, so it cannot
+# obtain the token.
+_CSRF_SECRET = token_urlsafe(32)
+_csrf_tokens = {}
+_csrf_lock = threading.Lock()
+
+
+def issue_csrf(user):
+    token = token_urlsafe(24)
+    with _csrf_lock:
+        now = time.time()
+        for key, (_, ts) in list(_csrf_tokens.items()):
+            if now - ts > 43200:
+                _csrf_tokens.pop(key, None)
+        _csrf_tokens[token] = (user, now)
+    return token
+
+
+def check_csrf(token, user):
+    if not token:
+        return False
+    with _csrf_lock:
+        entry = _csrf_tokens.get(token)
+    if not entry:
+        return False
+    owner, ts = entry
+    return compare_digest(owner, user) and (time.time() - ts) <= 43200
+
+
+# --- HTTP handler -------------------------------------------------------------
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ProxmoxAutoUpdateUI/1.0"
+    protocol_version = "HTTP/1.1"
+
+    # -- plumbing --
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[ui] %s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, code, body, ctype="application/json", extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        # Allow the Proxmox UI (any origin/port on this host) to frame us, but
+        # nothing else may embed this control panel.
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                         "script-src 'self' 'unsafe-inline'; frame-ancestors https:")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, code, payload):
+        self._send(code, json.dumps(payload), "application/json")
+
+    def _auth(self):
+        """Returns the username, or None after having already sent a 401."""
+        cookies = self.headers.get("Cookie", "")
+        ticket = None
+        for part in cookies.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "PVEAuthCookie":
+                ticket = urllib.parse.unquote(value)
+                break
+
+        user = verify_ticket(ticket)
+        if not user:
+            self._json(401, {"error": "Not logged in to Proxmox. "
+                                      "Open the Proxmox web UI, log in, then reload."})
+            return None
+        if user not in ALLOWED_USERS:
+            self._json(403, {"error": "User %s is not permitted to control updates." % user})
+            return None
+        return user
+
+    def _body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return {}
+        if length <= 0 or length > 1_000_000:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    # -- routes --
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        params = urllib.parse.parse_qs(query)
+
+        if path == "/healthz":
+            self._send(200, "ok", "text/plain")
+            return
+
+        user = self._auth()
+        if not user:
+            return
+
+        if path == "/":
+            token = issue_csrf(user)
+            self._send(200, render_page(user, token), "text/html; charset=utf-8")
+        elif path == "/guest":
+            vmid = (params.get("vmid") or [""])[0]
+            if not vmid.isdigit():
+                self._send(400, "<p>Missing or invalid vmid.</p>", "text/html; charset=utf-8")
+                return
+            name = (params.get("name") or [""])[0]
+            token = issue_csrf(user)
+            self._send(200, render_guest_page(user, token, vmid, name),
+                       "text/html; charset=utf-8")
+        elif path == "/api/guests":
+            guests, err = list_guests()
+            if err:
+                self._json(500, {"error": "Could not list guests: %s" % err})
+                return
+            self._json(200, {"guests": guests})
+        elif path == "/api/status":
+            status = JOB.snapshot()
+            status["lock_held"] = lock_is_held() and not status["running"]
+            status["schedule"] = current_schedule()
+            status["user"] = user
+            self._json(200, status)
+        elif path == "/api/config":
+            cfg = read_config()
+            payload = {k: cfg.get(k, "") for k in EDITABLE_KEYS}
+            self._json(200, {"config": payload, "sensitive": sorted(SENSITIVE_KEYS)})
+        elif path == "/api/logs":
+            self._json(200, {"logs": list_logs()})
+        elif path == "/api/log":
+            self._serve_log(params)
+        else:
+            self._json(404, {"error": "Not found"})
+
+    def _serve_log(self, params):
+        name = (params.get("name") or [None])[0]
+        if name is None:
+            status = JOB.snapshot()
+            name = status["log"]
+            if not name:
+                self._json(200, {"data": "", "offset": 0, "eof": True})
+                return
+        path = safe_log_path(name)
+        if not path:
+            self._json(404, {"error": "No such log"})
+            return
+        try:
+            offset = int((params.get("offset") or ["0"])[0])
+        except ValueError:
+            offset = 0
+
+        size = os.path.getsize(path)
+        if offset > size:      # log rotated or truncated underneath us
+            offset = 0
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read(256 * 1024)
+        self._json(200, {
+            "data": strip_ansi(chunk.decode("utf-8", errors="replace")),
+            "offset": offset + len(chunk),
+            "eof": offset + len(chunk) >= size,
+            "name": name,
+        })
+
+    def do_POST(self):
+        path = self.path.partition("?")[0]
+        user = self._auth()
+        if not user:
+            return
+
+        if not check_csrf(self.headers.get("X-PAU-CSRF"), user):
+            self._json(403, {"error": "Invalid or expired CSRF token — reload the page."})
+            return
+
+        body = self._body()
+
+        if path == "/api/run":
+            self._run(body, user)
+        elif path == "/api/guest/run":
+            self._run_guest(body, user)
+        elif path == "/api/exclusions":
+            self._save_exclusions(body)
+        elif path == "/api/config":
+            self._save_config(body)
+        elif path == "/api/schedule":
+            self._save_schedule(body)
+        else:
+            self._json(404, {"error": "Not found"})
+
+    def _run(self, body, user):
+        dry = bool(body.get("dry_run", True))
+        if not dry and body.get("confirm") != "UPDATE":
+            self._json(400, {"error": "Full runs require an explicit confirmation."})
+            return
+        if lock_is_held():
+            self._json(409, {"error": "Another update run holds the lock "
+                                      "(a scheduled run is probably in progress)."})
+            return
+        ok, detail = JOB.start(dry, user)
+        if not ok:
+            self._json(409, {"error": detail})
+            return
+        self._json(200, {"started": True, "log": detail, "dry_run": dry})
+
+    def _run_guest(self, body, user):
+        """Update a single guest. Never touches the host and never reboots."""
+        vmid = str(body.get("vmid", "")).strip()
+        if not vmid.isdigit():
+            self._json(400, {"error": "Expected a numeric vmid."})
+            return
+
+        guests, err = list_guests()
+        if err:
+            self._json(500, {"error": "Could not verify the guest: %s" % err})
+            return
+        if vmid not in {g["vmid"] for g in guests}:
+            self._json(404, {"error": "No guest with ID %s on this cluster." % vmid})
+            return
+
+        dry = bool(body.get("dry_run", True))
+        if not dry and body.get("confirm") != "UPDATE":
+            self._json(400, {"error": "Full runs require an explicit confirmation."})
+            return
+        if lock_is_held():
+            self._json(409, {"error": "Another update run holds the lock "
+                                      "(a scheduled run is probably in progress)."})
+            return
+
+        # No email for a single guest — the caller is watching the output live.
+        ok, detail = JOB.start(dry, user, only=vmid, no_email=True)
+        if not ok:
+            self._json(409, {"error": detail})
+            return
+        self._json(200, {"started": True, "log": detail, "dry_run": dry, "vmid": vmid})
+
+    def _save_exclusions(self, body):
+        ids = body.get("excluded")
+        if not isinstance(ids, list):
+            self._json(400, {"error": "Expected a list of IDs."})
+            return
+        cleaned = []
+        for item in ids:
+            text = str(item).strip()
+            if not text.isdigit():
+                self._json(400, {"error": "Not a valid guest ID: %r" % item})
+                return
+            cleaned.append(text)
+        try:
+            saved = set_excluded_ids(cleaned)
+        except OSError as exc:
+            self._json(500, {"error": "Could not write config: %s" % exc})
+            return
+        self._json(200, {"excluded": saved})
+
+    def _save_config(self, body):
+        incoming = body.get("config")
+        if not isinstance(incoming, dict):
+            self._json(400, {"error": "Expected a config object."})
+            return
+
+        updates, errors = {}, []
+        for key, value in incoming.items():
+            if key not in EDITABLE_KEYS:
+                errors.append("%s is not an editable setting" % key)
+                continue
+            value = ("" if value is None else str(value)).strip()
+            # An untouched sensitive field comes back as the placeholder; skip it
+            # so we never overwrite a real key with asterisks.
+            if key in SENSITIVE_KEYS and set(value) == {"*"}:
+                continue
+            if not EDITABLE_KEYS[key](value):
+                errors.append("%s: invalid value" % key)
+                continue
+            updates[key] = value
+
+        if errors:
+            self._json(400, {"error": "; ".join(errors)})
+            return
+        try:
+            write_config(updates)
+        except OSError as exc:
+            self._json(500, {"error": "Could not write config: %s" % exc})
+            return
+
+        # The cron expression lives in both the config and the crontab.
+        if "UPDATE_SCHEDULE_CRON" in updates:
+            try:
+                write_schedule(updates["UPDATE_SCHEDULE_CRON"])
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                self._json(500, {"error": "Config saved, but crontab update failed: %s" % exc})
+                return
+        self._json(200, {"saved": sorted(updates)})
+
+    def _save_schedule(self, body):
+        expr = str(body.get("cron", "")).strip()
+        if not _v_cron(expr):
+            self._json(400, {"error": "Expected a 5-field cron expression."})
+            return
+        try:
+            write_schedule(expr)
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        try:
+            write_config({"UPDATE_SCHEDULE_CRON": expr})
+        except OSError as exc:
+            self._json(500, {"error": "Crontab updated, but config write failed: %s" % exc})
+            return
+        self._json(200, {"cron": expr})
+
+
+# --- The page -----------------------------------------------------------------
+
+
+def render_page(user, csrf):
+    return (PAGE_TEMPLATE
+            .replace("{{CSS}}", SHARED_CSS)
+            .replace("{{USER}}", html.escape(user))
+            .replace("{{CSRF}}", csrf))
+
+
+def render_guest_page(user, csrf, vmid, name):
+    # vmid is already known to be all digits, so it is safe to inline into JS.
+    return (GUEST_TEMPLATE
+            .replace("{{CSS}}", SHARED_CSS)
+            .replace("{{USER}}", html.escape(user))
+            .replace("{{CSRF}}", csrf)
+            .replace("{{VMID}}", html.escape(vmid))
+            .replace("{{NAME}}", html.escape(name or "")))
+
+
+SHARED_CSS = r"""  :root {
+    --bg: #1e1e1e; --panel: #2a2a2a; --border: #3d3d3d; --text: #e8e8e8;
+    --muted: #9a9a9a; --accent: #e65c00; --ok: #4caf50; --warn: #ffb300;
+    --err: #f44336; --btn: #3a3a3a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f9; --panel: #fff; --border: #dee2e6; --text: #24292f;
+      --muted: #6c757d; --btn: #f0f0f0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 13px/1.5 "Segoe UI", Tahoma, sans-serif; }
+  h1 { font-size: 17px; margin: 0 0 4px; color: var(--accent); }
+  h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase;
+       letter-spacing: .06em; color: var(--muted); }
+  .sub { color: var(--muted); margin-bottom: 16px; font-size: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; padding: 7px 14px; border-radius: 4px;
+           border: 1px solid var(--border); background: var(--btn);
+           color: var(--text); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger  { background: var(--err); border-color: var(--err); color: #fff; }
+  label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 12px; }
+  input, select { width: 100%; padding: 6px 8px; border-radius: 4px;
+                  border: 1px solid var(--border); background: var(--bg);
+                  color: var(--text); font: inherit; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  pre { background: #111; color: #ddd; padding: 10px; border-radius: 4px;
+        max-height: 380px; overflow: auto; font: 11px/1.45 "Cascadia Mono",
+        "Courier New", monospace; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 10px;
+          font-size: 11px; font-weight: 600; }
+  .pill.idle { background: #444; color: #ddd; }
+  .pill.run  { background: var(--warn); color: #000; }
+  .pill.ok   { background: var(--ok); color: #fff; }
+  .pill.err  { background: var(--err); color: #fff; }
+  .msg { padding: 8px 11px; border-radius: 4px; margin-top: 10px; display: none; font-size: 12px; }
+  .msg.show { display: block; }
+  .msg.ok { background: rgba(76,175,80,.15); border: 1px solid var(--ok); }
+  .msg.err { background: rgba(244,67,54,.15); border: 1px solid var(--err); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+  .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .hidden { display: none; }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 5px 7px; border-bottom: 1px solid var(--border); text-align: left; }
+  a { color: var(--accent); }
+"""
+
+PAGE_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxmox Auto-Update</title>
+<style>{{CSS}}</style>
+</head>
+<body>
+<h1>Proxmox Auto-Update</h1>
+<div class="sub">
+  Signed in as <strong>{{USER}}</strong> &middot;
+  Status: <span id="statusPill" class="pill idle">checking…</span> &middot;
+  Schedule: <code id="schedDisplay">—</code>
+</div>
+
+<div class="tabs">
+  <button data-tab="run" class="active">Run</button>
+  <button data-tab="exclusions">Exclusions</button>
+  <button data-tab="schedule">Schedule</button>
+  <button data-tab="config">Configuration</button>
+  <button data-tab="logs">Past Reports</button>
+</div>
+
+<!-- RUN -->
+<section id="tab-run">
+  <div class="card">
+    <h2>Run an update</h2>
+    <div class="row">
+      <button id="btnDry" class="primary">Dry run</button>
+      <button id="btnFull" class="danger">Update everything now</button>
+      <span class="hint" style="margin:0">Both email the report to your configured recipient.</span>
+    </div>
+    <div class="hint">
+      A dry run installs nothing and never reboots. A full run updates the host and
+      every guest, and may schedule a reboot if the kernel changes.
+    </div>
+    <div id="runMsg" class="msg"></div>
+  </div>
+  <div class="card">
+    <h2>Live output</h2>
+    <pre id="logView">No run started from this page yet.</pre>
+  </div>
+</section>
+
+<!-- EXCLUSIONS -->
+<section id="tab-exclusions" class="hidden">
+  <div class="card">
+    <h2>Guests excluded from scheduled updates</h2>
+    <div class="hint" style="margin-bottom:10px">
+      Ticked guests are skipped by the scheduled run. You can still update an
+      excluded guest by hand from its own Auto-Update tab.
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <button id="btnRefreshGuests">Refresh</button>
+      <button id="btnExcludeNone">Include all</button>
+      <span id="exclCount" class="hint" style="margin:0"></span>
+    </div>
+    <table>
+      <thead><tr><th style="width:44px">Skip</th><th style="width:70px">ID</th>
+        <th>Name</th><th style="width:80px">Type</th><th style="width:90px">Status</th></tr></thead>
+      <tbody id="guestList"><tr><td colspan="5">Loading…</td></tr></tbody>
+    </table>
+    <div class="row" style="margin-top:12px">
+      <button id="btnSaveExcl" class="primary">Save exclusions</button>
+    </div>
+    <div id="exclMsg" class="msg"></div>
+  </div>
+</section>
+
+<!-- SCHEDULE -->
+<section id="tab-schedule" class="hidden">
+  <div class="card">
+    <h2>Update schedule</h2>
+    <div class="grid">
+      <div>
+        <label for="schedPreset">Preset</label>
+        <select id="schedPreset">
+          <option value="0 23 * * 5">Friday at 23:00</option>
+          <option value="0 22 * * 5">Friday at 22:00</option>
+          <option value="0 20 * * 5">Friday at 20:00</option>
+          <option value="0 10 * * 5">Friday at 10:00</option>
+          <option value="0 3 * * 0">Sunday at 03:00</option>
+          <option value="0 3 * * *">Every day at 03:00</option>
+          <option value="__custom">Custom…</option>
+        </select>
+      </div>
+      <div>
+        <label for="schedCron">Cron expression (5 fields)</label>
+        <input id="schedCron" placeholder="0 23 * * 5">
+        <div class="hint">minute hour day-of-month month day-of-week</div>
+      </div>
+      <div>
+        <label for="rebootTime">Reboot time (if kernel updated)</label>
+        <input id="rebootTime" placeholder="00:00">
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnSaveSched" class="primary">Save schedule</button>
+    </div>
+    <div id="schedMsg" class="msg"></div>
+  </div>
+</section>
+
+<!-- CONFIG -->
+<section id="tab-config" class="hidden">
+  <div class="card">
+    <h2>Configuration</h2>
+    <div id="configForm" class="grid"></div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnSaveConfig" class="primary">Save configuration</button>
+      <button id="btnReloadConfig">Reload</button>
+    </div>
+    <div id="configMsg" class="msg"></div>
+  </div>
+</section>
+
+<!-- LOGS -->
+<section id="tab-logs" class="hidden">
+  <div class="card">
+    <h2>Past reports</h2>
+    <table><tbody id="logList"></tbody></table>
+  </div>
+  <div class="card">
+    <h2>Selected log</h2>
+    <pre id="logFile">Select a log above.</pre>
+  </div>
+</section>
+
+<script>
+const CSRF = "{{CSRF}}";
+
+const FIELDS = [
+  ["MAILGUN_API_KEY",        "Mailgun API key",          "password"],
+  ["MAILGUN_DOMAIN",         "Mailgun domain",           "text"],
+  ["MAILGUN_REGION",         "Mailgun region",           "select", ["EU", "US"]],
+  ["SENDER_EMAIL",           "Sender email",             "text"],
+  ["RECIPIENT_EMAIL",        "Recipient email",          "text"],
+  ["EXCLUDE_IDS",            "Excluded VM/CT IDs",       "text"],
+  ["WINDOWS_UPDATE_TIMEOUT", "Windows timeout (s)",      "number"],
+  ["LINUX_UPDATE_TIMEOUT",   "Linux timeout (s)",        "number"],
+  ["APT_LOCK_TIMEOUT",       "APT lock wait (s)",        "number"],
+  ["START_STOPPED_LXC",      "Start stopped LXC",        "select", ["true", "false"]],
+  ["START_STOPPED_LINUX_VMS","Start stopped Linux VMs",  "select", ["true", "false"]],
+  ["START_STOPPED_WINDOWS",  "Start stopped Windows VMs","select", ["true", "false"]],
+  ["SNAPSHOT_BEFORE_UPDATE", "Snapshot before update",   "select", ["true", "false"]],
+  ["SNAPSHOT_KEEP",          "Snapshots to keep",        "number"],
+  ["REBOOT_TIME",            "Reboot time (HH:MM)",      "text"],
+];
+
+const $ = (id) => document.getElementById(id);
+
+function msg(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg show " + (ok ? "ok" : "err");
+  if (ok) setTimeout(() => { el.className = "msg"; }, 6000);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({credentials: "same-origin"}, opts || {}));
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* non-JSON error page */ }
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+const post = (path, body) => api(path, {
+  method: "POST",
+  headers: {"Content-Type": "application/json", "X-PAU-CSRF": CSRF},
+  body: JSON.stringify(body || {}),
+});
+
+// --- tabs ---
+document.querySelectorAll(".tabs button").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    ["run", "exclusions", "schedule", "config", "logs"].forEach((name) => {
+      $("tab-" + name).classList.toggle("hidden", name !== btn.dataset.tab);
+    });
+    if (btn.dataset.tab === "logs") loadLogList();
+    if (btn.dataset.tab === "exclusions") loadGuests();
+  };
+});
+
+// --- exclusions ---
+async function loadGuests() {
+  const tbody = $("guestList");
+  try {
+    const data = await api("/api/guests");
+    tbody.innerHTML = "";
+    if (!data.guests.length) {
+      tbody.innerHTML = "<tr><td colspan='5'>No guests found.</td></tr>";
+      return;
+    }
+    data.guests.forEach((g) => {
+      const tr = document.createElement("tr");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = g.excluded;
+      box.dataset.vmid = g.vmid;
+      box.style.width = "auto";
+      box.onchange = updateExclCount;
+
+      const td = document.createElement("td");
+      td.appendChild(box);
+      tr.appendChild(td);
+      [g.vmid, g.name, g.type === "lxc" ? "LXC" : "VM", g.status].forEach((val) => {
+        const cell = document.createElement("td");
+        cell.textContent = val;
+        if (val === "stopped") cell.style.color = "var(--muted)";
+        tr.appendChild(cell);
+      });
+      tbody.appendChild(tr);
+    });
+    updateExclCount();
+  } catch (e) {
+    tbody.innerHTML = "<tr><td colspan='5'>" + e.message + "</td></tr>";
+  }
+}
+
+function updateExclCount() {
+  const boxes = document.querySelectorAll("#guestList input[type=checkbox]");
+  const n = Array.from(boxes).filter((b) => b.checked).length;
+  $("exclCount").textContent = n + " of " + boxes.length + " excluded";
+}
+
+$("btnRefreshGuests").onclick = loadGuests;
+$("btnExcludeNone").onclick = () => {
+  document.querySelectorAll("#guestList input[type=checkbox]").forEach((b) => { b.checked = false; });
+  updateExclCount();
+};
+
+$("btnSaveExcl").onclick = async () => {
+  const ids = Array.from(document.querySelectorAll("#guestList input[type=checkbox]"))
+    .filter((b) => b.checked).map((b) => b.dataset.vmid);
+  try {
+    const res = await post("/api/exclusions", {excluded: ids});
+    msg($("exclMsg"), res.excluded.length
+        ? "Excluded: " + res.excluded.join(", ")
+        : "No guests are excluded.", true);
+  } catch (e) { msg($("exclMsg"), e.message, false); }
+};
+
+// --- status + live log ---
+let logOffset = 0, activeLog = null, wasRunning = false;
+
+async function poll() {
+  try {
+    const st = await api("/api/status");
+    const pill = $("statusPill");
+    if (st.running) {
+      pill.className = "pill run";
+      pill.textContent = (st.dry_run ? "dry run" : "updating") + " …";
+    } else if (st.lock_held) {
+      pill.className = "pill run";
+      pill.textContent = "scheduled run in progress";
+    } else if (st.returncode === 0) {
+      pill.className = "pill ok"; pill.textContent = "last run OK";
+    } else if (st.returncode !== null && st.returncode !== undefined) {
+      pill.className = "pill err"; pill.textContent = "last run failed (" + st.returncode + ")";
+    } else {
+      pill.className = "pill idle"; pill.textContent = "idle";
+    }
+    $("schedDisplay").textContent = st.schedule || "not scheduled";
+
+    $("btnDry").disabled = st.running || st.lock_held;
+    $("btnFull").disabled = st.running || st.lock_held;
+
+    if (st.log && st.log !== activeLog) { activeLog = st.log; logOffset = 0; $("logView").textContent = ""; }
+    if (activeLog) await pumpLog();
+    if (wasRunning && !st.running) await pumpLog();
+    wasRunning = st.running;
+  } catch (e) {
+    const pill = $("statusPill");
+    pill.className = "pill err";
+    pill.textContent = e.message;
+  }
+}
+
+async function pumpLog() {
+  const data = await api("/api/log?name=" + encodeURIComponent(activeLog) + "&offset=" + logOffset);
+  if (data.data) {
+    const view = $("logView");
+    const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+    view.textContent += data.data;
+    if (atBottom) view.scrollTop = view.scrollHeight;
+  }
+  logOffset = data.offset;
+}
+
+$("btnDry").onclick = async () => {
+  try {
+    await post("/api/run", {dry_run: true});
+    msg($("runMsg"), "Dry run started — nothing will be installed.", true);
+    logOffset = 0; activeLog = null;
+  } catch (e) { msg($("runMsg"), e.message, false); }
+};
+
+$("btnFull").onclick = async () => {
+  const typed = prompt(
+    "This updates the Proxmox host and every guest right now.\n\n" +
+    "Type UPDATE to confirm:");
+  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
+  try {
+    await post("/api/run", {dry_run: false, confirm: "UPDATE"});
+    msg($("runMsg"), "Full update started.", true);
+    logOffset = 0; activeLog = null;
+  } catch (e) { msg($("runMsg"), e.message, false); }
+};
+
+// --- schedule ---
+$("schedPreset").onchange = () => {
+  const v = $("schedPreset").value;
+  if (v !== "__custom") $("schedCron").value = v;
+};
+
+$("btnSaveSched").onclick = async () => {
+  try {
+    await post("/api/schedule", {cron: $("schedCron").value.trim()});
+    const reboot = $("rebootTime").value.trim();
+    if (reboot) await post("/api/config", {config: {REBOOT_TIME: reboot}});
+    msg($("schedMsg"), "Schedule saved and crontab updated.", true);
+    poll();
+  } catch (e) { msg($("schedMsg"), e.message, false); }
+};
+
+// --- config ---
+function buildConfigForm(cfg, sensitive) {
+  const form = $("configForm");
+  form.innerHTML = "";
+  FIELDS.forEach(([key, label, type, options]) => {
+    const wrap = document.createElement("div");
+    const lab = document.createElement("label");
+    lab.textContent = label; lab.htmlFor = "cfg_" + key;
+    wrap.appendChild(lab);
+
+    let input;
+    if (type === "select") {
+      input = document.createElement("select");
+      options.forEach((opt) => {
+        const o = document.createElement("option");
+        o.value = o.textContent = opt;
+        input.appendChild(o);
+      });
+    } else {
+      input = document.createElement("input");
+      input.type = type === "password" ? "password" : (type === "number" ? "number" : "text");
+    }
+    input.id = "cfg_" + key;
+    input.dataset.key = key;
+    input.value = sensitive.includes(key) && cfg[key] ? "********" : (cfg[key] || "");
+    wrap.appendChild(input);
+    form.appendChild(wrap);
+  });
+}
+
+async function loadConfig() {
+  try {
+    const data = await api("/api/config");
+    buildConfigForm(data.config, data.sensitive);
+    $("schedCron").value = (await api("/api/status")).schedule || "";
+    $("rebootTime").value = data.config.REBOOT_TIME || "";
+  } catch (e) { msg($("configMsg"), e.message, false); }
+}
+
+$("btnReloadConfig").onclick = loadConfig;
+
+$("btnSaveConfig").onclick = async () => {
+  const cfg = {};
+  document.querySelectorAll("#configForm [data-key]").forEach((el) => {
+    cfg[el.dataset.key] = el.value;
+  });
+  try {
+    const res = await post("/api/config", {config: cfg});
+    msg($("configMsg"), "Saved: " + res.saved.join(", "), true);
+  } catch (e) { msg($("configMsg"), e.message, false); }
+};
+
+// --- logs ---
+async function loadLogList() {
+  try {
+    const data = await api("/api/logs");
+    const tbody = $("logList");
+    tbody.innerHTML = "";
+    data.logs.forEach((entry) => {
+      const tr = document.createElement("tr");
+      const when = new Date(entry.mtime * 1000).toLocaleString();
+      const kb = (entry.size / 1024).toFixed(1) + " KB";
+      tr.innerHTML = '<td><a href="#">' + entry.name + "</a></td><td>" + when +
+                     "</td><td>" + kb + "</td>";
+      tr.querySelector("a").onclick = (ev) => { ev.preventDefault(); showLog(entry.name); };
+      tbody.appendChild(tr);
+    });
+  } catch (e) { $("logList").innerHTML = "<tr><td>" + e.message + "</td></tr>"; }
+}
+
+async function showLog(name) {
+  $("logFile").textContent = "Loading…";
+  let offset = 0, text = "";
+  try {
+    for (;;) {
+      const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=" + offset);
+      text += data.data;
+      offset = data.offset;
+      if (data.eof) break;
+    }
+    $("logFile").textContent = text || "(empty)";
+  } catch (e) { $("logFile").textContent = e.message; }
+}
+
+loadConfig();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+GUEST_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto-Update — {{VMID}}</title>
+<style>{{CSS}}</style>
+</head>
+<body>
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <strong id="guestTitle">Guest {{VMID}}</strong>
+      <span class="hint" style="margin:0"> &middot; <span id="guestMeta">…</span></span>
+    </div>
+    <span id="statusPill" class="pill idle">checking…</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Update this guest only</h2>
+  <div class="row">
+    <button id="btnDry" class="primary">Check for updates</button>
+    <button id="btnFull" class="danger">Update now</button>
+    <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+      <input type="checkbox" id="chkExclude" style="width:auto">
+      <span>Exclude from scheduled runs</span>
+    </label>
+  </div>
+  <div class="hint">
+    Only this guest is touched. The Proxmox host is not updated and no reboot is
+    ever scheduled from here. No report email is sent — the output appears below.
+  </div>
+  <div id="runMsg" class="msg"></div>
+</div>
+
+<div class="card">
+  <h2>Output</h2>
+  <pre id="logView">Nothing run yet.</pre>
+</div>
+
+<script>
+const CSRF = "{{CSRF}}";
+const VMID = "{{VMID}}";
+const $ = (id) => document.getElementById(id);
+
+function msg(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg show " + (ok ? "ok" : "err");
+  if (ok) setTimeout(() => { el.className = "msg"; }, 6000);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({credentials: "same-origin"}, opts || {}));
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+const post = (path, body) => api(path, {
+  method: "POST",
+  headers: {"Content-Type": "application/json", "X-PAU-CSRF": CSRF},
+  body: JSON.stringify(body || {}),
+});
+
+let allGuests = [];
+
+async function loadGuest() {
+  try {
+    const data = await api("/api/guests");
+    allGuests = data.guests;
+    const me = allGuests.find((g) => g.vmid === VMID);
+    if (me) {
+      $("guestTitle").textContent = me.name + " (" + me.vmid + ")";
+      $("guestMeta").textContent = (me.type === "lxc" ? "LXC container" : "Virtual machine") +
+                                   " · " + me.status;
+      $("chkExclude").checked = me.excluded;
+    }
+  } catch (e) { $("guestMeta").textContent = e.message; }
+}
+
+/* Exclusions are stored as one list, so toggling this guest means sending the
+   whole set back with just this entry added or removed. */
+$("chkExclude").onchange = async () => {
+  const want = $("chkExclude").checked;
+  const ids = allGuests.filter((g) => g.vmid === VMID ? want : g.excluded)
+                       .map((g) => g.vmid);
+  try {
+    await post("/api/exclusions", {excluded: ids});
+    allGuests.forEach((g) => { if (g.vmid === VMID) g.excluded = want; });
+    msg($("runMsg"), want
+        ? "This guest will be skipped by scheduled runs."
+        : "This guest is included in scheduled runs.", true);
+  } catch (e) {
+    $("chkExclude").checked = !want;
+    msg($("runMsg"), e.message, false);
+  }
+};
+
+let logOffset = 0, activeLog = null;
+
+async function poll() {
+  try {
+    const st = await api("/api/status");
+    const pill = $("statusPill");
+    const mine = st.only === VMID;
+    if (st.running && mine) {
+      pill.className = "pill run";
+      pill.textContent = st.dry_run ? "checking…" : "updating…";
+    } else if (st.running || st.lock_held) {
+      pill.className = "pill run"; pill.textContent = "another run in progress";
+    } else if (st.returncode === 0 && mine) {
+      pill.className = "pill ok"; pill.textContent = "last run OK";
+    } else if (mine && st.returncode) {
+      pill.className = "pill err"; pill.textContent = "last run failed (" + st.returncode + ")";
+    } else {
+      pill.className = "pill idle"; pill.textContent = "idle";
+    }
+    $("btnDry").disabled = st.running || st.lock_held;
+    $("btnFull").disabled = st.running || st.lock_held;
+
+    if (st.log && st.log !== activeLog && mine) {
+      activeLog = st.log; logOffset = 0; $("logView").textContent = "";
+    }
+    if (activeLog) {
+      const data = await api("/api/log?name=" + encodeURIComponent(activeLog) +
+                             "&offset=" + logOffset);
+      if (data.data) {
+        const view = $("logView");
+        const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+        view.textContent += data.data;
+        if (atBottom) view.scrollTop = view.scrollHeight;
+      }
+      logOffset = data.offset;
+    }
+  } catch (e) {
+    $("statusPill").className = "pill err";
+    $("statusPill").textContent = e.message;
+  }
+}
+
+$("btnDry").onclick = async () => {
+  try {
+    await post("/api/guest/run", {vmid: VMID, dry_run: true});
+    msg($("runMsg"), "Checking — nothing will be installed.", true);
+    activeLog = null; logOffset = 0;
+  } catch (e) { msg($("runMsg"), e.message, false); }
+};
+
+$("btnFull").onclick = async () => {
+  const typed = prompt("Update guest " + VMID + " now?\n\nType UPDATE to confirm:");
+  if (typed !== "UPDATE") { msg($("runMsg"), "Cancelled.", false); return; }
+  try {
+    await post("/api/guest/run", {vmid: VMID, dry_run: false, confirm: "UPDATE"});
+    msg($("runMsg"), "Update started.", true);
+    activeLog = null; logOffset = 0;
+  } catch (e) { msg($("runMsg"), e.message, false); }
+};
+
+loadGuest();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+# --- Entry point --------------------------------------------------------------
+
+
+def pick_cert():
+    for cert, key in CERT_CANDIDATES:
+        if os.path.isfile(cert) and os.path.isfile(key):
+            return cert, key
+    return None, None
+
+
+def watch_cert(ctx, cert, key, interval=300):
+    """Reload the certificate in place when it changes on disk.
+
+    Proxmox's ACME client renews pveproxy-ssl.pem without touching this service.
+    Calling load_cert_chain again on the live context makes new connections use
+    the new certificate, so a renewal doesn't silently keep serving an expired
+    one until someone restarts us.
+    """
+    def stat_of(path):
+        try:
+            st = os.stat(path)
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return None
+
+    last = (stat_of(cert), stat_of(key))
+    while True:
+        time.sleep(interval)
+        current = (stat_of(cert), stat_of(key))
+        if current == last or current[0] is None or current[1] is None:
+            continue
+        try:
+            ctx.load_cert_chain(cert, key)
+            last = current
+            sys.stderr.write("[ui] reloaded certificate from %s\n" % cert)
+        except (ssl.SSLError, OSError) as exc:
+            # Half-written file during renewal: keep the old cert and retry.
+            sys.stderr.write("[ui] certificate reload failed (%s) — keeping previous\n" % exc)
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("This service must run as root — it drives pct/qm and writes /etc.")
+
+    cert, key = pick_cert()
+    if not cert:
+        sys.exit("No Proxmox TLS certificate found in /etc/pve/local/. Is this a PVE node?")
+
+    httpd = ThreadingHTTPServer((LISTEN_ADDR, LISTEN_PORT), Handler)
+    httpd.daemon_threads = True
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+
+    threading.Thread(target=watch_cert, args=(ctx, cert, key), daemon=True).start()
+
+    def shutdown(_signum, _frame):
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    sys.stderr.write("[ui] listening on https://%s:%d (cert: %s)\n"
+                     % (LISTEN_ADDR, LISTEN_PORT, cert))
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
