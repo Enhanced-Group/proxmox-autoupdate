@@ -8,12 +8,12 @@ install and nothing else. Earlier releases are in the git history and on the
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
-## 3.4.2 — 2026-07-31
-
-### Added
-- **Diagnose Discord DM** button. It walks the DM flow one call at a time and reports which step fails and why — bad token, the bot's own ID, no shared server, or a rejected recipient — instead of a bare "400".
-- Unsaved-change tracking on every settings tab: a dot on the tab, a highlighted Save button, a banner, and a warning if you close the page with edits pending.
+## 3.4.3 — 2026-07-31
 
 ### Fixed
-- The test notification aborted before sending on configs written by an older installer, because it sourced them under `set -u` without defaulting the newer keys.
-- A bot token pasted with its `Bot ` prefix is now accepted by the diagnostic as well as the notifier.
+- Updating the tool silently started a dry run of every guest. The installer's end-of-run prompt defaults to "dry run" on Enter, and unattended it reads end-of-input — so a self-update triggered it. That run also took the update lock, which is why the status said "scheduled run in progress" during an update.
+- The status now says **updating Auto-Update** while the tool updates itself, rather than reporting it as a guest update.
+- Elements marked hidden could stay on screen: `.hidden` was less specific than the rules it had to override, so the reload notice showed while idle and the "live" tag never went away.
+
+### Changed
+- The reload notice is calmer and only appears while an update is actually running. When it finishes you are simply offered a reload, rather than warned.

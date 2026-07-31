@@ -1175,6 +1175,12 @@ class Handler(BaseHTTPRequestHandler):
             status["schedule"] = current_schedule()
             status["user"] = user
             status["version"] = installed_version()
+            # The header has to distinguish "updating the guests" from "updating
+            # this tool" — they look the same from the job's point of view but
+            # mean very different things to whoever is reading the page.
+            maint = maintenance_status()
+            status["self_updating"] = maint["busy"]
+            status["pending"] = maint["pending"]
             self._json(200, status)
         elif path == "/api/state":
             # Consumed cross-origin by the toolbar button's status dot. Includes
@@ -1745,7 +1751,12 @@ SHARED_CSS = r"""  :root {
     border-radius: 4px; padding: 7px 10px; margin-bottom: 12px; font-size: 12px;
   }
   .unsaved::before { content: "⚠"; color: var(--warn); }
-  .hidden { display: none; }
+  /* Utility class, so it has to beat anything that sets display — .msg.show
+     and .pill are both more specific than a bare class selector, which left
+     elements marked hidden still on screen. */
+  .hidden { display: none !important; }
+  .note { padding: 8px 11px; border-radius: 4px; margin-top: 10px; font-size: 12px;
+          background: rgba(70,150,220,.12); border: 1px solid #4d9bd7; }
   .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
   /* --- Dialogs -------------------------------------------------------------
@@ -2080,10 +2091,9 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <span id="installStage" class="hint hidden" style="margin:0"></span>
     </div>
     <div id="maintProgress" class="progress"><div></div></div>
-    <div id="reloadWarning" class="msg show err hidden" style="margin-top:10px">
-      Updating the tool replaces the JavaScript the Proxmox UI is running.
-      When this finishes, reload <strong>every open Proxmox tab</strong> —
-      Ctrl+Shift+R — or they will keep running the old interface.
+    <div id="reloadWarning" class="note hidden">
+      This takes a minute or two. The panel restarts partway through — that's
+      normal. You'll be offered a reload when it's done.
     </div>
     <div id="verMsg" class="msg"></div>
     <div class="hint">Checking only reads the published version — it never
@@ -2317,6 +2327,25 @@ $("btnPurgeLogs").onclick = async () => {
    page — it is read back from systemd and polled until the unit settles. */
 let maintPoll = null;
 
+/* Offered once the new version is confirmed running. The reload is genuinely
+   needed — this page and the Proxmox UI around it are both still running the
+   previous version's JavaScript — but it is a normal end-of-update step, not a
+   warning, so it reads as one. */
+async function offerReload(version) {
+  const go = await dialog({
+    title: "Updated to " + version,
+    okText: "Reload now",
+    cancelText: "Later",
+    message:
+      "All done." +
+      "<p style='margin:10px 0 0'>This page is still showing the previous " +
+      "version's interface. Reloading picks up the new one.</p>" +
+      "<p style='margin:10px 0 0;opacity:.75'>Any other Proxmox tabs you have " +
+      "open will want a refresh too.</p>",
+  });
+  if (go) { window.location.reload(); }
+}
+
 function renderMaintState(v) {
   const busy = !!v.busy;
   const btn = $("btnSelfUpdate");
@@ -2430,12 +2459,12 @@ function watchMaintenance() {
       clearInterval(maintPoll); maintPoll = null;
       // Only reached once the installed version matches what was being
       // installed, so this really does mean finished.
-      msg($("verMsg"), "Update complete — now running " + v.version +
-                       ". Reload your Proxmox tabs to pick up the new interface.", true);
+      msg($("verMsg"), "Updated to " + v.version + ".", true);
       $("btnSelfUpdate").classList.add("hidden");
       $("reloadWarning").classList.add("hidden");
       latestVersion = null;
       loadChangelog();
+      offerReload(v.version);
     }
   }, 3000);
 }
@@ -2636,12 +2665,18 @@ async function poll() {
   try {
     const st = await api("/api/status");
     const pill = $("statusPill");
-    const busy = st.running || st.lock_held;
+    const busy = st.running || st.lock_held || st.self_updating;
 
-    if (st.running) {
+    // Checked first: a self-update is about this tool, not about your guests,
+    // and it is the only one of these that invalidates the page you are on.
+    if (st.self_updating) {
+      pill.className = "pill run";
+      pill.innerHTML = '<span class="spinner"></span>updating Auto-Update' +
+                       (st.pending ? " to " + st.pending : "") + "…";
+    } else if (st.running) {
       pill.className = "pill run";
       pill.innerHTML = '<span class="spinner"></span>' +
-                       (st.dry_run ? "dry run" : "updating") + "…";
+                       (st.dry_run ? "dry run" : "updating guests") + "…";
     } else if (st.lock_held) {
       pill.className = "pill run";
       pill.innerHTML = '<span class="spinner"></span>scheduled run in progress';
@@ -2655,11 +2690,15 @@ async function poll() {
     $("schedDisplay").textContent = st.schedule || "not scheduled";
 
     // Motion while a run is in flight: a long silent stretch mid-upgrade
-    // otherwise looks identical to a panel that has hung.
-    $("runProgress").classList.toggle("active", !!busy);
-    $("liveTag").classList.toggle("hidden", !busy);
-    $("logView").classList.toggle("live", !!busy);
+    // otherwise looks identical to a panel that has hung. Scoped to an actual
+    // run — a self-update produces no run log, so a "live" marker on an empty
+    // output pane would be a lie.
+    const runLive = !!(st.running || st.lock_held);
+    $("runProgress").classList.toggle("active", runLive);
+    $("liveTag").classList.toggle("hidden", !runLive);
+    $("logView").classList.toggle("live", runLive);
 
+    // Still disabled during a self-update: the script is being replaced.
     $("btnDry").disabled = busy;
     $("btnFull").disabled = busy;
 
