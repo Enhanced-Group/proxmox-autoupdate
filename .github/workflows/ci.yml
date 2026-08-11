@@ -10,7 +10,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # This project is distributed by `curl | bash` and runs as root on a
       # hypervisor. A syntax error reaching main reaches every installation's
@@ -63,7 +63,7 @@ jobs:
   patcher:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The web-UI patcher rewrites Proxmox's 5 MB pvemanagerlib.js. A bad edit
       # there takes out the entire Proxmox web interface, so exercise the real
@@ -111,7 +111,7 @@ jobs:
   guest-payload:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The script that runs inside every container and VM is a heredoc, so
       # `bash -n` on the outer file does not validate it at all. It is piped

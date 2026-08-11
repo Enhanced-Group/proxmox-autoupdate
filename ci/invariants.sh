@@ -2,8 +2,12 @@
 # ==============================================================================
 # Cross-file invariants that no single-file linter can see.
 #
-# Each of these encodes a real regression: something that passed `bash -n` and
-# shellcheck, shipped, and broke on users' machines.
+# Each of these encodes a real regression: something that passed both `bash -n`
+# and the linter, shipped, and broke on users' machines.
+#
+# (Do not begin a comment line with the word "shellcheck" — it is read as a
+# directive, and an unparseable one is an error, not a warning. That is exactly
+# how this file first broke CI.)
 # ==============================================================================
 
 set -uo pipefail
