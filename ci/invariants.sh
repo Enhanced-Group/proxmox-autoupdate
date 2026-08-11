@@ -41,7 +41,9 @@ else
     if [ -z "${REQUIRED}" ]; then
         fail "could not read the required-function list from the panel"
     fi
-    for fn in ${REQUIRED}; do
+    # The panel's own list, plus the two the markers' comment implies but which
+    # sat outside them until this was written.
+    for fn in ${REQUIRED} build_text_summary notify_all; do
         if echo "${SLICE}" | grep -qE "^${fn}\(\)"; then
             ok "${fn}() is inside the notifier block"
         else

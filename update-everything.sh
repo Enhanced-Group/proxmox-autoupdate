@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="3.5.1"
+PAU_VERSION="4.0.0"
 
 set -u
 set -o pipefail
@@ -1674,6 +1674,14 @@ print(", ".join("%s (%s) x%d" % (g.get("name") or "guest", gid,
 # A failing notification never fails the run. The updates already happened; not
 # being able to talk about them is a lesser problem, reported and moved past.
 
+# >>> PAU-NOTIFIER-BEGIN
+# Everything between these markers is lifted verbatim by the web panel's "Send
+# test notification", so that a test exercises the real notifier rather than a
+# copy of it. Keep the whole notifier inside them: a helper left outside is not
+# a compile error, it is a function that is simply missing at run time.
+#
+# ci/invariants.sh enforces that every function the panel requires is in here.
+
 # Plain-text summary shared by all the webhook channels.
 build_text_summary() {
     local status_line
@@ -1705,11 +1713,6 @@ build_text_summary() {
     fi
 }
 
-# >>> PAU-NOTIFIER-BEGIN
-# Everything between these markers is lifted verbatim by the web panel's "Send
-# test notification", so that a test exercises the real notifier rather than a
-# copy of it. Keep the whole notifier inside them: a helper left outside is not
-# a compile error, it is a function that is simply missing at run time.
 
 # ---- Keeping credentials out of the process list ----
 # A process's full command line is readable from /proc by any local user, so an
@@ -2104,12 +2107,13 @@ notify_webhook() {
     post_webhook "Webhook" "${GENERIC_WEBHOOK_URL}" "$(build_payload generic "$1" "$2")"
 }
 
-# <<< PAU-NOTIFIER-END
-
 notify_all() {
     local subject="$1" body="$2" html_file="$3"
-    start_spinner "Sending notifications (${NOTIFY_ACTIVE})..."
-    stop_spinner
+    # The spinner helpers live outside this block. Guard the calls so the block
+    # stays sourceable on its own, which is how the panel's test-notification
+    # button runs it.
+    command -v start_spinner >/dev/null 2>&1 && start_spinner "Sending notifications (${NOTIFY_ACTIVE})..."
+    command -v stop_spinner  >/dev/null 2>&1 && stop_spinner
     local channel
     for channel in ${NOTIFY_ACTIVE}; do
         case "${channel}" in
@@ -2120,6 +2124,7 @@ notify_all() {
         esac
     done
 }
+# <<< PAU-NOTIFIER-END
 
 # ==============================================================================
 # HELPER: Escape text for inclusion in the HTML report
