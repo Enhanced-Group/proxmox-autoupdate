@@ -98,7 +98,53 @@ _SAFE_HOST_RE = re.compile(r"\A[A-Za-z0-9._-]{1,253}\Z")
 
 
 def _v_int(v):
-    return bool(INT_RE.match(v))
+    # Empty means "not set, use the built-in default". The script reads every
+    # one of these as ${KEY:-default}, so an empty value in the config is
+    # equivalent to the key being absent — and rejecting empty here made any
+    # setting that was not already in a user's config file impossible to save,
+    # because the form posts every field it renders.
+    return v == "" or bool(INT_RE.match(v))
+
+
+# The effective default for each setting, so a key that is not yet in the
+# config file shows its real value in the UI rather than an empty box. These
+# must match the ${KEY:-default} values in update-everything.sh; ci/invariants.sh
+# checks that they do.
+KEY_DEFAULTS = {
+    "WINDOWS_UPDATE_TIMEOUT": "3600",
+    "WINDOWS_SHUTDOWN_TIMEOUT": "900",
+    "LINUX_UPDATE_TIMEOUT": "1800",
+    "LINUX_SHUTDOWN_TIMEOUT": "180",
+    "APT_LOCK_TIMEOUT": "600",
+    "AGENT_ERROR_GRACE": "120",
+    "SNAPSHOT_KEEP": "3",
+    "LOG_RETENTION_DAYS": "90",
+    "SMTP_PORT": "587",
+    "SMTP_SECURITY": "starttls",
+    "NTFY_PRIORITY": "default",
+    "MAILGUN_REGION": "EU",
+    "REBOOT_TIME": "00:00",
+    "SNAPSHOT_BEFORE_UPDATE": "false",
+    "START_STOPPED_LXC": "true",
+    "START_STOPPED_LINUX_VMS": "true",
+    "START_STOPPED_WINDOWS": "false",
+    "KEEP_LOGS": "true",
+    "NOTIFY_ON_FAILURE_ONLY": "false",
+    "CONFIRM_UPDATES": "true",
+    "SUPPRESS_SUBSCRIPTION_NOTICE": "false",
+    "UPDATE_SCHEDULE_CRON": "0 23 * * 5",
+}
+
+# EMAIL_TRANSPORT is not a plain default — the script infers it when unset, so
+# that installations predating SMTP support keep using Mailgun without anyone
+# editing anything. Mirror that inference here, or the panel would show "SMTP
+# server" selected on a working Mailgun install and quietly misrepresent what
+# the next run will actually do.
+def effective_email_transport(cfg):
+    explicit = (cfg.get("EMAIL_TRANSPORT") or "").strip()
+    if explicit in ("mailgun", "smtp"):
+        return explicit
+    return "mailgun" if (cfg.get("MAILGUN_API_KEY") or "").strip() else "smtp"
 
 
 def _v_bool(v):
@@ -1846,7 +1892,16 @@ class Handler(BaseHTTPRequestHandler):
             cfg = read_config()
             payload = {}
             for k in EDITABLE_KEYS:
-                value = cfg.get(k, "")
+                # Fall back to the effective default rather than an empty
+                # string. A blank box for a setting that does have a value is
+                # misleading, and it used to make the whole form unsaveable:
+                # every field is posted on save, and an empty integer failed
+                # validation.
+                value = cfg.get(k)
+                if k == "EMAIL_TRANSPORT":
+                    value = effective_email_transport(cfg)
+                elif value is None or value == "":
+                    value = KEY_DEFAULTS.get(k, "")
                 if k in SENSITIVE_KEYS and value:
                     payload[k] = "*" * 12
                 else:

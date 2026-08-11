@@ -16,6 +16,14 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 
 ### Fixed
 
+- **The Update Everything button did not match its toolbar.** It forced
+  `scale: 'medium'` and `minWidth: 170` while every other button beside it —
+  Documentation, Create VM, Create CT — is `small` and sized to its text, so it
+  sat noticeably taller and wider than its neighbours, and its label was bolded
+  when theirs are not. It now copies the toolbar's own button geometry, exactly
+  as the per-guest button already did, and expresses the accent through colour
+  alone.
+
 - **The panel followed the operating system's light/dark preference, not
   Proxmox's.** Those are frequently not the same — a dark Proxmox on a light
   desktop opened this panel in light mode inside a dark window, which is most
@@ -29,6 +37,23 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   or a class name, so it keeps working when Proxmox renames or restructures its
   themes — which it has done before. Only `dark` and `light` are accepted from
   the URL.
+
+- **Saving the Configuration tab failed with "invalid value".** The three
+  timeouts added in 4.2.0 are not present in a config file written by an
+  earlier version, so the panel served them as empty strings — and since a form
+  posts every field it renders, and an empty integer failed validation, the
+  whole form became unsaveable. Settings absent from the config file now show
+  their real default instead of an empty box, and an empty value is accepted as
+  "use the default", which is what the script already does with `${KEY:-...}`.
+
+  The same trap applied to any setting added in future, so `ci/invariants.sh`
+  now checks that every setting either accepts an empty value or has a default,
+  and that those defaults match the script's.
+
+- **The email transport could be shown wrong.** The script infers it when unset
+  — a Mailgun key means Mailgun — so an existing Mailgun installation would
+  have seen "SMTP server" selected while runs still went through Mailgun. The
+  panel mirrors the inference.
 
 - **Scrollbars used the browser default**, which on a dark panel reads as a
   pale hole punched through it. They now derive from the theme tokens, so they

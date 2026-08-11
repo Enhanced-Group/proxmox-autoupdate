@@ -12,6 +12,11 @@ cd "$(dirname "$0")/.."
 FAILED=0
 ok()   { echo "  [ ok ] $1"; }
 fail() { echo "  [FAIL] $1"; FAILED=1; }
+warn() { echo "  [warn] $1"; }
+
+# Presence is not usability: Windows puts a python3 stub on PATH that exists,
+# prints an advert for the Microsoft Store, and exits non-zero.
+have_python3() { python3 -c 'pass' >/dev/null 2>&1; }
 
 # --- 1. The notifier slice the panel lifts out of the update script ----------
 # The panel's "send a test notification" button extracts the block between these
@@ -116,6 +121,9 @@ done
 # rather than at load. This caught exactly that: a run timer added to the main
 # page, referenced from shared code, with no such element on the guest page.
 echo "== shared JS element references =="
+if ! have_python3; then
+    ok "python3 not available — skipped (CI always has it)"
+else
 python3 - <<'PYCHECK'
 import re, sys
 
@@ -142,6 +150,70 @@ for tpl in ("PAGE_TEMPLATE", "GUEST_TEMPLATE"):
 sys.exit(1 if bad else 0)
 PYCHECK
 [ $? -eq 0 ] || FAILED=1
+fi
+
+# --- 3c. Panel defaults match the script's ----------------------------------
+# The panel shows KEY_DEFAULTS when a setting is absent from the config file.
+# If those drift from the ${KEY:-default} values in update-everything.sh, the
+# UI confidently displays a number the script will not actually use.
+echo "== default values agree =="
+if ! have_python3; then
+    ok "python3 not available — skipped (CI always has it)"
+else
+python3 - <<'PYCHECK'
+import re, sys
+
+panel = open("webui/pve-autoupdate-ui", encoding="utf-8").read()
+script = open("update-everything.sh", encoding="utf-8").read()
+
+m = re.search(r"KEY_DEFAULTS = \{(.*?)\n\}", panel, re.S)
+if not m:
+    print("  [FAIL] KEY_DEFAULTS not found in the panel")
+    sys.exit(1)
+defaults = dict(re.findall(r'"([A-Z_]+)":\s*"([^"]*)"', m.group(1)))
+
+bad = False
+# EMAIL_TRANSPORT is inferred by the script when unset rather than defaulted,
+# so there is no ${KEY:-value} to compare against. The panel mirrors that
+# inference in effective_email_transport().
+INFERRED = {"EMAIL_TRANSPORT"}
+
+for key, shown in sorted(defaults.items()):
+    if key in INFERRED:
+        continue
+    sm = re.search(r'^%s="\$\{%s:-([^}]*)\}"' % (key, key), script, re.M)
+    if not sm:
+        continue          # panel-only setting; nothing to compare against
+    actual = sm.group(1)
+    if actual != shown:
+        print("  [FAIL] %s: panel shows %r, script defaults to %r" % (key, shown, actual))
+        bad = True
+if not bad:
+    print("  [ ok ] %d panel defaults match update-everything.sh" % len(defaults))
+
+# Every editable setting must either accept an empty value or have a default.
+# Otherwise a key absent from someone's config file comes back empty, and since
+# the forms post every field they render, the whole form becomes unsaveable —
+# which is exactly what adding three settings in 4.2.0 did.
+keys = re.search(r"EDITABLE_KEYS = \{(.*?)\n\}", panel, re.S).group(1)
+editable = re.findall(r'"([A-Z_]+)":', keys)
+trap = [k for k in editable if k not in defaults]
+strict = []
+for k in trap:
+    # Validators that obviously reject empty: _v_int, _v_cron, _v_time, _v_region.
+    m2 = re.search(r'"%s":\s*(\w+)' % k, keys)
+    if m2 and m2.group(1) in ("_v_int", "_v_cron", "_v_time", "_v_region"):
+        strict.append(k)
+if strict:
+    print("  [FAIL] no default for settings that reject an empty value: %s"
+          % ", ".join(sorted(strict)))
+    bad = True
+else:
+    print("  [ ok ] every strict setting has a default")
+sys.exit(1 if bad else 0)
+PYCHECK
+[ $? -eq 0 ] || FAILED=1
+fi
 
 # --- 4. No CR bytes ----------------------------------------------------------
 # A CRLF in a shebang makes the kernel look for an interpreter literally named

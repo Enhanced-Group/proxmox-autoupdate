@@ -233,10 +233,10 @@ JSBLOCK_HEAD
             '  background: transparent !important;',
             '  background-image: none !important;',
             '}',
-            '.pau-btn .x-btn-inner {',
-            '  color: var(--pau-on-accent) !important;',
-            '  font-weight: 600 !important;',
-            '}',
+            /* Deliberately no font-weight override. Bolding the label made it
+               heavier than every other button in the toolbar, which is part of
+               why it looked like it had been added by someone else. */
+            '.pau-btn .x-btn-inner { color: var(--pau-on-accent) !important; }',
             '.pau-btn .x-btn-icon-el { color: var(--pau-on-accent) !important; }',
             '.pau-btn.x-btn-over, .pau-btn.x-btn-focus, .pau-btn:hover {',
             '  background: var(--pau-accent-hover) !important;',
@@ -531,20 +531,28 @@ JSBLOCK_HEAD
 
                     var idx = tb.items.indexOf(doc);
                     if (idx < 0) { idx = 0; }
-                    var btn = tb.insert(idx, {
+                    /* Copy the neighbours' ui/scale/baseCls, exactly as the
+                       per-guest button already does.
+
+                       This used to force scale:'medium' and minWidth:170 while
+                       every other button in that toolbar is 'small' and sized
+                       to its text. The result was a button noticeably taller
+                       and wider than Documentation and Create VM sitting right
+                       next to it — which is why it read as bolted on rather
+                       than built in. Let ExtJS size it like its siblings and
+                       express the accent through colour alone. */
+                    var btn = tb.insert(idx, Ext.apply({
                         xtype: 'button',
                         itemId: 'pauNodeBtn',
                         text: 'Update Everything',
                         /* The icon slot holds the status dot. */
                         iconCls: 'pau-ico',
                         cls: 'pau-btn',
-                        scale: 'medium',
-                        minWidth: 170,
                         margin: '0 8 0 0',
                         handler: function () {
                             openPanel('Proxmox Auto-Update', panelBase() + '/');
                         }
-                    });
+                    }, siblingStyle(tb)));
 
                     /* Lay out twice: the first pass can measure before the
                        injected stylesheet has been applied, which is what left
@@ -627,10 +635,14 @@ JSBLOCK_HEAD
         return firstButton >= 0 ? firstButton + 1 : items.length;
     }
 
+    /* Adopt the geometry of whichever buttons are already in this toolbar, so
+       ours sits at the same height and weight as its neighbours instead of
+       imposing its own. Skips our own buttons, or a second call would copy the
+       first one's style back onto itself. */
     function siblingStyle(tb) {
         var items = tb.query('button');
         for (var i = 0; i < items.length; i++) {
-            if (items[i].itemId === 'pauGuestBtn') { continue; }
+            if (items[i].itemId === 'pauGuestBtn' || items[i].itemId === 'pauNodeBtn') { continue; }
             return {ui: items[i].ui, scale: items[i].scale, baseCls: items[i].baseCls};
         }
         return {};
