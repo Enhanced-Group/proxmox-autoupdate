@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="3.5.1"
+PAU_VERSION="4.0.0"
 
 set -u
 set -o pipefail
@@ -19,11 +19,15 @@ CLI_DRY_RUN=""
 ONLY_IDS=""
 SEND_EMAIL="true"
 DETACH="false"
+DOCTOR="false"
 RAW_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         -n|--dry-run)
             CLI_DRY_RUN="true"
+            ;;
+        --doctor)
+            DOCTOR="true"
             ;;
         --detach)
             DETACH="true"
@@ -52,6 +56,11 @@ Usage: update-everything.sh [options]
 
   --no-email        Do not send any notification for this run. Useful when the
                     output is already being watched live.
+
+  --doctor          Check this installation and report what would stop it
+                    working, without changing anything. Run this first if a
+                    scheduled run appears to do nothing. Exits non-zero if any
+                    check fails.
 
   --detach          Hand the run to systemd and return immediately. Use this
                     from the Proxmox web shell: the run then survives closing
@@ -116,17 +125,409 @@ if [ "${DETACH}" = "true" ]; then
     exit 1
 fi
 
-# Ensure UK timezone formatting for date commands
-export TZ="Europe/London"
+# Timestamps and the reboot schedule follow the host's own timezone.
+#
+# This used to force TZ=Europe/London for the whole process, which is fine for a
+# UK box and wrong everywhere else: REBOOT_TIME was resolved as a London
+# wall-clock time, so a US-Eastern user asking for 03:00 got a reboot at 22:00
+# local. Set PAU_TZ in the config to pin a specific zone for reporting.
+if [ -n "${PAU_TZ:-}" ]; then
+    export TZ="${PAU_TZ}"
+fi
 
 # Ensure full PATH for cron execution (pct, qm, pveversion live in sbin dirs)
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
+# --- EARLY FAILURE NOTIFICATION ---
+# The full notification layer lives near the end of this script and only runs
+# once the sweep has finished. Every fatal path before that point — a missing
+# config, a held lock, a missing dependency — used to exit with a line on stdout
+# and nothing else, and cron's output is redirected to a log file by the
+# installer, so nothing was mailed either. A weekly job could therefore fail
+# silently for months.
+#
+# This is a deliberately minimal sender: no HTML, no attachments, no jq. It
+# parses the config rather than sourcing it, so it cannot be broken by (or
+# execute) whatever is in there.
+CONFIG_FILE="${PAU_CONFIG_FILE:-/etc/proxmox-autoupdate.conf}"
+
+cfg_read() {
+    [ -r "${CONFIG_FILE}" ] || return 0
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "${CONFIG_FILE}" 2>/dev/null \
+        | tail -1 \
+        | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# Escape a string for embedding in a JSON string literal.
+#
+# The slurp (:a N $!ba) has to come first. sed applies commands in order within
+# a cycle, so escaping before the slurp only ever escapes the first line — every
+# subsequent line is appended after those substitutions have already run.
+json_escape() {
+    printf '%s' "$1" \
+        | tr -d '\r' \
+        | sed -e ':a' -e 'N' -e '$!ba' \
+              -e 's/\\/\\\\/g' \
+              -e 's/"/\\"/g' \
+              -e 's/\t/\\t/g' \
+              -e 's/\n/\\n/g'
+}
+
+notify_fatal() {
+    local msg="$1"
+    local methods host_label
+    methods=$(cfg_read NOTIFY_METHODS)
+    if [ -z "${methods}" ] || [ "${methods}" = "none" ]; then
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || return 0
+
+    host_label=$(hostname -s 2>/dev/null || echo "proxmox")
+    local text="[proxmox-autoupdate] ${host_label}: ${msg}"
+    local esc
+    esc=$(json_escape "${text}")
+
+    case ",${methods}," in
+        *,discord,*)
+            local dw
+            dw=$(cfg_read DISCORD_WEBHOOK_URL)
+            [ -n "${dw}" ] && curl -fsS -m 15 -H 'Content-Type: application/json' \
+                -d "{\"content\":\"${esc}\"}" "${dw}" >/dev/null 2>&1 || true
+            ;;
+    esac
+    case ",${methods}," in
+        *,slack,*)
+            local sw
+            sw=$(cfg_read SLACK_WEBHOOK_URL)
+            [ -n "${sw}" ] && curl -fsS -m 15 -H 'Content-Type: application/json' \
+                -d "{\"text\":\"${esc}\"}" "${sw}" >/dev/null 2>&1 || true
+            ;;
+    esac
+    case ",${methods}," in
+        *,webhook,*)
+            local gw
+            gw=$(cfg_read GENERIC_WEBHOOK_URL)
+            [ -n "${gw}" ] && curl -fsS -m 15 -H 'Content-Type: application/json' \
+                -d "{\"status\":\"fatal\",\"host\":\"$(json_escape "${host_label}")\",\"message\":\"${esc}\"}" \
+                "${gw}" >/dev/null 2>&1 || true
+            ;;
+    esac
+    case ",${methods}," in
+        *,email,*)
+            local key domain region sender recipient api
+            key=$(cfg_read MAILGUN_API_KEY);   domain=$(cfg_read MAILGUN_DOMAIN)
+            sender=$(cfg_read SENDER_EMAIL);   recipient=$(cfg_read RECIPIENT_EMAIL)
+            region=$(cfg_read MAILGUN_REGION); region="${region:-EU}"
+            api="https://api.eu.mailgun.net/v3"
+            [ "${region}" = "US" ] && api="https://api.mailgun.net/v3"
+            if [ -n "${key}" ] && [ -n "${domain}" ] && [ -n "${recipient}" ]; then
+                curl -fsS -m 20 --user "api:${key}" \
+                    "${api}/${domain}/messages" \
+                    -F from="${sender:-proxmox@${domain}}" \
+                    -F to="${recipient}" \
+                    -F subject="[proxmox-autoupdate] ${host_label}: run did not start" \
+                    -F text="${text}" >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# --- SELF-DIAGNOSTIC ---
+# Everything the update path silently depends on, checked in one place and
+# reported in plain language. This exists because the failure modes that matter
+# most are the quiet ones: a host whose repositories are broken, a node where
+# pmxcfs is down, an install on a machine that is not a Proxmox host at all. All
+# of those used to end in "all clear" and an empty report.
+#
+# Read-only. Changes nothing, sends nothing, starts nothing.
+DOC_FAIL=0
+DOC_WARN=0
+_d_ok()   { echo "  [ ok ] $1"; }
+_d_warn() { echo "  [warn] $1"; DOC_WARN=$((DOC_WARN + 1)); }
+_d_fail() { echo "  [FAIL] $1"; DOC_FAIL=$((DOC_FAIL + 1)); }
+_d_head() { echo ""; echo "── $1"; }
+
+run_doctor() {
+    echo ""
+    echo "proxmox-autoupdate — self-check (version ${PAU_VERSION})"
+    echo "Nothing is changed by this command."
+
+    _d_head "Host"
+    if [ "$(id -u)" -eq 0 ]; then
+        _d_ok "running as root"
+    else
+        _d_fail "not running as root — the real run needs root for pct, qm and apt"
+    fi
+
+    if command -v pveversion >/dev/null 2>&1 && [ -d /etc/pve ]; then
+        _d_ok "Proxmox VE detected: $(pveversion 2>/dev/null | head -1)"
+    else
+        _d_fail "this is not a Proxmox VE host (pveversion and /etc/pve required)"
+        _d_fail "  → run this on the PVE host itself, not in a VM or container"
+    fi
+
+    local t
+    for t in pct qm pvesh; do
+        command -v "${t}" >/dev/null 2>&1 && _d_ok "${t} found" || _d_fail "${t} not found on PATH"
+    done
+
+    _d_head "Cluster filesystem"
+    if pct list >/dev/null 2>&1; then
+        _d_ok "pct list works ($(pct list 2>/dev/null | awk 'NR>1' | wc -l) container(s))"
+    else
+        _d_fail "pct list failed — containers cannot be enumerated"
+        _d_fail "  → check: systemctl status pve-cluster"
+    fi
+    if qm list >/dev/null 2>&1; then
+        _d_ok "qm list works ($(qm list 2>/dev/null | awk 'NR>1' | wc -l) VM(s))"
+    else
+        _d_fail "qm list failed — VMs cannot be enumerated"
+        _d_fail "  → check: systemctl status pve-cluster"
+    fi
+
+    _d_head "Dependencies"
+    local pkg
+    for t in jq python3 curl flock; do
+        case "${t}" in
+            flock) pkg="util-linux" ;;
+            *)     pkg="${t}" ;;
+        esac
+        command -v "${t}" >/dev/null 2>&1 && _d_ok "${t}" \
+            || _d_fail "${t} missing (required) — apt-get install -y ${pkg}"
+    done
+    command -v systemd-run >/dev/null 2>&1 && _d_ok "systemd-run (needed by --detach)" \
+        || _d_warn "systemd-run missing — --detach will not work"
+    command -v fuser >/dev/null 2>&1 && _d_ok "fuser (used by the panel's run-in-progress guard)" \
+        || _d_warn "fuser missing — apt-get install -y psmisc"
+    command -v linux-version >/dev/null 2>&1 && _d_ok "linux-version (accurate kernel comparison)" \
+        || _d_warn "linux-version missing — apt-get install -y linux-base"
+
+    _d_head "This installation"
+    local installed="/usr/local/bin/update-everything.sh"
+    if [ -f "${installed}" ]; then
+        if head -1 "${installed}" | grep -q '^#!'; then
+            if bash -n "${installed}" 2>/dev/null; then
+                if grep -q '^PAU_VERSION=' "${installed}"; then
+                    _d_ok "${installed} looks like a valid copy of this script"
+                else
+                    _d_fail "${installed} parses but has no PAU_VERSION — it is not this script"
+                fi
+            else
+                _d_fail "${installed} is not valid shell — the download was corrupted"
+                _d_fail "  → reinstall; a proxy or captive portal may have replaced it with an error page"
+            fi
+        else
+            _d_fail "${installed} does not start with #! — it is not a script at all"
+            _d_fail "  → head -3 ${installed}   (probably an HTML error page)"
+        fi
+    else
+        _d_warn "${installed} not present (running from a checkout?)"
+    fi
+
+    _d_head "Configuration"
+    if [ -f "${CONFIG_FILE}" ]; then
+        _d_ok "${CONFIG_FILE} exists"
+        if bash -n "${CONFIG_FILE}" 2>/dev/null; then
+            _d_ok "config parses as shell"
+        else
+            _d_fail "config is not valid shell — the run will abort on it"
+        fi
+        local mode
+        mode=$(stat -c '%a' "${CONFIG_FILE}" 2>/dev/null || echo "?")
+        if [ "${mode}" = "600" ]; then
+            _d_ok "config permissions are 600"
+        else
+            _d_warn "config is mode ${mode}; it holds credentials — chmod 600 ${CONFIG_FILE}"
+        fi
+        local m
+        m=$(cfg_read NOTIFY_METHODS)
+        if [ -z "${m}" ] || [ "${m}" = "none" ]; then
+            _d_warn "no notification channel configured — failures will be silent"
+        else
+            _d_ok "notification methods: ${m}"
+        fi
+        if [ "$(cfg_read DRY_RUN)" = "true" ]; then
+            _d_warn "DRY_RUN=true — scheduled runs report but never install anything"
+        fi
+    else
+        _d_fail "${CONFIG_FILE} not found — run the installer"
+    fi
+
+    _d_head "Host package sources"
+    if [ "$(id -u)" -eq 0 ]; then
+        local apterr rc=0
+        apterr=$(apt-get update -qy 2>&1 >/dev/null) || rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            _d_ok "apt-get update succeeds"
+            local n
+            n=$(LC_ALL=C apt list --upgradable 2>/dev/null | grep -c '/' || true)
+            _d_ok "${n} host package(s) currently upgradable"
+        else
+            _d_fail "apt-get update exited ${rc} — the host cannot be updated"
+            echo "${apterr}" | tail -n 3 | sed 's/^/         /'
+        fi
+    else
+        _d_warn "skipping apt check (needs root)"
+    fi
+    if grep -rqs 'enterprise\.proxmox\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+        if [ -s /etc/subscription ]; then
+            _d_ok "enterprise repository enabled and a subscription is present"
+        else
+            _d_fail "enterprise repository enabled but no subscription — apt will fail every run"
+            _d_fail "  → switch to pve-no-subscription, or disable the enterprise repository"
+        fi
+    fi
+
+    _d_head "Scheduling"
+    if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1 \
+       || systemctl is-active --quiet cron 2>/dev/null; then
+        _d_ok "a cron daemon is running"
+    else
+        _d_fail "no cron daemon is running — nothing will ever trigger a scheduled run"
+        _d_fail "  → systemctl enable --now cron"
+    fi
+    if crontab -l 2>/dev/null | grep -q 'update-everything.sh'; then
+        _d_ok "crontab entry present: $(crontab -l 2>/dev/null | grep 'update-everything.sh' | head -1)"
+    else
+        _d_warn "no crontab entry for update-everything.sh"
+    fi
+
+    _d_head "Runtime state"
+    if [ -e "${LOCKFILE}" ]; then
+        if command -v fuser >/dev/null 2>&1 && fuser "${LOCKFILE}" >/dev/null 2>&1; then
+            _d_warn "a run is in progress right now (lock held)"
+        else
+            _d_ok "lockfile present but not held (normal between runs)"
+        fi
+    else
+        _d_ok "no lockfile"
+    fi
+    local logdir
+    logdir=$(cfg_read LOG_DIR); logdir="${logdir:-/var/log/proxmox-autoupdate}"
+    if [ -d "${logdir}" ] && [ -w "${logdir}" ]; then
+        _d_ok "log directory writable: ${logdir}"
+    else
+        _d_warn "log directory missing or not writable: ${logdir}"
+    fi
+    local avail_root avail_boot
+    avail_root=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "${avail_root}" ] && { [ "${avail_root}" -lt 1024 ] \
+        && _d_warn "only ${avail_root} MB free on / — an upgrade may fail" \
+        || _d_ok "${avail_root} MB free on /"; }
+    if mountpoint -q /boot 2>/dev/null; then
+        avail_boot=$(df -Pm /boot 2>/dev/null | awk 'NR==2{print $4}')
+        [ -n "${avail_boot}" ] && { [ "${avail_boot}" -lt 100 ] \
+            && _d_fail "only ${avail_boot} MB free on /boot — a kernel upgrade will fail" \
+            || _d_ok "${avail_boot} MB free on /boot"; }
+    fi
+    _d_ok "timezone: $(date +%Z) (reboot times are interpreted in this zone)"
+
+    _d_head "Web panel"
+    local uiport
+    uiport=$(cfg_read WEB_UI_PORT); uiport="${uiport:-8007}"
+    if [ "$(cfg_read ENABLE_WEB_UI)" = "true" ]; then
+        if systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
+            _d_ok "panel service is running on port ${uiport}"
+        else
+            _d_fail "panel is enabled in the config but the service is not running"
+            _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
+            if command -v ss >/dev/null 2>&1 && ss -lntH 2>/dev/null | grep -q ":${uiport} "; then
+                _d_fail "  → port ${uiport} is already in use by something else"
+                _d_fail "     (Proxmox Backup Server uses 8007 — pick another port)"
+            fi
+        fi
+    else
+        _d_ok "web panel not enabled"
+    fi
+
+    _d_head "Guests"
+    if qm list >/dev/null 2>&1; then
+        local vid vstate vname
+        while read -r vid vname vstate _; do
+            [ -z "${vid}" ] && continue
+            if [ "${vstate}" = "running" ]; then
+                if qm agent "${vid}" ping >/dev/null 2>&1; then
+                    _d_ok "VM ${vid} (${vname}): guest agent responding"
+                else
+                    _d_warn "VM ${vid} (${vname}): running but the guest agent is not responding — it cannot be updated"
+                fi
+            fi
+        done < <(qm list 2>/dev/null | awk 'NR>1 {print $1, $2, $3}')
+    fi
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+    if [ "${DOC_FAIL}" -gt 0 ]; then
+        echo "  ${DOC_FAIL} problem(s) will stop this working, ${DOC_WARN} warning(s)."
+        echo "  Fix the [FAIL] lines above, then run --doctor again."
+    elif [ "${DOC_WARN}" -gt 0 ]; then
+        echo "  No blocking problems. ${DOC_WARN} warning(s) worth a look."
+    else
+        echo "  Everything checks out."
+    fi
+    echo "────────────────────────────────────────────────────────────"
+    echo ""
+    [ "${DOC_FAIL}" -gt 0 ] && return 1
+    return 0
+}
+
+if [ "${DOCTOR}" = "true" ]; then
+    LOCKFILE="/var/run/proxmox-autoupdate.lock"
+    run_doctor
+    exit $?
+fi
+
+# --- PREFLIGHT ---
+# These checks come before the lockfile, because the lockfile itself needs root
+# and a working flock. Getting them wrong produced a spectacularly misleading
+# error: a non-root run failed to open the lockfile, then ran flock on an
+# unopened descriptor, and reported "Another instance is already running."
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[!] FATAL: this must run as root (it drives pct, qm and apt)."
+    echo "    Try:  sudo $0 $*"
+    exit 1
+fi
+
+if ! command -v flock >/dev/null 2>&1; then
+    echo "[!] FATAL: flock is required but not installed."
+    echo "    Install it with:  apt-get install -y util-linux"
+    exit 1
+fi
+
+# Refuse to run anywhere that is not a Proxmox VE node. Without this the guest
+# loops simply found nothing, and the run reported a clean sweep of zero guests
+# — the exact symptom of installing on plain Debian, on a Proxmox Backup Server,
+# or inside a container on the host rather than on the host itself.
+if [ "${PAU_SKIP_PVE_CHECK:-false}" != "true" ]; then
+    if ! command -v pveversion >/dev/null 2>&1 || [ ! -d /etc/pve ]; then
+        echo "[!] FATAL: this does not look like a Proxmox VE host."
+        echo "    pveversion and /etc/pve are both required."
+        echo "    Run this on the PVE host itself — not inside a VM or container."
+        echo "    Set PAU_SKIP_PVE_CHECK=true to override."
+        exit 1
+    fi
+    for PVE_TOOL in pct qm pvesh; do
+        if ! command -v "${PVE_TOOL}" >/dev/null 2>&1; then
+            echo "[!] FATAL: ${PVE_TOOL} not found on PATH."
+            echo "    This is part of a normal Proxmox VE install; something is wrong."
+            exit 1
+        fi
+    done
+fi
+
 # --- LOCKFILE (prevent concurrent runs) ---
 LOCKFILE="/var/run/proxmox-autoupdate.lock"
-exec 200>"${LOCKFILE}"
+if ! exec 200>"${LOCKFILE}"; then
+    echo "[!] FATAL: could not open the lockfile ${LOCKFILE}"
+    exit 1
+fi
 if ! flock -n 200; then
     echo "[!] Another instance of proxmox-autoupdate is already running. Exiting."
+    echo "    Watch it:  journalctl -fu pve-autoupdate-run"
+    echo "    If nothing is actually running, a previous run was killed; the lock"
+    echo "    clears on its own once that process is gone."
+    notify_fatal "A scheduled run was skipped: another instance still holds the lock on $(hostname -s 2>/dev/null || echo host)."
     exit 1
 fi
 
@@ -273,11 +674,23 @@ run_with_spinner() {
 # CONFIGURATION
 # ==============================================================================
 
-CONFIG_FILE="/etc/proxmox-autoupdate.conf"
+# CONFIG_FILE is set near the top, before the preflight checks, so that the
+# early failure notifier can read it.
 
 if [ ! -f "${CONFIG_FILE}" ]; then
     echo -e "${C_RED}[!] FATAL: Configuration file not found: ${CONFIG_FILE}${C_NC}"
     echo "    Run the installer to create it: curl -sSL https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/main/install.sh | bash"
+    exit 1
+fi
+
+# Refuse to source a config that bash cannot parse, rather than letting the
+# error surface as an unbound-variable abort partway through the assignment
+# block. Anything the panel or installer wrote is single-quoted, but a
+# hand-edited file can still contain anything.
+if ! bash -n "${CONFIG_FILE}" 2>/dev/null; then
+    echo -e "${C_RED}[!] FATAL: ${CONFIG_FILE} is not valid shell and cannot be read.${C_NC}"
+    bash -n "${CONFIG_FILE}" 2>&1 | head -n 3 | sed 's/^/    /'
+    notify_fatal "The configuration file is not valid shell and could not be read. The scheduled run did not start."
     exit 1
 fi
 
@@ -377,8 +790,21 @@ fi
 
 # Optional config values with defaults
 EXCLUDE_IDS="${EXCLUDE_IDS:-}"
-WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT:-1200}"
+WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT:-3600}"
 START_STOPPED_WINDOWS="${START_STOPPED_WINDOWS:-false}"
+
+# How long a Windows guest that this script started gets to shut itself down
+# again, in seconds.
+#
+# Windows runs its servicing stack on shutdown ("Working on updates — do not
+# turn off your computer"), which routinely takes far longer than an ACPI
+# request normally would. This budget is never escalated to a forced stop: if
+# the guest is still going when it expires, it is left running and reported.
+WINDOWS_SHUTDOWN_TIMEOUT="${WINDOWS_SHUTDOWN_TIMEOUT:-900}"
+
+# How long a Linux guest that this script started gets to shut down before it
+# is forcibly stopped.
+LINUX_SHUTDOWN_TIMEOUT="${LINUX_SHUTDOWN_TIMEOUT:-180}"
 START_STOPPED_LXC="${START_STOPPED_LXC:-true}"
 START_STOPPED_LINUX_VMS="${START_STOPPED_LINUX_VMS:-true}"
 REBOOT_TIME="${REBOOT_TIME:-00:00}"
@@ -386,6 +812,11 @@ REBOOT_TIME="${REBOOT_TIME:-00:00}"
 # How long a Linux guest (VM or LXC) gets to finish its upgrade, in seconds.
 # A real dist-upgrade over a slow mirror routinely exceeds five minutes.
 LINUX_UPDATE_TIMEOUT="${LINUX_UPDATE_TIMEOUT:-1800}"
+
+# How long the guest-agent poll loop tolerates exec-status errors before it
+# concludes the agent is gone. A guest that upgrades its own qemu-guest-agent
+# restarts it mid-run, which drops the exec-pid table for a while.
+AGENT_ERROR_GRACE="${AGENT_ERROR_GRACE:-120}"
 
 # How long apt waits for the dpkg/apt lock inside a guest before giving up.
 # Distros with unattended-upgrades enabled (Ubuntu by default) will otherwise
@@ -438,13 +869,35 @@ NOTIFY_ON_FAILURE_ONLY=$(normalise_bool "${NOTIFY_ON_FAILURE_ONLY}")
 
 # Validate the numeric settings — a typo here would otherwise surface as an
 # arithmetic error deep inside a poll loop.
+# SNAPSHOT_KEEP and LOG_RETENTION_DAYS may legitimately be 0 ("keep none" /
+# "keep forever"). The timeouts may not: `timeout 0` means *no limit*, while the
+# guest-agent poll loop clamps to a single poll and declares an instant timeout
+# — so the same 0 means opposite things on the two guest paths, and a host
+# reboot would be suppressed forever by the resulting mid-update count.
 for _NUM_VAR in WINDOWS_UPDATE_TIMEOUT LINUX_UPDATE_TIMEOUT APT_LOCK_TIMEOUT \
-                SNAPSHOT_KEEP LOG_RETENTION_DAYS; do
-    if ! [[ "${!_NUM_VAR}" =~ ^[0-9]+$ ]]; then
+                WINDOWS_SHUTDOWN_TIMEOUT LINUX_SHUTDOWN_TIMEOUT; do
+    if ! [[ "${!_NUM_VAR}" =~ ^[1-9][0-9]*$ ]]; then
         echo -e "${C_RED}[!] FATAL: ${_NUM_VAR} must be a positive integer (got '${!_NUM_VAR}')${C_NC}"
+        notify_fatal "Configuration error: ${_NUM_VAR} must be a positive integer (got '${!_NUM_VAR}'). The scheduled run did not start."
         exit 1
     fi
 done
+for _NUM_VAR in SNAPSHOT_KEEP LOG_RETENTION_DAYS; do
+    if ! [[ "${!_NUM_VAR}" =~ ^[0-9]+$ ]]; then
+        echo -e "${C_RED}[!] FATAL: ${_NUM_VAR} must be a non-negative integer (got '${!_NUM_VAR}')${C_NC}"
+        notify_fatal "Configuration error: ${_NUM_VAR} must be a non-negative integer (got '${!_NUM_VAR}'). The scheduled run did not start."
+        exit 1
+    fi
+done
+
+# REBOOT_TIME is used both to compute a delay and as a fallback argument to
+# shutdown(8). A malformed value made `date -d` fail, which silently disabled
+# the post-kernel-update reboot while the report still claimed one was booked.
+if ! [[ "${REBOOT_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+    echo -e "${C_RED}[!] FATAL: REBOOT_TIME must be HH:MM in 24-hour form (got '${REBOOT_TIME}')${C_NC}"
+    notify_fatal "Configuration error: REBOOT_TIME must be HH:MM (got '${REBOOT_TIME}'). The scheduled run did not start."
+    exit 1
+fi
 
 # ==============================================================================
 # SYSTEM & LOG SETUP
@@ -478,6 +931,7 @@ for TOOL in jq python3; do
     if ! command -v "${TOOL}" >/dev/null 2>&1; then
         echo -e "${C_RED}[!] FATAL: ${TOOL} is required but could not be installed.${C_NC}"
         echo "    Install it manually:  apt-get install -y jq python3"
+        notify_fatal "Missing dependency '${TOOL}' and it could not be installed automatically — probably because apt itself is failing. The scheduled run did not start."
         exit 1
     fi
 done
@@ -590,19 +1044,109 @@ wait_for_agent() {
 # ==============================================================================
 # HELPER: Detect VM operating system via guest agent
 # ==============================================================================
+# Is a Proxmox `ostype` value one of the Windows ones?
+#
+# Proxmox uses: wxp w2k w2k3 w2k8 wvista win7 win8 win10 win11 for Windows, and
+# l24 l26 solaris other for everything else. Matching on the substring "win"
+# therefore missed wxp/w2k/w2k3/w2k8/wvista entirely, which meant those guests
+# were treated as Linux and gated on START_STOPPED_LINUX_VMS (default true)
+# rather than START_STOPPED_WINDOWS (default false) — so a config that
+# explicitly refused to boot stopped Windows guests booted them anyway. Anchor
+# on a leading "w", the same test the web UI patch already uses.
+is_windows_ostype() {
+    echo "${1:-}" | grep -qiE '^w'
+}
+
+# Classify a running guest. `ostype` from the VM config is authoritative when it
+# is set to a Windows value: it is what the administrator declared, it is
+# available without talking to the guest, and it cannot be spoofed by the guest.
+# The agent probe is only used to refine "not declared Windows".
+#
+# Returns: windows | linux | unknown
+#
+# "unknown" matters. This used to fall back to "linux" whenever the probe failed
+# or returned nothing, which sent Windows guests down the Linux path, where the
+# exec of /bin/bash fails and the guest is reported as a generic agent error —
+# and, more importantly, is never actually patched.
 detect_vm_os() {
     local vmid="$1"
+    local ostype=""
+    ostype=$(config_field qm "${vmid}" ostype)
+    if is_windows_ostype "${ostype}"; then
+        echo "windows"
+        return
+    fi
+
     local os_info=""
     os_info=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/get-osinfo" \
         --output-format json 2>/dev/null) || true
 
     if [ -n "$os_info" ]; then
-        if echo "$os_info" | grep -qi "mswindows\|windows\|microsoft"; then
+        # Match the machine-readable id field rather than grepping the whole
+        # blob: "pretty-name":"Microsoft Azure Linux 3.0" is not Windows, but a
+        # blob-wide search for "microsoft" said it was.
+        local os_id=""
+        os_id=$(echo "${os_info}" | jq -r '.id // empty' 2>/dev/null || true)
+        if [ -n "${os_id}" ]; then
+            case "${os_id}" in
+                mswindows|windows) echo "windows"; return ;;
+                *)                 echo "linux";   return ;;
+            esac
+        fi
+        # No usable id — fall back to the old substring test on the name fields.
+        if echo "$os_info" | grep -qi "mswindows"; then
             echo "windows"
             return
         fi
+        echo "linux"
+        return
     fi
-    echo "linux"
+
+    # The probe gave us nothing at all. Say so rather than guessing Linux.
+    if [ -n "${ostype}" ] && [ "${ostype}" != "other" ]; then
+        echo "linux"
+        return
+    fi
+    echo "unknown"
+}
+
+# Return a VM that this script started back to its stopped state.
+#
+# The distinction that matters here is Windows. A Windows guest may be running
+# its servicing stack — installing or rolling back updates — during shutdown,
+# and cutting power at that point is the one action in this whole script that
+# can leave a guest unbootable. So Windows gets a much longer budget and is
+# *never* escalated to `qm stop`; if it will not stop in time it is left running
+# and counted as mid-update, which also suppresses the host reboot.
+#
+# Linux guests keep the previous behaviour: ask, wait, then force.
+restore_stopped_vm() {
+    local vmid="$1" name="$2" ostype="${3:-linux}"
+
+    if [ "${DRY_RUN}" = "true" ]; then
+        print_skip "VM ${vmid} (${name}) — would be stopped again ${C_DIM}[dry run]${C_NC}"
+        return 0
+    fi
+
+    print_stop "Stopping VM ${vmid} (${name}) ${C_DIM}[restoring state]${C_NC}..."
+    qm shutdown "${vmid}" >/dev/null 2>&1 || true
+
+    local budget="${LINUX_SHUTDOWN_TIMEOUT}"
+    [ "${ostype}" = "windows" ] && budget="${WINDOWS_SHUTDOWN_TIMEOUT}"
+
+    if wait_for_status "vm" "${vmid}" "stopped" "${budget}"; then
+        return 0
+    fi
+
+    if [ "${ostype}" = "windows" ]; then
+        print_warn "VM ${vmid} (${name}) — still shutting down after ${budget}s; left running to finish safely"
+        GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+        return 1
+    fi
+
+    print_warn "VM ${vmid} (${name}) — ACPI shutdown timeout, forcing stop..."
+    qm stop "${vmid}" >/dev/null 2>&1 || true
+    return 1
 }
 
 # ==============================================================================
@@ -662,8 +1206,15 @@ take_snapshot() {
 #   __DETAIL__ <text>                 one-line reason when FAIL
 #   __LOG__ <text>                    trailing diagnostic output
 #
-# Everything is read from stdin by /bin/bash, so each command gets </dev/null to
+# Everything is read from stdin by /bin/sh, so each command gets </dev/null to
 # stop apt from swallowing the rest of this script off the shared stdin.
+#
+# This body must stay POSIX: it is executed with /bin/sh, which is dash on
+# Debian and BusyBox ash on Alpine. It was previously piped into /bin/bash,
+# which Alpine does not ship at all — so every Alpine guest failed its exec,
+# reported "update did not report a result", and accumulated a permanent
+# failure streak, while the apk branch below was unreachable. Nothing here
+# needs bash. `sh -n` over the generated output is enforced in CI.
 build_guest_update_script() {
     cat <<GUESTSCRIPT
 export DEBIAN_FRONTEND=noninteractive
@@ -680,8 +1231,18 @@ WORK_LOG=\$(mktemp 2>/dev/null || echo /tmp/.pau_log)
 emit_log() { tail -n 20 "\${WORK_LOG}" 2>/dev/null | sed 's/^/__LOG__ /' || true; }
 
 # Package name -> "old -> new" from \`apt list --upgradable\` output.
+#
+# LC_ALL=C because the caller parses the literal English string
+# "upgradable from:" out of this; under any other locale apt translates it and
+# the old-version column is silently lost.
+#
+# Sets LIST_RC so the caller can tell "nothing to upgrade" from "apt failed" —
+# both of which produce empty output.
+LIST_RC=0
 list_upgradable() {
-    apt list --upgradable 2>/dev/null | grep '/' || true
+    _lu_out=\$(LC_ALL=C apt list --upgradable 2>/dev/null)
+    LIST_RC=\$?
+    echo "\${_lu_out}" | grep '/' || true
 }
 
 # Turn "pkg/suite 2.0 amd64 [upgradable from: 1.0]" into "__PKG__ pkg (1.0 -> 2.0)".
@@ -708,13 +1269,17 @@ if command -v apt-get >/dev/null 2>&1; then
     UPDATE_RC=1
     ATTEMPT=1
     while [ \${ATTEMPT} -le 5 ]; do
-        if apt-get \${APT_OPTS} update -qy </dev/null >"\${WORK_LOG}" 2>&1; then
-            UPDATE_RC=0
-            break
-        fi
+        # Capture the status directly from apt-get. Assigning \$? on the line
+        # after the closing \`fi\` read the exit status of the *if compound*
+        # instead, and an \`if\` whose condition is false with no \`else\` exits 0
+        # — so UPDATE_RC was always 0, the FAIL branch below was unreachable,
+        # and a guest that could not reach its mirrors at all reported success
+        # with zero packages.
+        apt-get \${APT_OPTS} update -qy </dev/null >"\${WORK_LOG}" 2>&1
         UPDATE_RC=\$?
-        sleep 5
+        [ \${UPDATE_RC} -eq 0 ] && break
         ATTEMPT=\$((ATTEMPT + 1))
+        [ \${ATTEMPT} -le 5 ] && sleep 5
     done
 
     if [ \${UPDATE_RC} -ne 0 ]; then
@@ -725,6 +1290,14 @@ if command -v apt-get >/dev/null 2>&1; then
     fi
 
     BEFORE=\$(list_upgradable)
+
+    # An empty list means "nothing to upgrade" only if apt actually succeeded.
+    if [ \${LIST_RC} -ne 0 ]; then
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ apt list --upgradable failed (exit \${LIST_RC}) — package state unknown"
+        emit_log
+        exit 0
+    fi
 
     if [ -z "\${BEFORE}" ]; then
         echo "__RESULT__ OK"
@@ -836,52 +1409,86 @@ guest_exec_wait() {
 
     GX_STATE="timeout"
     GX_EXITCODE=""
+    GX_SIGNAL=""
     GX_OUT=""
     GX_ERR=""
 
-    local max_polls=$(( timeout / poll_interval ))
-    [ "${max_polls}" -lt 1 ] && max_polls=1
-    local wait_count=0
+    # Budget against the wall clock, not against a poll count.
+    #
+    # This used to be max_polls = timeout / poll_interval, which charged only
+    # the sleeps and never the pvesh round-trip. With a 1800s setting and a
+    # ~0.5-1.5s API call per poll the real budget was closer to 2000-2300s, so
+    # the configured timeout did not mean what it said — and it meant something
+    # different again on the LXC path, which uses a real timeout(1).
+    local deadline=$(( $(date +%s) + timeout ))
     local consecutive_failures=0
+    local first_failure_at=0
     local parse_failures=0
 
-    while [ ${wait_count} -lt ${max_polls} ]; do
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
         local exec_status=""
         if ! exec_status=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec-status" \
                 --pid "${exec_pid}" --output-format json 2>/dev/null); then
-            # A single hiccup on the API or the agent socket is not a failed
-            # update. Only give up after three consecutive misses.
+            # A hiccup on the API or the agent socket is not a failed update.
+            #
+            # Three consecutive misses was about fifteen seconds, which is far
+            # too little: a Linux guest upgrading its own qemu-guest-agent
+            # restarts the agent mid-run and drops the exec-pid table, and any
+            # brief pvedaemon stall looks identical. Giving up here marks the
+            # guest mid-update, which also cancels the host's kernel reboot for
+            # the night. Tolerate it for a couple of minutes, and confirm with a
+            # ping before declaring the agent gone.
             consecutive_failures=$((consecutive_failures + 1))
-            if [ ${consecutive_failures} -ge 3 ]; then
-                GX_STATE="apierror"
-                return
+            [ "${first_failure_at}" -eq 0 ] && first_failure_at=$(date +%s)
+            if [ $(( $(date +%s) - first_failure_at )) -ge "${AGENT_ERROR_GRACE}" ]; then
+                if ! qm agent "${vmid}" ping >/dev/null 2>&1; then
+                    GX_STATE="apierror"
+                    return
+                fi
+                # Agent is alive; the exec record is what we lost. Keep waiting.
+                first_failure_at=$(date +%s)
             fi
-            sleep ${poll_interval}
-            wait_count=$((wait_count + 1))
+            sleep "${poll_interval}"
             continue
         fi
         consecutive_failures=0
+        first_failure_at=0
 
         # A reply that isn't JSON will never become JSON on a later poll — it
         # means --output-format json isn't being honoured. Fail fast and say so,
         # rather than silently burning the whole timeout and reporting a bogus
         # "timed out" for an update that actually ran.
+        # An empty reply is a parse failure too. jq exits 0 on empty input and
+        # prints nothing, so `exited` came back empty, the case below matched
+        # nothing, and the loop burned the entire timeout before reporting a
+        # bogus "timed out" — exactly what the comment above says it avoids.
         local exited=""
-        if ! exited=$(echo "${exec_status}" | jq -r '.exited // empty' 2>/dev/null); then
+        if [ -z "${exec_status}" ] || \
+           ! exited=$(echo "${exec_status}" | jq -re '.exited' 2>/dev/null); then
             parse_failures=$((parse_failures + 1))
             if [ ${parse_failures} -ge 2 ]; then
                 GX_STATE="badjson"
                 GX_OUT="${exec_status}"
                 return
             fi
-            sleep ${poll_interval}
-            wait_count=$((wait_count + 1))
+            sleep "${poll_interval}"
             continue
         fi
 
         case "${exited}" in
             1|true)
-                GX_EXITCODE=$(echo "${exec_status}" | jq -r '.exitcode // 0' 2>/dev/null || echo 0)
+                GX_EXITCODE=$(echo "${exec_status}" | jq -r '.exitcode // empty' 2>/dev/null || true)
+                # A process killed by a signal reports `signal`, not `exitcode`.
+                # Defaulting to 0 hid that entirely, so an OOM-killed upgrade
+                # looked like a clean exit.
+                GX_SIGNAL=$(echo "${exec_status}" | jq -r '.signal // empty' 2>/dev/null || true)
+                if [ -z "${GX_EXITCODE}" ]; then
+                    if [ -n "${GX_SIGNAL}" ]; then
+                        GX_EXITCODE="signal:${GX_SIGNAL}"
+                    else
+                        GX_EXITCODE="0"
+                    fi
+                fi
                 GX_OUT=$(echo "${exec_status}" | jq -r '."out-data" // empty' 2>/dev/null || true)
                 GX_ERR=$(echo "${exec_status}" | jq -r '."err-data" // empty' 2>/dev/null || true)
                 # Flag truncation so a clipped package list isn't mistaken for a
@@ -895,8 +1502,7 @@ __LOG__ (output truncated by the guest agent)"
                 ;;
         esac
 
-        sleep ${poll_interval}
-        wait_count=$((wait_count + 1))
+        sleep "${poll_interval}"
     done
 
     GX_STATE="timeout"
@@ -1068,6 +1674,14 @@ print(", ".join("%s (%s) x%d" % (g.get("name") or "guest", gid,
 # A failing notification never fails the run. The updates already happened; not
 # being able to talk about them is a lesser problem, reported and moved past.
 
+# >>> PAU-NOTIFIER-BEGIN
+# Everything between these markers is lifted verbatim by the web panel's "Send
+# test notification", so that a test exercises the real notifier rather than a
+# copy of it. Keep the whole notifier inside them: a helper left outside is not
+# a compile error, it is a function that is simply missing at run time.
+#
+# ci/invariants.sh enforces that every function the panel requires is in here.
+
 # Plain-text summary shared by all the webhook channels.
 build_text_summary() {
     local status_line
@@ -1099,11 +1713,6 @@ build_text_summary() {
     fi
 }
 
-# >>> PAU-NOTIFIER-BEGIN
-# Everything between these markers is lifted verbatim by the web panel's "Send
-# test notification", so that a test exercises the real notifier rather than a
-# copy of it. Keep the whole notifier inside them: a helper left outside is not
-# a compile error, it is a function that is simply missing at run time.
 
 # ---- Keeping credentials out of the process list ----
 # A process's full command line is readable from /proc by any local user, so an
@@ -1498,12 +2107,13 @@ notify_webhook() {
     post_webhook "Webhook" "${GENERIC_WEBHOOK_URL}" "$(build_payload generic "$1" "$2")"
 }
 
-# <<< PAU-NOTIFIER-END
-
 notify_all() {
     local subject="$1" body="$2" html_file="$3"
-    start_spinner "Sending notifications (${NOTIFY_ACTIVE})..."
-    stop_spinner
+    # The spinner helpers live outside this block. Guard the calls so the block
+    # stays sourceable on its own, which is how the panel's test-notification
+    # button runs it.
+    command -v start_spinner >/dev/null 2>&1 && start_spinner "Sending notifications (${NOTIFY_ACTIVE})..."
+    command -v stop_spinner  >/dev/null 2>&1 && stop_spinner
     local channel
     for channel in ${NOTIFY_ACTIVE}; do
         case "${channel}" in
@@ -1514,6 +2124,7 @@ notify_all() {
         esac
     done
 }
+# <<< PAU-NOTIFIER-END
 
 # ==============================================================================
 # HELPER: Escape text for inclusion in the HTML report
@@ -1594,7 +2205,7 @@ update_linux_vm() {
 
     local exec_result=""
     if ! exec_result=$(pvesh create "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec" \
-            --command "/bin/bash" \
+            --command "/bin/sh" \
             --'input-data' "$(build_guest_update_script)" \
             --output-format json 2>&1); then
         GU_DETAIL="guest agent rejected the exec request: $(echo "${exec_result}" | tail -1)"
@@ -1649,11 +2260,26 @@ update_windows_vm() {
 
     # PowerShell script for Windows Update (uses COM objects, no modules needed)
     local ps_script='
-$ErrorActionPreference = "SilentlyContinue"
+# Stop, not SilentlyContinue. With SilentlyContinue a non-terminating COM
+# failure does not throw, so the catch below never ran: $SearchResult could be
+# $null, `$null.Updates.Count -eq 0` evaluates to False in PowerShell, and
+# execution fell through to report "UPDATED:" with an empty count — a
+# successful update of a guest that installed nothing.
+$ErrorActionPreference = "Stop"
+# Redirected stdout is otherwise encoded with the console OEM code page, which
+# mangles non-ASCII update titles by the time they reach the report.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
 try {
     $Session = New-Object -ComObject Microsoft.Update.Session
     $Searcher = $Session.CreateUpdateSearcher()
     $SearchResult = $Searcher.Search("IsInstalled=0 and Type='"'"'Software'"'"'")
+    if ($null -eq $SearchResult -or $null -eq $SearchResult.Updates) {
+        Write-Output "ERROR:Windows Update search returned no result object"
+        exit 0
+    }
     if ($SearchResult.Updates.Count -eq 0) {
         Write-Output "NO_UPDATES"
         exit 0
@@ -1673,6 +2299,10 @@ try {
     $Downloader = $Session.CreateUpdateDownloader()
     $Downloader.Updates = $SearchResult.Updates
     $DownloadResult = $Downloader.Download()
+    if ($DownloadResult.ResultCode -ne 2) {
+        Write-Output "ERROR:Download returned result code $($DownloadResult.ResultCode) (HRESULT $($DownloadResult.HResult))"
+        exit 0
+    }
     $Installer = New-Object -ComObject Microsoft.Update.UpdateInstaller
     $Installer.Updates = $SearchResult.Updates
     $InstallResult = $Installer.Install()
@@ -1683,6 +2313,10 @@ try {
     Write-Output "UPDATED:$Count"
     foreach ($name in $Names) {
         Write-Output $name
+    }
+    # Last, so it cannot disturb the "first line is UPDATED:<count>" contract.
+    if ($InstallResult.RebootRequired) {
+        Write-Output "__REBOOT_PENDING__"
     }
 } catch {
     Write-Output "ERROR:$($_.Exception.Message)"
@@ -1706,7 +2340,7 @@ ${ps_script}"
     # Execute via guest agent
     local exec_result=""
     exec_result=$(pvesh create "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec" \
-        --command "powershell.exe -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded_cmd}" \
+        --command "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded_cmd}" \
         --output-format json 2>&1) || {
         echo "EXEC_FAILED"
         return
@@ -1762,10 +2396,41 @@ fi
 section_header "LXC Containers"
 LXC_HTML=""
 
-for CTID in $(pct list | awk 'NR>1 {print $1}'); do
+# Enumerate first and check the exit status, rather than iterating over the
+# output of an unchecked command substitution.
+#
+# `set -e` is deliberately off, so a failing `pct list` used to produce an empty
+# word list, the loop body simply never ran, every counter stayed at zero, and
+# the run finished by printing "Update sequence complete — all clear". That is
+# what happens whenever pmxcfs is unhappy — pve-cluster failed to start after a
+# full disk, /etc/pve not mounted, a quorum-less node — and the host apt phase
+# still works, so the whole run looks normal while nothing was even looked at.
+CT_LIST=""
+CT_LIST_OK=true
+if ! CT_LIST=$(pct list 2>&1); then
+    print_fail "Could not list containers: $(echo "${CT_LIST}" | tail -n 1)"
+    print_fail "Is pve-cluster running?  systemctl status pve-cluster"
+    ERRORS_OCCURRED=true
+    CT_LIST_OK=false
+    LXC_HTML="<tr><td colspan='3'>Container list unavailable — <code>pct list</code> failed. No containers were examined.</td></tr>"
+    CT_LIST=""
+fi
+
+for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
     is_targeted "${CTID}" || continue
     CT_NAME=$(config_field pct "${CTID}" hostname)
     [ -z "${CT_NAME}" ] && CT_NAME="LXC-${CTID}"
+
+    # Templates are not updatable objects. They appear in `pct list` as stopped,
+    # so with START_STOPPED_LXC=true (the default) every run tried to `pct start`
+    # them, Proxmox refused, and each one became a permanent error and a
+    # permanent "repeat offender" — turning every report red on any host that
+    # keeps a template, which is most of them.
+    if [ "$(config_field pct "${CTID}" template)" = "1" ]; then
+        print_skip "LXC ${CTID} (${CT_NAME}) — template"
+        continue
+    fi
+
     CT_STATUS=$(pct status "${CTID}" | awk '{print $2}')
     CT_WAS_STOPPED=false
 
@@ -1786,6 +2451,16 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
             LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})</td><td><span class='status-badge badge-warning'>Skipped</span></td><td>Stopped container — auto-start disabled in config.</td></tr>"
             continue
         fi
+        # A dry run reports; it does not change the state of the machine.
+        # Booting every stopped guest, waiting a minute each, then stopping them
+        # again is emphatically a change — and --help promises the opposite.
+        if [ "${DRY_RUN}" = "true" ]; then
+            print_skip "LXC ${CTID} (${CT_NAME}) — stopped; would be started and checked ${C_DIM}[dry run]${C_NC}"
+            LXC_SKIPPED=$((LXC_SKIPPED + 1))
+            LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})</td><td><span class='status-badge badge-dim'>Skipped</span></td><td>Stopped container. A real run would start it, update it and stop it again.</td></tr>"
+            continue
+        fi
+
         print_action "Starting LXC ${CTID} (${CT_NAME}) ${C_DIM}[was stopped]${C_NC}..."
 
         if pct start "${CTID}" >/dev/null 2>&1; then
@@ -1839,7 +2514,7 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
     start_spinner "Updating LXC ${CTID} (${CT_NAME})..."
     CT_OUTPUT=""
     CT_RC=0
-    CT_OUTPUT=$(build_guest_update_script | timeout "${LINUX_UPDATE_TIMEOUT}" pct exec "${CTID}" -- /bin/bash 2>&1) || CT_RC=$?
+    CT_OUTPUT=$(build_guest_update_script | timeout -k 60 "${LINUX_UPDATE_TIMEOUT}" pct exec "${CTID}" -- /bin/sh 2>&1) || CT_RC=$?
     stop_spinner
 
     if [ "${CT_RC}" -eq 124 ]; then
@@ -1906,13 +2581,16 @@ for CTID in $(pct list | awk 'NR>1 {print $1}'); do
     esac
 
     # Restore stopped state if needed
-    if [ "${CT_WAS_STOPPED}" = true ]; then
+    if [ "${CT_WAS_STOPPED}" = true ] && [ "${DRY_RUN}" != "true" ]; then
         print_stop "Stopping LXC ${CTID} (${CT_NAME}) ${C_DIM}[restoring state]${C_NC}..."
-        pct shutdown "${CTID}" >/dev/null 2>&1 || pct stop "${CTID}" >/dev/null 2>&1 || true
-        wait_for_status "ct" "${CTID}" "stopped" 120 || {
+        # `pct shutdown` blocks for its own timeout and then exits non-zero, so
+        # `|| pct stop` fired an immediate force-stop and the wait below was
+        # dead weight. Ask first, wait properly, and only then force.
+        pct shutdown "${CTID}" >/dev/null 2>&1 || true
+        if ! wait_for_status "ct" "${CTID}" "stopped" "${LINUX_SHUTDOWN_TIMEOUT}"; then
             print_warn "LXC ${CTID} — shutdown timeout, forcing stop..."
             pct stop "${CTID}" >/dev/null 2>&1 || true
-        }
+        fi
     fi
 done
 
@@ -1922,10 +2600,30 @@ done
 section_header "Virtual Machines"
 VM_HTML=""
 
-for VMID in $(qm list | awk 'NR>1 {print $1}'); do
+# Same reasoning as the container list above: a failed `qm list` must be an
+# error, not an empty sweep reported as success.
+VM_LIST=""
+VM_LIST_OK=true
+if ! VM_LIST=$(qm list 2>&1); then
+    print_fail "Could not list VMs: $(echo "${VM_LIST}" | tail -n 1)"
+    print_fail "Is pve-cluster running?  systemctl status pve-cluster"
+    ERRORS_OCCURRED=true
+    VM_LIST_OK=false
+    VM_HTML="<tr><td colspan='3'>VM list unavailable — <code>qm list</code> failed. No VMs were examined.</td></tr>"
+    VM_LIST=""
+fi
+
+for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
     is_targeted "${VMID}" || continue
     VM_NAME=$(config_field qm "${VMID}" name)
     [ -z "${VM_NAME}" ] && VM_NAME="VM-${VMID}"
+
+    # As above: a template is not something to boot and patch.
+    if [ "$(config_field qm "${VMID}" template)" = "1" ]; then
+        print_skip "VM ${VMID} (${VM_NAME}) — template"
+        continue
+    fi
+
     VM_STATUS=$(qm status "${VMID}" | awk '{print $2}')
     VM_WAS_STOPPED=false
     VM_OS_TYPE="linux"
@@ -1944,7 +2642,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
 
         # Check if this is a Windows VM before starting (from config)
         VM_OSTYPE_CONFIG=$(config_field qm "${VMID}" ostype)
-        if echo "${VM_OSTYPE_CONFIG}" | grep -qi "win"; then
+        if is_windows_ostype "${VM_OSTYPE_CONFIG}"; then
             VM_OS_TYPE="windows"
             # Respect START_STOPPED_WINDOWS setting
             if [ "${START_STOPPED_WINDOWS}" != "true" ]; then
@@ -1963,6 +2661,14 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             fi
         fi
 
+        # See the container loop: a dry run must not boot the machine.
+        if [ "${DRY_RUN}" = "true" ]; then
+            print_skip "VM ${VMID} (${VM_NAME}) — stopped; would be started and checked ${C_DIM}[dry run]${C_NC}"
+            VM_SKIPPED=$((VM_SKIPPED + 1))
+            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-dim'>Skipped</span></td><td>Stopped VM. A real run would start it, update it and stop it again.</td></tr>"
+            continue
+        fi
+
         print_action "Starting VM ${VMID} (${VM_NAME}) ${C_DIM}[was stopped]${C_NC}..."
 
         if qm start "${VMID}" >/dev/null 2>&1; then
@@ -1979,10 +2685,15 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                     ERRORS_OCCURRED=true
                     record_guest_failure "${VMID}" "${VM_NAME}" "guest agent not responding"
                     VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Agent Timeout</span></td><td>VM started but QEMU Guest Agent did not respond within ${agent_timeout} seconds.</td></tr>"
-                    # Shut it back down
-                    print_stop "Stopping VM ${VMID} (${VM_NAME}) ${C_DIM}[restoring state]${C_NC}..."
-                    qm shutdown "${VMID}" >/dev/null 2>&1 || true
-                    wait_for_status "vm" "${VMID}" "stopped" 120 || qm stop "${VMID}" >/dev/null 2>&1 || true
+                    # Shut it back down.
+                    #
+                    # Never force-stop a Windows guest here. The most likely
+                    # reason a Windows VM we just started has no guest agent is
+                    # that it is sitting at "Configuring Windows updates" from a
+                    # previous cycle — which is precisely when pulling the power
+                    # corrupts it. Ask politely, and if it will not go, leave it
+                    # running and say so.
+                    restore_stopped_vm "${VMID}" "${VM_NAME}" "${VM_OS_TYPE}"
                     continue
                 fi
                 stop_spinner
@@ -2018,6 +2729,19 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
         VM_OS_TYPE=$(detect_vm_os "${VMID}")
     fi
 
+    # An OS we could not identify must not be guessed at. Running the Linux
+    # payload against a Windows guest silently leaves it unpatched, and running
+    # it against anything else is a shot in the dark.
+    if [ "${VM_OS_TYPE}" = "unknown" ]; then
+        print_fail "VM ${VMID} (${VM_NAME}) — could not determine the guest OS"
+        VM_ERRORS=$((VM_ERRORS + 1))
+        ERRORS_OCCURRED=true
+        record_guest_failure "${VMID}" "${VM_NAME}" "could not determine guest OS"
+        VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Unknown OS</span></td><td>The guest agent returned no OS information and <code>ostype</code> is not set in the VM config. Set <code>ostype</code> so the correct update method is used.</td></tr>"
+        [ "${VM_WAS_STOPPED}" = true ] && restore_stopped_vm "${VMID}" "${VM_NAME}" "linux"
+        continue
+    fi
+
     # Build display suffix
     local_suffix=""
     [ "${VM_WAS_STOPPED}" = true ] && local_suffix=" ${C_DIM}[was stopped]${C_NC}"
@@ -2048,7 +2772,15 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
     if [ "${VM_OS_TYPE}" = "windows" ]; then
         # ---- WINDOWS VM UPDATE ----
         start_spinner "Updating VM ${VMID} (${VM_NAME}) [Windows]..."
-        WIN_OUTPUT=$(update_windows_vm "${VMID}" "${WINDOWS_UPDATE_TIMEOUT}")
+        # Strip carriage returns once, here, rather than in each branch below.
+        # PowerShell terminates every line with CRLF, and command substitution
+        # removes the trailing newline but never the CR. That left WIN_OUTPUT as
+        # "NO_UPDATES\r", so the exact-equality test against "NO_UPDATES" was
+        # false for every healthy Windows guest and each one was reported as an
+        # unrecognised-output error on every run. It also left stray CRs inside
+        # the extracted counts and update titles, which corrupted the console
+        # output and the HTML report.
+        WIN_OUTPUT=$(update_windows_vm "${VMID}" "${WINDOWS_UPDATE_TIMEOUT}" | tr -d '\r')
         stop_spinner
 
         if [ "${WIN_OUTPUT}" = "EXEC_FAILED" ] || [ "${WIN_OUTPUT}" = "ENCODE_FAILED" ]; then
@@ -2070,6 +2802,14 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_warn "VM ${VMID} (${VM_NAME}) — Windows Update timed out after ${WINDOWS_UPDATE_TIMEOUT}s${local_suffix}"
             VM_WIN_TIMEOUT=$((VM_WIN_TIMEOUT + 1))
             GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+            # A timeout leaves the guest in an unknown state, so it has to count
+            # as a failure. It previously set no error flag at all, which meant
+            # the run was recorded as "ok", a failure-only notification stayed
+            # silent, and — because the id never reached FAILED_THIS_RUN — any
+            # existing failure streak for this guest was reset to zero.
+            VM_ERRORS=$((VM_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "Windows Update timed out after ${WINDOWS_UPDATE_TIMEOUT}s"
             # Don't shut down a Windows VM mid-update! Leave it running.
             VM_WAS_STOPPED=false
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Windows Update did not complete within ${WINDOWS_UPDATE_TIMEOUT}s. VM left running to finish.</td></tr>"
@@ -2091,11 +2831,31 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td><strong>${WIN_COUNT} update(s) would be installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
         elif echo "${WIN_OUTPUT}" | grep -q "^UPDATED:"; then
             WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^UPDATED://')
-            WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2)
+            WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2 | grep -v '^__REBOOT_PENDING__$' || true)
+            WIN_REBOOT_PENDING=false
+            echo "${WIN_OUTPUT}" | grep -q '^__REBOOT_PENDING__$' && WIN_REBOOT_PENDING=true
             print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${WIN_COUNT} Windows updates installed${C_NC}${local_suffix}"
             VM_WIN_UPDATED=$((VM_WIN_UPDATED + 1))
             VM_UPDATED=$((VM_UPDATED + 1))
-            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${WIN_COUNT} update(s) installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
+            WIN_LEFT_RUNNING=""
+            if [ "${WIN_REBOOT_PENDING}" = true ]; then
+                WIN_LEFT_RUNNING=" Windows reports a reboot is required to finish installing."
+            fi
+            if [ "${VM_WAS_STOPPED}" = true ]; then
+                # This is the dangerous case, and it used to be the unguarded
+                # one. Updates have just been written and a servicing reboot is
+                # pending, so the guest is about to spend a long time in
+                # "Working on updates — do not turn off your computer". The
+                # restore-state block below would ask it to shut down and then
+                # force-stop it a few minutes later, cutting power in the middle
+                # of that. Leave it running instead and let it settle; the next
+                # scheduled run will find it idle and stop it then.
+                print_warn "VM ${VMID} (${VM_NAME}) — left running to finish installing (was stopped)"
+                VM_WAS_STOPPED=false
+                GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+                WIN_LEFT_RUNNING="${WIN_LEFT_RUNNING} It was started by this run and has been left running to complete servicing safely; it will be returned to its stopped state once it settles."
+            fi
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${WIN_COUNT} update(s) installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul>${WIN_LEFT_RUNNING}</td></tr>"
         else
             # Unrecognised output means the PowerShell script did not finish.
             # Treating that as "up to date" would hide a broken guest.
@@ -2190,12 +2950,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
 
     # Restore stopped state if needed
     if [ "${VM_WAS_STOPPED}" = true ]; then
-        print_stop "Stopping VM ${VMID} (${VM_NAME}) ${C_DIM}[restoring state]${C_NC}..."
-        qm shutdown "${VMID}" >/dev/null 2>&1 || true
-        if ! wait_for_status "vm" "${VMID}" "stopped" 180; then
-            print_warn "VM ${VMID} — ACPI shutdown timeout, forcing stop..."
-            qm stop "${VMID}" >/dev/null 2>&1 || true
-        fi
+        restore_stopped_vm "${VMID}" "${VM_NAME}" "${VM_OS_TYPE}"
     fi
 done
 
@@ -2230,12 +2985,35 @@ export NEEDRESTART_SUSPEND=1
 
 start_spinner "Checking for host updates..."
 HOST_UPDATE_RC=0
-apt-get "${HOST_APT_OPTS[@]}" update -qy >/dev/null 2>&1 || HOST_UPDATE_RC=$?
-HOST_UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep '/' || true)
+HOST_APT_ERR=$(apt-get "${HOST_APT_OPTS[@]}" update -qy 2>&1 >/dev/null) || HOST_UPDATE_RC=$?
+HOST_UPGRADABLE=$(LC_ALL=C apt list --upgradable 2>/dev/null | grep '/' || true)
 stop_spinner
 
+# A refresh that failed means the package list cannot be trusted, so nothing
+# below may claim the host is up to date.
+#
+# This used to be a print_warn and nothing else: ERRORS_OCCURRED was never set,
+# so with an empty or stale index the host was badged "No Updates", the report
+# said "Host node is fully up to date", the run was recorded as ok, and a
+# failure-only notification stayed silent. On the single most common Proxmox
+# homelab misconfiguration — the enterprise repo enabled without a subscription
+# — every pve-* package went unpatched for months behind a green tick.
+HOST_REPO_WARNING=""
 if [ "${HOST_UPDATE_RC}" -ne 0 ]; then
-    print_warn "Host apt-get update exited ${HOST_UPDATE_RC} — package list may be stale"
+    print_fail "Host apt-get update exited ${HOST_UPDATE_RC} — the package list is stale"
+    ERRORS_OCCURRED=true
+    HOST_REPO_WARNING="apt-get update exited ${HOST_UPDATE_RC}, so the package list could not be refreshed and updates may have been missed."
+
+    if grep -rqs 'enterprise\.proxmox\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+       && [ ! -s /etc/subscription ]; then
+        print_fail "The Proxmox enterprise repository is enabled but there is no subscription."
+        print_fail "Switch to the no-subscription repository, or disable the enterprise one."
+        HOST_REPO_WARNING="${HOST_REPO_WARNING} The Proxmox <em>enterprise</em> repository is enabled without a subscription, which makes this fail on every run. Switch to <code>pve-no-subscription</code> or disable the enterprise repository."
+    fi
+
+    if [ -n "${HOST_APT_ERR}" ]; then
+        echo "${HOST_APT_ERR}" | tail -n 5 | sed 's/^/      /'
+    fi
 fi
 
 if [ -n "${HOST_UPGRADABLE}" ]; then
@@ -2273,10 +3051,22 @@ if [ -n "${HOST_UPGRADABLE}" ]; then
             print_fail "${C_RED}Host apt-get dist-upgrade FAILED (exit ${HOST_APT_RC}) — reboot will NOT be scheduled${C_NC}"
         fi
     fi
+elif [ "${HOST_UPDATE_RC}" -ne 0 ]; then
+    # Empty list *and* a failed refresh. "Up to date" would be a guess, and the
+    # wrong one on any host whose repositories are misconfigured.
+    print_fail "Host package list could not be refreshed — update status unknown"
+    HOST_STATUS_BADGE="<span class='status-badge badge-error'>Repo Error</span>"
+    HOST_SUMMARY_TEXT="<strong>Could not determine host update status.</strong> ${HOST_REPO_WARNING}"
 else
     print_ok "Host is already fully up to date"
     HOST_STATUS_BADGE="<span class='status-badge badge-no-updates'>No Updates</span>"
     HOST_SUMMARY_TEXT="Host node is fully up to date."
+fi
+
+# Carry the repository warning into the report even when packages *were* found
+# and installed — a partial refresh still means something may have been missed.
+if [ -n "${HOST_REPO_WARNING}" ] && [ "${HOST_STATUS_BADGE}" != "<span class='status-badge badge-error'>Repo Error</span>" ]; then
+    HOST_SUMMARY_TEXT="${HOST_SUMMARY_TEXT}<p class='warn-note'>${HOST_REPO_WARNING}</p>"
 fi
 
 # Capture Proxmox VE Version AFTER updates
@@ -2295,15 +3085,50 @@ fi   # end of full-sweep-only host section
 REBOOT_NEEDED=false
 REBOOT_REASON=""
 RUNNING_KERNEL=$(uname -r)
-LATEST_KERNEL=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|/boot/vmlinuz-||' || true)
+
+# Pick the highest kernel *version*, not the most recently written file.
+#
+# `ls -t` orders by mtime, which is not version order. Reinstalling or pinning
+# an older kernel — routine after a NIC or GPU driver problem, and what a /boot
+# restore does — made that older image the "latest", so the running kernel never
+# matched it and the host was rebooted at REBOOT_TIME after every single run,
+# forever, each time reporting a kernel change that had not happened.
+#
+# linux-version (from linux-base) knows how to order kernel versions properly;
+# sort -V is the fallback.
+KERNEL_LIST=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' || true)
+LATEST_KERNEL=""
+if [ -n "${KERNEL_LIST}" ]; then
+    if command -v linux-version >/dev/null 2>&1; then
+        LATEST_KERNEL=$(echo "${KERNEL_LIST}" | linux-version sort --reverse 2>/dev/null | head -1)
+    fi
+    [ -z "${LATEST_KERNEL}" ] && LATEST_KERNEL=$(echo "${KERNEL_LIST}" | sort -V | tail -1)
+fi
+
+# Did this run actually install a kernel? A version difference that predates the
+# run is a pre-existing skew (a pinned kernel, a stock Debian image pulled in as
+# a dependency), and rebooting for it every week is not an update, it is an
+# unexplained weekly outage.
+KERNEL_UPGRADED_THIS_RUN=false
+if [ -n "${HOST_UPDATES:-}" ] && \
+   echo "${HOST_UPDATES}" | grep -qE '(proxmox-kernel|pve-kernel|linux-image)'; then
+    KERNEL_UPGRADED_THIS_RUN=true
+fi
 
 if [ -n "${ONLY_IDS}" ]; then
     # Never reboot the host because of a targeted guest run.
     REBOOT_REASON="Reboot not considered — targeted run (--only ${ONLY_IDS})"
-elif [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
+elif [ "${KERNEL_UPGRADED_THIS_RUN}" = true ] && [ -n "${LATEST_KERNEL}" ] \
+     && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
     REBOOT_NEEDED=true
     REBOOT_REASON="Kernel updated: ${RUNNING_KERNEL} &rarr; ${LATEST_KERNEL}"
     print_warn "Kernel change detected: ${C_BOLD}${RUNNING_KERNEL} → ${LATEST_KERNEL}${C_NC}"
+elif [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
+    # Newer kernel present but not installed by this run. Report it; do not
+    # reboot for it, or every scheduled run reboots the host again.
+    print_warn "Running an older kernel than the newest installed (${RUNNING_KERNEL} vs ${LATEST_KERNEL})"
+    print_warn "No kernel was installed by this run, so no reboot has been scheduled."
+    REBOOT_REASON="Not rebooting: ${LATEST_KERNEL} is installed but was not updated by this run (running ${RUNNING_KERNEL})"
 fi
 
 if [ -z "${ONLY_IDS}" ] && [ -f /var/run/reboot-required ]; then
@@ -2529,8 +3354,28 @@ DRY_SUFFIX=""
 [ "${DRY_RUN}" = "true" ] && DRY_SUFFIX=" ${C_DIM}[dry run — nothing was changed]${C_NC}"
 if [ "${ERRORS_OCCURRED}" = true ]; then
     echo -e "  ${C_RED}${C_BOLD}Update sequence complete — with errors${C_NC}${DRY_SUFFIX}"
+elif [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
+    echo -e "  ${C_YELLOW}${C_BOLD}Update sequence complete — ${GUESTS_MID_UPDATE} guest(s) left mid-update${C_NC}${DRY_SUFFIX}"
 else
     echo -e "  ${C_GREEN}${C_BOLD}Update sequence complete — all clear ✓${C_NC}${DRY_SUFFIX}"
 fi
 echo -e "${C_BOLD}${C_CYAN}══════════════════════════════════════════════════════════════${C_NC}"
 echo ""
+
+# Exit with a status that reflects the run.
+#
+# The script previously ended on an echo, so it always exited 0 no matter what
+# had failed. `systemctl status pve-autoupdate-run` reported SUCCESS on a failed
+# run — which the --detach help text explicitly tells people to check — and any
+# cron or monitoring wrapper using `|| alert` could never fire.
+#
+#   0  everything succeeded
+#   1  at least one error occurred
+#   2  no hard error, but guests were left mid-update (host reboot suppressed)
+if [ "${ERRORS_OCCURRED}" = true ]; then
+    exit 1
+fi
+if [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
+    exit 2
+fi
+exit 0

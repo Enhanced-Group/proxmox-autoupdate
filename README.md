@@ -11,37 +11,52 @@ This tool performs weekly updates across your entire Proxmox stack — including
 - **Complete Infrastructure Coverage:** Updates the Proxmox VE host, LXC containers, Linux VMs, and Windows VMs.
 - **Stopped Guest Updates:** Automatically starts stopped containers and VMs, applies updates, and restores them to their original state.
 - **Windows VM Support:** Detects Windows VMs via QEMU Guest Agent and runs Windows Update using native PowerShell COM objects (no extra modules needed).
-- **Multi-Distro Container Support:** Detects and updates `apt` (Debian/Ubuntu), `dnf`/`yum` (RHEL/Fedora/CentOS), and `apk` (Alpine) based containers.
+- **Multi-Distro Container Support:** Detects and updates `apt` (Debian/Ubuntu), `dnf`/`yum` (RHEL/Fedora/CentOS) and `apk` (Alpine) based containers. The in-guest script is POSIX `sh`, so it runs on Alpine's BusyBox shell as well as Debian's dash. Guests using `zypper` or `pacman` are reported as unsupported rather than silently skipped.
 - **Honest Result Reporting:** Guests report status through explicit markers rather than exit codes, so a benign non-zero `apt` exit is no longer reported as a failure — and a real failure is never reported as success. Packages that were genuinely upgraded are distinguished from those held back.
-- **Dry Run Mode:** `update-everything.sh --dry-run` reports exactly what would be upgraded, installs nothing, and still emails the report.
+- **Dry Run Mode:** `update-everything.sh --dry-run` reports exactly what would be upgraded and changes nothing at all — no packages, no snapshots, no reboot, and no starting or stopping of guests. Stopped guests are listed as skipped.
+- **Self-Diagnostic:** `update-everything.sh --doctor` checks everything a run depends on — Proxmox detected, cluster filesystem answering, dependencies present, repositories working, cron running, guest agents responding, disk space — and exits non-zero with a numbered list of what to fix. Read-only.
 - **Pre-Update Snapshots:** Optionally snapshot each guest before updating, with automatic pruning of old auto-snapshots.
 - **Web Control Panel:** Optional **Update Everything** button in the Proxmox toolbar (left of *Documentation*) — run updates, manage exclusions, edit the schedule and config, and read past reports without touching a shell. Authorised by your existing Proxmox login.
 - **Flexible Notifications:** Discord (channel *or* direct message, with the log attached as a file), Slack/Teams, any JSON webhook, and Mailgun email — in any combination, or none at all.
-- **Per-Guest Updates:** Each VM and container gets its own **Auto-Update** tab below *Permissions* — patch a single guest without running the whole sweep, or exclude it from the schedule with one click. Also available as `--only <id>` on the CLI.
+- **Per-Guest Updates:** Each VM and container gets an **Update Now** button in its toolbar — patch a single guest without running the whole sweep, or exclude it from the schedule with one click. Also available as `--only <id>` on the CLI.
 - **Fancy Terminal Output:** Braille dot spinners, ANSI color-coded results, Unicode box-drawing banners, and a summary table.
-- **Interactive Configuration:** Prompts for Mailgun credentials, region, exclusion list, and Windows timeout during install. Stored securely in `/etc/proxmox-autoupdate.conf` (`chmod 600`).
+- **Interactive Configuration:** Prompts for notification channels, exclusion list, timeouts, schedule, reboot time and the web panel during install. Stored in `/etc/proxmox-autoupdate.conf` (`chmod 600`, created with those permissions before anything is written to it).
 - **EU & US Mailgun Regions:** Quick 1/2 selection during install — supports both `api.eu.mailgun.net` and `api.mailgun.net`.
-- **UK Localization:** Timestamps formatted as `DD/MM/YYYY HH:MM:SS` in `Europe/London` timezone.
+- **Local Time:** Timestamps and the scheduled reboot follow the host's own timezone. Set `PAU_TZ` in the config to pin a specific one.
 - **Proxmox Version Tracking:** Highlights exact PVE version deltas (e.g., `8.2.2 → 8.2.7`).
-- **Smart Conditional Reboot:** Only reboots when a kernel update is detected. Never reboots after a failed upgrade.
+- **Smart Conditional Reboot:** Reboots only when *this run* installed a newer kernel than the one booted, or when the system flags `/var/run/reboot-required`. Kernels are compared by version, not by file timestamp, so a pinned or reinstalled older kernel cannot cause a reboot every run. Never reboots after a failed upgrade, a targeted run, or while a guest is mid-update.
 - **Error Reporting:** Failures are flagged in the email subject and report body with red badges.
 - **Exclusion List:** Skip specific VM/CT IDs via config (`EXCLUDE_IDS="100,201"`).
-- **Concurrency Safe:** Lockfile prevents overlapping runs.
-- **Full Logging:** Output logged to `/var/log/proxmox-autoupdate/` with 90-day auto-pruning.
+- **Concurrency Safe:** A `flock` lockfile prevents overlapping runs, and the web panel refuses to start one while a scheduled run is going.
+- **Honest Exit Codes:** `0` clean, `1` errors occurred, `2` guests left mid-update — so cron wrappers and `systemctl status` reflect reality.
+- **Customisable Appearance:** Recolour the panel's accent, success, warning and error colours from the Configuration tab, with presets and a live preview. Text contrast is adjusted automatically.
+- **Full Logging:** Output logged to `LOG_DIR` (default `/var/log/proxmox-autoupdate/`), pruned after `LOG_RETENTION_DAYS` (default 90; `0` keeps forever). `cron.log` is rotated by logrotate.
 - **Idempotent Deployment:** Re-running the installer safely updates everything while preserving config.
 
 ---
 
 ## Requirements
 
-- **Proxmox VE 7.x or 8.x** host
-- **Root access** — both the installer and update script must run as `root`
-- **curl** — for downloading the script and sending emails
+- **Proxmox VE host** — 7.x, 8.x and 9.x are all supported. There is no version gate; the installer refuses to run anywhere `pveversion` and `/etc/pve` are not both present, so it will not install on plain Debian, on a Proxmox Backup Server, or inside a container.
+- **Root access** — the installer, the update script and the uninstaller all check for it and refuse otherwise.
 - **QEMU Guest Agent** — must be installed inside VMs you want to auto-update:
   - **Linux VMs:** Install `qemu-guest-agent` package
   - **Windows VMs:** Install the [QEMU Guest Agent for Windows](https://pve.proxmox.com/wiki/Qemu-guest-agent) (included in VirtIO drivers)
-- **Mailgun account** — with a configured sending domain (EU or US region)
-- **jq** — **required**. Every guest-agent reply is parsed as JSON; the installer installs it automatically if missing.
+
+Required packages — the installer adds the first two automatically if missing, and `update-everything.sh --doctor` reports on all of them:
+
+| Package | Why |
+|---|---|
+| `jq` | Every guest-agent reply is parsed as JSON |
+| `python3` | Report payloads and the run-history state file; also the web panel |
+| `curl` | Downloads and notification delivery |
+| `util-linux` (`flock`) | The lockfile that prevents overlapping runs |
+| `cron` (running) | Nothing triggers the schedule without it |
+| `psmisc` | Optional. Used by the panel's run-in-progress indicator |
+| `linux-base` | Optional. Accurate kernel version comparison |
+| `systemd` (`systemd-run`) | Optional. Needed by `--detach` |
+
+**Notifications are entirely optional.** With no channel configured the tool still updates on schedule — it just does so quietly. Mailgun is only needed if you want email specifically.
 
 > **⚠ Important:** VMs without the QEMU Guest Agent will be reported as "Agent Offline" and skipped. For Windows VMs, ensure the VirtIO guest tools are installed.
 
@@ -85,11 +100,11 @@ At the end, it offers to run immediately:
 
 | Choice | What it does |
 |--------|--------------|
-| **Dry run** *(default)* | Checks the host and every guest, emails the full report, installs nothing, never reboots |
+| **Dry run** *(default)* | Checks the host and every running guest, reports in full, installs nothing, never reboots, and never starts or stops a guest |
 | **Full run** | Updates everything now, then emails the report (asks for typed confirmation first) |
 | **Skip** | Waits for the scheduled run |
 
-Both run modes send the report email, so either one verifies your Mailgun setup end to end.
+If a notification channel is configured, both run modes deliver the report through it, so either one verifies the channel end to end. With no channel configured the run is simply quiet — the full output is on screen and in the log directory.
 
 ---
 
@@ -202,7 +217,10 @@ RECIPIENT_EMAIL="admin@example.com"
 EXCLUDE_IDS="300,301"
 
 # Windows settings
-WINDOWS_UPDATE_TIMEOUT="1200"    # seconds (default: 20 min)
+WINDOWS_UPDATE_TIMEOUT="3600"    # seconds a Windows guest gets to install (default: 60 min)
+WINDOWS_SHUTDOWN_TIMEOUT="900"   # seconds to wait for a Windows guest to shut down.
+                                 # Never escalated to a forced stop: a guest still
+                                 # servicing updates is left running instead.
 START_STOPPED_WINDOWS="false"    # start stopped Windows VMs?
 
 # Linux guest settings
@@ -210,6 +228,8 @@ LINUX_UPDATE_TIMEOUT="1800"      # seconds a Linux guest gets to finish (default
 APT_LOCK_TIMEOUT="600"           # seconds apt waits for the dpkg lock inside a guest
 START_STOPPED_LXC="true"
 START_STOPPED_LINUX_VMS="true"
+LINUX_SHUTDOWN_TIMEOUT="180"     # seconds before a started Linux guest is forced off
+AGENT_ERROR_GRACE="120"          # seconds of guest-agent errors tolerated mid-update
 
 # Snapshots
 SNAPSHOT_BEFORE_UPDATE="false"   # snapshot each guest before updating it
@@ -219,10 +239,15 @@ SNAPSHOT_KEEP="3"                # auto-snapshots to keep per guest
 DRY_RUN="false"
 
 # Logs
+LOG_DIR="/var/log/proxmox-autoupdate"   # where run logs are written
 KEEP_LOGS="true"                 # false still streams a run live, then deletes it
 LOG_RETENTION_DAYS="90"          # 0 keeps them forever
 
+# Timezone used for timestamps and REBOOT_TIME. Empty means the host's own.
+PAU_TZ=""
+
 # Ask before starting an update. Deletions and uninstall always confirm.
+# Read by the web panel only — the update script never looks at it.
 CONFIRM_UPDATES="true"
 
 # Notifications — all optional; empty NOTIFY_METHODS means updates run quietly
@@ -230,6 +255,8 @@ NOTIFY_METHODS=""                # email, discord, slack, webhook (comma-separat
 NOTIFY_ON_FAILURE_ONLY="false"
 
 # Timing settings
+# Read by the installer and the web panel, which write it into root's crontab.
+# The update script itself never reads it.
 UPDATE_SCHEDULE_CRON="0 23 * * 5" # Fridays at 23:00 (cron 5-field format)
 REBOOT_TIME="00:00"              # HH:MM format for post-update reboot (if kernel updated)
 ```
@@ -326,8 +353,8 @@ NOTIFY_ON_FAILURE_ONLY="true"        # stay quiet on clean runs
 
 The **full run log is attached as a `.log` file**, not pasted into the message —
 Discord truncates content at 2000 characters and an embed at 4096, which a real
-run comfortably exceeds. Logs above 8 MB are split across several messages so
-nothing is lost.
+run comfortably exceeds. Logs above the per-file upload limit are split across
+several messages so nothing is lost.
 
 To DM the report to yourself instead of posting to a channel, set a bot token
 and your user ID:
@@ -399,11 +426,11 @@ the left of *Documentation*:
 [ Auto-Update ] [ Documentation ] [ Create VM ] [ Create CT ]
 ```
 
-Buttons live in the **content toolbar**, next to the controls they belong with:
+Two buttons are added:
 
 ```
-Node selected:      [ ⟳ Update Everything ● ]  Reboot   Shutdown   Shell   Bulk Actions   Help
-LXC / Linux VM:     [ ⟳ Update Now ]           Start    Shutdown   Console   More   Help
+Top toolbar:        [ ⟳ Update Everything ● ]  Documentation   Create VM   Create CT
+LXC / Linux VM:     [ ⟳ Update Now ]           Start   Shutdown   Console   More   Help
 Windows VM:         (no button — scheduled runs only)
 ```
 
@@ -430,7 +457,7 @@ A per-guest run:
 
 - touches **only** that guest — the Proxmox host is not updated
 - **never** schedules a reboot
-- sends **no** report email (you're watching the output live)
+- sends **no** report when started from the panel (you're watching the output live). From the shell, add `--no-email` for the same behaviour
 
 The same thing from the shell:
 
@@ -454,11 +481,17 @@ Toolbar button  ──►  https://<host>:8007/  (pve-autoupdate-ui.service)
 Only the injected JavaScript touches a Proxmox-owned file, and it's **appended**
 to the end of `pvemanagerlib.js` between markers rather than spliced into
 Proxmox's own definitions — appending cannot break the code above it, and
-removal is an exact delete between two markers. The per-guest tab is added by
-overriding `PVE.qemu.Config` / `PVE.lxc.Config` after their own `initComponent`
-has run, so it doesn't depend on how those panels are built internally; if a
-future Proxmox release reshapes them, the override is wrapped in `try/catch` and
-costs you the tab rather than the guest view.
+removal is an exact delete between two markers. The buttons are placed by a
+short `Ext.ComponentQuery` sweep once the UI has rendered, so it doesn't depend
+on how those panels are built internally; if a future Proxmox release reshapes
+them, you lose the button rather than the page.
+
+The file is never rewritten in place. Each edit is staged to a temporary file in
+the same directory and swapped in with an atomic rename, so an interrupted
+write — power loss, out of memory, a full disk — cannot leave a truncated
+`pvemanagerlib.js` behind. A pristine copy is kept at
+`/var/lib/proxmox-autoupdate/pvemanagerlib.js.orig`; restore it with
+`pve-autoupdate-patch-webui restore`.
 
 A `pve-manager` upgrade replaces that file and removes the button. An apt hook at
 `/etc/apt/apt.conf.d/99-proxmox-autoupdate-webui` re-applies it automatically
@@ -566,6 +599,92 @@ showing a blank window.
 
 After installing, **hard-refresh the Proxmox UI (Ctrl+Shift+R)** — the old
 `pvemanagerlib.js` is cached by the browser.
+
+---
+
+## Troubleshooting
+
+### It ran and said everything was fine, but nothing was updated
+
+Run the self-check first. It covers every cause below and tells you which one you have:
+
+```bash
+update-everything.sh --doctor
+```
+
+It changes nothing and exits non-zero if anything is actually broken. The usual culprits:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Reports 0 containers and 0 VMs | Installed somewhere that isn't a Proxmox host — plain Debian, a Proxmox Backup Server, or inside a container on the host | Install on the PVE host itself. The installer now refuses outright. |
+| Reports 0 containers and 0 VMs on a real PVE host | `pve-cluster` is down, so `pct list` and `qm list` fail | `systemctl status pve-cluster` |
+| Host badged "Repo Error" | The Proxmox enterprise repository is enabled without a subscription, so `apt-get update` fails on every run | Switch to `pve-no-subscription`, or disable the enterprise repository |
+| A container reports "already up to date" but is months behind | It cannot reach its mirrors — no gateway, wrong DNS, or an end-of-life release | `pct exec <id> -- apt-get update` |
+| Nothing ever runs at all | No cron daemon | `systemctl enable --now cron` |
+| No notifications, ever | No channel configured, or `NOTIFY_ON_FAILURE_ONLY` is set and the runs are clean | Check the Notifications tab, or `--doctor` |
+| `cron.log` shows a syntax error on line 1 | The install downloaded an error page instead of the script — a captive portal, a filtering proxy, or a DNS blocklist hit on `raw.githubusercontent.com` | Reinstall. The installer now verifies what it downloaded before installing it. |
+
+### The Proxmox web UI is blank after an update
+
+An interrupted write to `pvemanagerlib.js` by an older version of this tool could leave that file truncated, and because it is a single script the whole interface stops loading. Restore it:
+
+```bash
+pve-autoupdate-patch-webui restore
+```
+
+If that fails, reinstall the file from Proxmox itself:
+
+```bash
+apt-get install --reinstall pve-manager
+```
+
+Current versions stage every edit to a temporary file and swap it in with an atomic rename, so this can no longer happen.
+
+### The web panel isn't reachable
+
+```bash
+systemctl status pve-autoupdate-ui
+journalctl -u pve-autoupdate-ui -n 50
+```
+
+The most common cause is a port collision: **Proxmox Backup Server also uses 8007**. If you run both on one machine, re-run the installer and choose a different port.
+
+The panel serves TLS using the node's own certificate, so if you trust `:8006` in your browser you will trust this port too. On the default self-signed certificate you get the usual warning once per port.
+
+### A Windows VM reports "Timeout" every run
+
+Windows cumulative updates routinely take longer than the default hour. Raise it:
+
+```bash
+WINDOWS_UPDATE_TIMEOUT="7200"
+```
+
+A guest left mid-update is reported as such, and the host reboot is suppressed until it settles. Windows guests are never force-stopped by this tool — a guest that is still installing or rolling back updates is left running instead.
+
+### A guest fails every run and appears under "Failing repeatedly"
+
+Check what it actually reported, then reproduce it by hand:
+
+```bash
+update-everything.sh --only <id> --dry-run
+```
+
+Templates are skipped automatically. Guests using `zypper` or `pacman` are reported as unsupported rather than silently passed over.
+
+### Checking a run afterwards
+
+Exit codes are meaningful, so a wrapper can act on them:
+
+| Code | Meaning |
+|---|---|
+| `0` | Everything succeeded |
+| `1` | At least one error occurred |
+| `2` | No hard error, but guests were left mid-update |
+
+```bash
+update-everything.sh || echo "run failed with $?"
+journalctl -u pve-autoupdate-run     # when started with --detach
+```
 
 ---
 

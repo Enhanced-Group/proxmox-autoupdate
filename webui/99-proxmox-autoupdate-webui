@@ -2,8 +2,15 @@
 //
 // A pve-manager upgrade replaces /usr/share/pve-manager/js/pvemanagerlib.js
 // wholesale, which removes the Auto-Update toolbar button. This hook re-applies
-// it afterwards. The patcher is idempotent and exits immediately when the
-// button is already present, so the cost on unrelated apt runs is one grep.
+// it afterwards.
+//
+// This fires after *every* dpkg transaction, not only pve-manager upgrades, so
+// `apply` is a no-op unless the exact expected block is missing: it greps for a
+// fingerprint of the block it would write and returns immediately if it is
+// already there. Only when the block is absent or stale does it rewrite the
+// file, and that rewrite stages to a temporary file in the same directory and
+// finishes with an atomic rename, so an interrupted run can never leave a
+// truncated pvemanagerlib.js behind.
 DPkg::Post-Invoke {
-    "if [ -x /usr/local/bin/pve-autoupdate-patch-webui ]; then /usr/local/bin/pve-autoupdate-patch-webui apply >/dev/null 2>&1 || true; fi";
+    "if [ -x /usr/local/bin/pve-autoupdate-patch-webui ]; then /usr/local/bin/pve-autoupdate-patch-webui apply --quiet >/dev/null 2>&1 || true; fi";
 };
