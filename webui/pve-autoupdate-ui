@@ -13,6 +13,7 @@ Only members of ALLOWED_USERS may do anything at all.
 Standard library only — Proxmox ships Python 3 but no extra packages.
 """
 
+import fcntl
 import html
 import json
 import os
@@ -37,8 +38,13 @@ LISTEN_ADDR = os.environ.get("PAU_UI_ADDR", "0.0.0.0")
 
 UPDATE_SCRIPT = "/usr/local/bin/update-everything.sh"
 CONFIG_FILE = "/etc/proxmox-autoupdate.conf"
-LOG_DIR = "/var/log/proxmox-autoupdate"
 LOCKFILE = "/var/run/proxmox-autoupdate.lock"
+
+# LOG_DIR is read from the config, not hardcoded. update-everything.sh honours
+# the config key, so hardcoding it here meant a custom value made the Logs tab
+# permanently empty while runs wrote somewhere else entirely. Resolved lazily at
+# the bottom of this section, once read_config() is defined.
+LOG_DIR_DEFAULT = "/var/log/proxmox-autoupdate"
 CRON_MARKER = "# proxmox-autoupdate"
 STATE_FILE = "/var/lib/proxmox-autoupdate/state.json"
 
@@ -55,10 +61,36 @@ ALLOWED_USERS = {"root@pam"}
 # Config keys the UI is allowed to write, with their validators.
 INT_RE = re.compile(r"^[0-9]+$")
 BOOL_VALUES = {"true", "false"}
-CRON_RE = re.compile(r"^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s*$")
-TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
-IDLIST_RE = re.compile(r"^[0-9]*([,\s]*[0-9]+)*$")
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# \A and \Z, not ^ and $: in Python ^/$ also match either side of an embedded
+# newline, so "0 3 * * *\nrm -rf /" satisfied a ^...$ cron pattern. \s likewise
+# matches a newline, which let multi-line values through the id-list and cron
+# checks and straight into the root crontab and the sourced config file.
+CRON_RE = re.compile(r"\A[ \t]*\S+[ \t]+\S+[ \t]+\S+[ \t]+\S+[ \t]+\S+[ \t]*\Z")
+TIME_RE = re.compile(r"\A([01][0-9]|2[0-3]):[0-5][0-9]\Z")
+IDLIST_RE = re.compile(r"\A[0-9]*([,\t ]*[0-9]+)*\Z")
+EMAIL_RE = re.compile(r"\A[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+
+# Characters that must never reach the config file.
+#
+# /etc/proxmox-autoupdate.conf is `source`d by update-everything.sh as root, and
+# values were written into double quotes, where bash still expands $, backticks
+# and \. A webhook URL containing "$" aborted the entire run under `set -u`
+# ("bar: unbound variable") before a single guest was touched; a backtick or
+# $(...) executed as root on the next scheduled run.
+#
+# Values are now single-quoted on write, which makes this defence in depth
+# rather than the only line — but a cron expression also reaches crontab(1)
+# directly, so rejecting these outright is still worth doing.
+_SHELL_META_RE = re.compile(r"[$`\\\r\n\x00]")
+
+
+def _has_shell_meta(v):
+    return bool(_SHELL_META_RE.search(v))
+
+
+# The Host header is attacker-controlled, and it is interpolated into a CSP
+# header. Only ever emit something that cannot break out of the directive.
+_SAFE_HOST_RE = re.compile(r"\A[A-Za-z0-9._-]{1,253}\Z")
 
 
 def _v_int(v):
@@ -105,7 +137,11 @@ def _v_methods(v):
 def _v_url(v):
     # Empty clears the channel. Otherwise require an https URL — these carry no
     # authentication of their own, so the URL is the secret.
-    return v == "" or (v.startswith("https://") and " " not in v and len(v) < 2048)
+    if v == "":
+        return True
+    if _has_shell_meta(v):
+        return False
+    return v.startswith("https://") and " " not in v and len(v) < 2048
 
 
 def _v_optional_email(v):
@@ -113,7 +149,9 @@ def _v_optional_email(v):
 
 
 def _v_optional(v):
-    return "\n" not in v and '"' not in v
+    # Previously this rejected only newline and double-quote, which left $,
+    # backtick and backslash free to reach a file that bash sources as root.
+    return not _has_shell_meta(v) and '"' not in v and len(v) < 4096
 
 
 EDITABLE_KEYS = {
@@ -199,13 +237,13 @@ class Job:
             if not os.path.isfile(UPDATE_SCRIPT) or not os.access(UPDATE_SCRIPT, os.X_OK):
                 return False, "%s is missing or not executable." % UPDATE_SCRIPT
 
-            os.makedirs(LOG_DIR, exist_ok=True)
+            os.makedirs(resolve_log_dir(), exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S")
             if only:
                 kind = "guest%s" % only.replace(",", "-")
             else:
                 kind = "dryrun" if dry_run else "manual"
-            self.log_path = os.path.join(LOG_DIR, "webui_%s_%s.log" % (kind, stamp))
+            self.log_path = os.path.join(resolve_log_dir(), "webui_%s_%s.log" % (kind, stamp))
 
             cmd = [UPDATE_SCRIPT]
             if dry_run:
@@ -253,16 +291,37 @@ JOB = Job()
 
 
 def lock_is_held():
-    """True when some other run (usually cron) currently holds the lockfile."""
+    """True when some other run (usually cron) currently holds the lockfile.
+
+    Asks the kernel directly with a non-blocking flock, which is what
+    update-everything.sh actually uses. The previous implementation shelled out
+    to fuser and returned False on any error — including fuser not being
+    installed, which it is not by default, since psmisc is not a dependency the
+    installer declares. So the guard that is documented as "refuses to run while
+    an update is in progress" silently did nothing on a stock host, and the
+    panel would happily start a second concurrent sweep driving pct and qm.
+    """
     if not os.path.exists(LOCKFILE):
         return False
+    fd = None
     try:
-        out = subprocess.run(
-            ["fuser", LOCKFILE], capture_output=True, timeout=5
-        )
-        return out.returncode == 0
-    except (OSError, subprocess.SubprocessError):
+        fd = os.open(LOCKFILE, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True          # someone else holds it
+        fcntl.flock(fd, fcntl.LOCK_UN)
         return False
+    except OSError:
+        # Cannot even open it. Fail closed: better to refuse a run than to
+        # start a second one on top of a live sweep.
+        return True
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def read_config():
@@ -284,36 +343,212 @@ def read_config():
     return values
 
 
+def sh_quote(value):
+    """Render a value as a single-quoted shell literal.
+
+    The config file is `source`d by update-everything.sh as root. Values were
+    written into *double* quotes, where bash still expands $VAR, $(...) and
+    backticks — so a webhook URL with a "$" in it aborted the whole run under
+    `set -u`, and a backtick executed as root. Inside single quotes bash expands
+    nothing at all; the only character needing care is the quote itself, closed
+    and reopened around an escaped one.
+    """
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+# Serialises config writes. This is a read-modify-write on a shared file from a
+# threading server, and it is reachable from three handlers plus the guest-page
+# exclusion checkbox; concurrent saves used to lose whole keys, and two open
+# tabs could resurrect excluded guests.
+_CONFIG_LOCK = threading.Lock()
+
+
 def write_config(updates):
     """Rewrite the config in place, preserving comments, ordering and mode 600."""
-    existing = []
-    if os.path.isfile(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as fh:
-            existing = fh.readlines()
+    with _CONFIG_LOCK:
+        existing = []
+        if os.path.isfile(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as fh:
+                existing = fh.readlines()
 
-    seen = set()
-    out = []
-    for line in existing:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            key = stripped.partition("=")[0].strip()
-            if key in updates:
-                out.append('%s="%s"\n' % (key, updates[key]))
-                seen.add(key)
-                continue
-        out.append(line)
+        seen = set()
+        out = []
+        for line in existing:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.partition("=")[0].strip()
+                if key in updates:
+                    out.append("%s=%s\n" % (key, sh_quote(updates[key])))
+                    seen.add(key)
+                    continue
+            out.append(line)
 
-    missing = [k for k in updates if k not in seen]
-    if missing:
-        out.append("\n# Added by the web UI\n")
-        for key in missing:
-            out.append('%s="%s"\n' % (key, updates[key]))
+        missing = [k for k in updates if k not in seen]
+        if missing:
+            out.append("\n# Added by the web UI\n")
+            for key in missing:
+                out.append("%s=%s\n" % (key, sh_quote(updates[key])))
 
-    tmp = CONFIG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(out)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG_FILE)
+        # Create the temp file with the final mode rather than the process
+        # umask, so the credentials in it are never briefly world-readable. A
+        # per-process unique name stops two writers sharing one temp file.
+        tmp = "%s.tmp.%d" % (CONFIG_FILE, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.writelines(out)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, CONFIG_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+# --- Appearance ---------------------------------------------------------------
+#
+# Four colour tokens, stored in their own JSON file rather than in
+# /etc/proxmox-autoupdate.conf.
+#
+# That file is `source`d by update-everything.sh as root, so putting
+# browser-supplied colour strings in it would mean a slip in hex validation
+# becomes root code execution. This file is only ever read by Python, so the
+# worst a bad value can do is look wrong. It is also shared across browsers,
+# unlike localStorage, and survives clearing site data.
+#
+# Values are validated on read as well as on write, so hand-editing the file
+# cannot inject anything into the stylesheet either.
+THEME_FILE = "/etc/proxmox-autoupdate-theme.json"
+HEX_RE = re.compile(r"\A#[0-9a-fA-F]{6}\Z")
+
+THEME_DEFAULTS = {
+    "accent": "#e65c00",   # Proxmox orange: primary buttons, active tab, links
+    "ok":     "#4caf50",
+    "warn":   "#ffb300",
+    "err":    "#f44336",
+}
+
+THEME_PRESETS = {
+    "proxmox": {"accent": "#e65c00", "ok": "#4caf50", "warn": "#ffb300", "err": "#f44336"},
+    "steel":   {"accent": "#3d8bcd", "ok": "#43a047", "warn": "#fb8c00", "err": "#e53935"},
+    "teal":    {"accent": "#0f9d8f", "ok": "#43a047", "warn": "#f9a825", "err": "#e53935"},
+    "violet":  {"accent": "#7c5cbf", "ok": "#4caf50", "warn": "#ffb300", "err": "#ef5350"},
+}
+
+
+def read_theme():
+    theme = dict(THEME_DEFAULTS)
+    try:
+        with open(THEME_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return theme
+    if not isinstance(raw, dict):
+        return theme
+    for key in THEME_DEFAULTS:
+        value = raw.get(key)
+        if isinstance(value, str) and HEX_RE.match(value):
+            theme[key] = value.lower()
+    return theme
+
+
+def write_theme(theme):
+    clean = {}
+    for key in THEME_DEFAULTS:
+        value = str(theme.get(key, THEME_DEFAULTS[key]))
+        if not HEX_RE.match(value):
+            raise ValueError("%s must be a colour like #e65c00" % key)
+        clean[key] = value.lower()
+    tmp = "%s.tmp.%d" % (THEME_FILE, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(clean, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, THEME_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return clean
+
+
+def _srgb_to_linear(channel):
+    c = channel / 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _relative_luminance(hex_colour):
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    return (0.2126 * _srgb_to_linear(r)
+            + 0.7152 * _srgb_to_linear(g)
+            + 0.0722 * _srgb_to_linear(b))
+
+
+# WCAG AA for UI components and large text. Deliberately not the 4.5 figure for
+# small body text: these are short bold labels on a solid fill, and the point of
+# this threshold is to catch genuinely unreadable choices, not to restyle the
+# panel. White stays the default wherever it is legible, so the shipped look is
+# unchanged — black on Proxmox orange scores higher (5.9 vs 3.6) but nobody
+# asked for the buttons to change colour.
+CONTRAST_MIN = 3.0
+
+
+def readable_on(hex_colour):
+    """White, unless white would be unreadable on this colour — then black.
+
+    Primary buttons and the active tab hardcoded white text, which is fine on
+    Proxmox orange and illegible on a pale accent. Rather than rejecting the
+    colour the user picked, switch the foreground only when we have to.
+    """
+    lum = _relative_luminance(hex_colour)
+    contrast_white = 1.05 / (lum + 0.05)
+    if contrast_white >= CONTRAST_MIN:
+        return "#ffffff"
+    return "#000000"
+
+
+def _rgba(hex_colour, alpha):
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    return "rgba(%d,%d,%d,%.2f)" % (r, g, b, alpha)
+
+
+def theme_css(theme=None):
+    """CSS custom properties overriding the defaults in SHARED_CSS.
+
+    Emitted after SHARED_CSS so it wins on equal specificity. Every value here
+    has already been matched against HEX_RE, so nothing user-supplied can escape
+    the declaration.
+    """
+    t = theme or read_theme()
+    return (
+        ":root{"
+        "--accent:%s;--ok:%s;--warn:%s;--err:%s;"
+        "--accent-dim:%s;--on-accent:%s;--on-ok:%s;--on-warn:%s;--on-err:%s"
+        "}"
+    ) % (
+        t["accent"], t["ok"], t["warn"], t["err"],
+        _rgba(t["accent"], 0.35),
+        readable_on(t["accent"]), readable_on(t["ok"]),
+        readable_on(t["warn"]), readable_on(t["err"]),
+    )
+
+
+def resolve_log_dir():
+    """Pick up LOG_DIR from the config, falling back to the default.
+
+    Re-read rather than cached: the operator can change it in the config file
+    while the service is running, and the Logs tab should follow it.
+    """
+    value = (read_config().get("LOG_DIR") or "").strip()
+    if value and value.startswith("/") and "\x00" not in value:
+        return value.rstrip("/") or LOG_DIR_DEFAULT
+    return LOG_DIR_DEFAULT
 
 
 def excluded_ids():
@@ -391,19 +626,19 @@ def log_stats():
     """Total size and count of the log directory, for the UI to display."""
     total = count = 0
     oldest = None
-    if os.path.isdir(LOG_DIR):
-        for name in os.listdir(LOG_DIR):
+    if os.path.isdir(resolve_log_dir()):
+        for name in os.listdir(resolve_log_dir()):
             if not name.endswith(".log"):
                 continue
             try:
-                st = os.stat(os.path.join(LOG_DIR, name))
+                st = os.stat(os.path.join(resolve_log_dir(), name))
             except OSError:
                 continue
             total += st.st_size
             count += 1
             if oldest is None or st.st_mtime < oldest:
                 oldest = st.st_mtime
-    return {"dir": LOG_DIR, "bytes": total, "count": count, "oldest": oldest}
+    return {"dir": resolve_log_dir(), "bytes": total, "count": count, "oldest": oldest}
 
 
 def purge_logs(keep_current=True):
@@ -414,12 +649,12 @@ def purge_logs(keep_current=True):
         if snap["running"] and snap["log"]:
             current = snap["log"]
     removed = 0
-    if os.path.isdir(LOG_DIR):
-        for name in os.listdir(LOG_DIR):
+    if os.path.isdir(resolve_log_dir()):
+        for name in os.listdir(resolve_log_dir()):
             if not name.endswith(".log") or name == current:
                 continue
             try:
-                os.remove(os.path.join(LOG_DIR, name))
+                os.remove(os.path.join(resolve_log_dir(), name))
                 removed += 1
             except OSError:
                 pass
@@ -991,7 +1226,7 @@ def write_schedule(expr):
     while kept and not kept[-1].strip():
         kept.pop()
     kept.append(CRON_MARKER)
-    kept.append("%s %s >> %s/cron.log 2>&1" % (expr, UPDATE_SCRIPT, LOG_DIR))
+    kept.append("%s %s >> %s/cron.log 2>&1" % (expr, UPDATE_SCRIPT, resolve_log_dir()))
     payload = "\n".join(kept) + "\n"
 
     proc = subprocess.run(["crontab", "-"], input=payload, text=True,
@@ -1001,13 +1236,13 @@ def write_schedule(expr):
 
 
 def list_logs(limit=40):
-    if not os.path.isdir(LOG_DIR):
+    if not os.path.isdir(resolve_log_dir()):
         return []
     entries = []
-    for name in os.listdir(LOG_DIR):
+    for name in os.listdir(resolve_log_dir()):
         if not name.endswith(".log"):
             continue
-        path = os.path.join(LOG_DIR, name)
+        path = os.path.join(resolve_log_dir(), name)
         try:
             st = os.stat(path)
         except OSError:
@@ -1018,11 +1253,11 @@ def list_logs(limit=40):
 
 
 def safe_log_path(name):
-    """Resolve a log name to a path inside LOG_DIR, or None if it escapes."""
+    """Resolve a log name to a path inside the log directory, or None if it escapes."""
     if not name or "/" in name or "\\" in name or name.startswith("."):
         return None
-    path = os.path.realpath(os.path.join(LOG_DIR, name))
-    if os.path.dirname(path) != os.path.realpath(LOG_DIR):
+    path = os.path.realpath(os.path.join(resolve_log_dir(), name))
+    if os.path.dirname(path) != os.path.realpath(resolve_log_dir()):
         return None
     return path if os.path.isfile(path) else None
 
@@ -1043,11 +1278,51 @@ _ssl_noverify.check_hostname = False
 _ssl_noverify.verify_mode = ssl.CERT_NONE
 
 
+# Cache of ticket -> (username-or-None, expiry). Both outcomes are cached.
+#
+# Without this, every single request — including the status poll every 2s from
+# every open tab — made a blocking HTTPS call to pvedaemon with an 8s timeout,
+# before any cheaper check. That had two consequences. Upgrading pve-manager
+# during a run made the panel log the operator out mid-run, because a transport
+# failure was reported as 401. And because the ticket pattern is a trivial
+# regex, unauthenticated requests reached that call too, so N cheap connections
+# pinned N threads for 8s each against the daemon the Proxmox UI itself depends
+# on.
+_TICKET_CACHE = {}
+_TICKET_CACHE_LOCK = threading.Lock()
+_TICKET_TTL_OK = 30.0
+_TICKET_TTL_BAD = 5.0
+_TICKET_CACHE_MAX = 512
+
+# Raised when the PVE API could not be reached at all, as distinct from it
+# rejecting the ticket. The first is a 503 (try again), the second a 401.
+class AuthBackendUnavailable(Exception):
+    pass
+
+
+def _verify_ticket_upstream(ticket):
+    req = urllib.request.Request(
+        "https://127.0.0.1:8006/api2/json/access/permissions",
+        headers={"Cookie": "PVEAuthCookie=%s" % ticket},
+    )
+    try:
+        with urllib.request.urlopen(req, context=_ssl_noverify, timeout=8) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError:
+        # The API answered and said no. That is a real rejection.
+        return False
+    except (urllib.error.URLError, OSError, ssl.SSLError):
+        raise AuthBackendUnavailable()
+
+
 def verify_ticket(ticket):
     """Validate a PVEAuthCookie against the local PVE API. Returns username or None.
 
     The signature check is delegated to pvedaemon rather than reimplemented:
     if the API accepts the cookie, it is genuine and unexpired.
+
+    Raises AuthBackendUnavailable if pvedaemon could not be reached, so the
+    caller can answer 503 rather than pretending the user is logged out.
     """
     if not ticket:
         return None
@@ -1056,19 +1331,26 @@ def verify_ticket(ticket):
         return None
     user = match.group(1)
 
-    req = urllib.request.Request(
-        "https://127.0.0.1:8006/api2/json/access/permissions",
-        headers={"Cookie": "PVEAuthCookie=%s" % ticket},
-    )
-    try:
-        with urllib.request.urlopen(req, context=_ssl_noverify, timeout=8) as resp:
-            if resp.status != 200:
-                return None
-    except urllib.error.HTTPError:
-        return None
-    except (urllib.error.URLError, OSError, ssl.SSLError):
-        return None
-    return user
+    now = time.monotonic()
+    with _TICKET_CACHE_LOCK:
+        hit = _TICKET_CACHE.get(ticket)
+        if hit and hit[1] > now:
+            return hit[0]
+
+    ok = _verify_ticket_upstream(ticket)
+    result = user if ok else None
+
+    with _TICKET_CACHE_LOCK:
+        if len(_TICKET_CACHE) >= _TICKET_CACHE_MAX:
+            # Cheap bound: drop everything already expired, then, if that was
+            # not enough, clear the lot. This is a single-node admin panel, not
+            # a session store.
+            for key in [k for k, v in _TICKET_CACHE.items() if v[1] <= now]:
+                _TICKET_CACHE.pop(key, None)
+            if len(_TICKET_CACHE) >= _TICKET_CACHE_MAX:
+                _TICKET_CACHE.clear()
+        _TICKET_CACHE[ticket] = (result, now + (_TICKET_TTL_OK if ok else _TICKET_TTL_BAD))
+    return result
 
 
 # CSRF: a token bound to the ticket, handed out with the page and required on
@@ -1151,11 +1433,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", allowed)
             self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Vary", "Origin")
-        # Allow the Proxmox UI (any origin/port on this host) to frame us, but
-        # nothing else may embed this control panel.
+        # Allow the Proxmox UI (any port on *this host*) to frame us, and
+        # nothing else.
+        #
+        # This said `frame-ancestors https:`, which permits every HTTPS origin
+        # on the internet — the opposite of what the comment claimed. Any site
+        # could iframe this panel and clickjack "Update everything now" or the
+        # uninstall action, and with CONFIRM_UPDATES=false there is not even a
+        # dialog in the way. The host header gives us the one origin that should
+        # legitimately be framing this.
+        host_only = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host_only and _SAFE_HOST_RE.match(host_only):
+            frame_ancestors = "'self' https://%s:*" % host_only
+        else:
+            frame_ancestors = "'self'"
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                         "script-src 'self' 'unsafe-inline'; frame-ancestors https:")
+                         "script-src 'self' 'unsafe-inline'; "
+                         "base-uri 'none'; form-action 'self'; "
+                         "frame-ancestors " + frame_ancestors)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -1175,7 +1471,17 @@ class Handler(BaseHTTPRequestHandler):
                 ticket = urllib.parse.unquote(value)
                 break
 
-        user = verify_ticket(ticket)
+        try:
+            user = verify_ticket(ticket)
+        except AuthBackendUnavailable:
+            # pvedaemon is not answering. That is not the same as the operator
+            # being logged out, and reporting it as 401 was actively misleading
+            # during the one moment it happens most: a host dist-upgrade that
+            # restarts pve-manager while a run is in progress.
+            self._json(503, {"error": "The Proxmox API is not responding right now "
+                                      "(it restarts during a host upgrade). "
+                                      "This page will keep retrying."})
+            return None
         if not user:
             self._json(401, {"error": "Not logged in to Proxmox. "
                                       "Open the Proxmox web UI, log in, then reload."})
@@ -1285,9 +1591,27 @@ class Handler(BaseHTTPRequestHandler):
                 "url": "https://github.com/%s/blob/main/CHANGELOG.md" % GITHUB_REPO,
             })
         elif path == "/api/config":
+            # Secrets are redacted here, on the server.
+            #
+            # This used to return the Mailgun API key, the Discord bot token and
+            # every webhook URL in cleartext, and rely on the browser to render
+            # them as asterisks. Anything that could read the response — an
+            # extension, a proxy, devtools, a saved HAR — had the credentials.
+            # The client already treats an all-asterisk value as "unchanged", so
+            # sending a placeholder is enough for the form to round-trip.
             cfg = read_config()
-            payload = {k: cfg.get(k, "") for k in EDITABLE_KEYS}
+            payload = {}
+            for k in EDITABLE_KEYS:
+                value = cfg.get(k, "")
+                if k in SENSITIVE_KEYS and value:
+                    payload[k] = "*" * 12
+                else:
+                    payload[k] = value
             self._json(200, {"config": payload, "sensitive": sorted(SENSITIVE_KEYS)})
+        elif path == "/api/theme":
+            self._json(200, {"theme": read_theme(),
+                             "defaults": THEME_DEFAULTS,
+                             "presets": THEME_PRESETS})
         elif path == "/api/logs":
             self._json(200, {"logs": list_logs()})
         elif path == "/api/log":
@@ -1345,6 +1669,8 @@ class Handler(BaseHTTPRequestHandler):
             self._save_exclusions(body)
         elif path == "/api/config":
             self._save_config(body)
+        elif path == "/api/theme":
+            self._save_theme(body)
         elif path == "/api/schedule":
             self._save_schedule(body)
         elif path == "/api/notify/test":
@@ -1511,6 +1837,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "Could not write config: %s" % exc})
             return
         self._json(200, {"excluded": saved})
+
+    def _save_theme(self, body):
+        incoming = body.get("theme")
+        if body.get("reset"):
+            incoming = dict(THEME_DEFAULTS)
+        preset = body.get("preset")
+        if preset:
+            if preset not in THEME_PRESETS:
+                self._json(400, {"error": "Unknown preset '%s'" % preset})
+                return
+            incoming = dict(THEME_PRESETS[preset])
+        if not isinstance(incoming, dict):
+            self._json(400, {"error": "Expected a theme object"})
+            return
+        try:
+            saved = write_theme(incoming)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._json(500, {"error": "Could not save the theme: %s" % exc})
+            return
+        self._json(200, {"ok": True, "theme": saved})
 
     def _save_config(self, body):
         incoming = body.get("config")
@@ -1731,7 +2080,7 @@ def _shared_js():
 
 def render_page(user, csrf):
     return (PAGE_TEMPLATE
-            .replace("{{CSS}}", SHARED_CSS)
+            .replace("{{CSS}}", SHARED_CSS + theme_css())
             .replace("{{JS}}", _shared_js())
             .replace("{{USER}}", html.escape(user))
             .replace("{{CSRF}}", csrf))
@@ -1740,7 +2089,7 @@ def render_page(user, csrf):
 def render_guest_page(user, csrf, vmid, name):
     # vmid is already known to be all digits, so it is safe to inline into JS.
     return (GUEST_TEMPLATE
-            .replace("{{CSS}}", SHARED_CSS)
+            .replace("{{CSS}}", SHARED_CSS + theme_css())
             .replace("{{JS}}", _shared_js())
             .replace("{{USER}}", html.escape(user))
             .replace("{{CSRF}}", csrf)
@@ -1774,8 +2123,8 @@ SHARED_CSS = r"""  :root {
            color: var(--text); cursor: pointer; }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.danger  { background: var(--err); border-color: var(--err); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent, #fff); }
+  button.danger  { background: var(--err); border-color: var(--err); color: var(--on-err, #fff); }
   label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 12px; }
   input, select { width: 100%; padding: 6px 8px; border-radius: 4px;
                   border: 1px solid var(--border); background: var(--bg);
@@ -1787,22 +2136,22 @@ SHARED_CSS = r"""  :root {
   .pill { display: inline-block; padding: 2px 9px; border-radius: 10px;
           font-size: 11px; font-weight: 600; }
   .pill.idle { background: #444; color: #ddd; }
-  .pill.run  { background: var(--warn); color: #000; }
-  .pill.ok   { background: var(--ok); color: #fff; }
-  .pill.err  { background: var(--err); color: #fff; }
-  .pill.warn-pill { background: var(--accent); color: #fff; }
+  .pill.run  { background: var(--warn); color: var(--on-warn, #000); }
+  .pill.ok   { background: var(--ok); color: var(--on-ok, #fff); }
+  .pill.err  { background: var(--err); color: var(--on-err, #fff); }
+  .pill.warn-pill { background: var(--accent); color: var(--on-accent, #fff); }
   .msg { padding: 8px 11px; border-radius: 4px; margin-top: 10px; display: none; font-size: 12px; }
   .msg.show { display: block; }
   .msg.ok { background: rgba(76,175,80,.15); border: 1px solid var(--ok); }
   .msg.err { background: rgba(244,67,54,.15); border: 1px solid var(--err); }
   .tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
   .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
-  .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tabs button.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent, #fff); }
   /* Unsaved changes: a dot on the tab, a pulsing Save button, a banner. */
   .tabs button.dirty::after {
     content: "•"; margin-left: 5px; color: var(--warn); font-size: 16px; line-height: 0;
   }
-  .tabs button.active.dirty::after { color: #fff; }
+  .tabs button.active.dirty::after { color: var(--on-accent, #fff); }
   button.needs-save {
     box-shadow: 0 0 0 2px var(--warn);
     animation: needsave 1.6s ease-in-out infinite;
@@ -1822,6 +2171,15 @@ SHARED_CSS = r"""  :root {
   .note { padding: 8px 11px; border-radius: 4px; margin-top: 10px; font-size: 12px;
           background: rgba(70,150,220,.12); border: 1px solid #4d9bd7; }
   .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+  /* Appearance picker */
+  .swatch-row { flex-wrap: nowrap; }
+  input.swatch { width: 42px; min-width: 42px; height: 30px; padding: 2px;
+                 cursor: pointer; }
+  input.hexbox { flex: 1; font: 12px/1.4 "Cascadia Mono", "Courier New", monospace;
+                 text-transform: lowercase; }
+  input.hexbox:invalid { border-color: var(--err); }
+  button.preset { padding: 5px 10px; font-size: 12px; }
 
   /* --- Dialogs -------------------------------------------------------------
      Browser confirm()/prompt() render as "An embedded page at host:8007 says",
@@ -1866,7 +2224,7 @@ SHARED_CSS = r"""  :root {
               background: var(--border); margin-top: 10px; display: none; }
   .progress.active { display: block; }
   .progress > div { height: 100%; width: 100%; background-image: linear-gradient(
-      90deg, var(--accent) 0 8px, rgba(230,92,0,.35) 8px 16px);
+      90deg, var(--accent) 0 8px, var(--accent-dim, rgba(230,92,0,.35)) 8px 16px);
       background-size: 32px 100%; animation: stripes .8s linear infinite; }
 
   pre.live::after { content: '▌'; color: var(--accent); animation: blink 1s step-end infinite; }
@@ -2105,6 +2463,58 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <button id="btnReloadConfig">Reload</button>
     </div>
     <div id="configMsg" class="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Appearance</h2>
+    <p class="hint" style="margin-top:0">
+      Applies to everyone who opens this panel, not just this browser.
+      Text colour on coloured buttons is chosen automatically for contrast.
+    </p>
+    <div class="row" style="margin-bottom:12px">
+      <button type="button" class="preset" data-preset="proxmox">Proxmox Orange</button>
+      <button type="button" class="preset" data-preset="steel">Steel Blue</button>
+      <button type="button" class="preset" data-preset="teal">Teal</button>
+      <button type="button" class="preset" data-preset="violet">Violet</button>
+    </div>
+    <div class="grid" id="themeGrid">
+      <div>
+        <label for="th-accent">Accent — buttons, active tab, headings</label>
+        <div class="row swatch-row">
+          <input type="color" id="th-accent" class="swatch">
+          <input type="text" id="th-accent-hex" class="hexbox" spellcheck="false" maxlength="7">
+        </div>
+      </div>
+      <div>
+        <label for="th-ok">Success</label>
+        <div class="row swatch-row">
+          <input type="color" id="th-ok" class="swatch">
+          <input type="text" id="th-ok-hex" class="hexbox" spellcheck="false" maxlength="7">
+        </div>
+      </div>
+      <div>
+        <label for="th-warn">Warning</label>
+        <div class="row swatch-row">
+          <input type="color" id="th-warn" class="swatch">
+          <input type="text" id="th-warn-hex" class="hexbox" spellcheck="false" maxlength="7">
+        </div>
+      </div>
+      <div>
+        <label for="th-err">Error</label>
+        <div class="row swatch-row">
+          <input type="color" id="th-err" class="swatch">
+          <input type="text" id="th-err-hex" class="hexbox" spellcheck="false" maxlength="7">
+        </div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="btnSaveTheme">Save appearance</button>
+      <button id="btnResetTheme">Reset to default</button>
+      <span class="pill ok">success</span>
+      <span class="pill warn-pill">accent</span>
+      <span class="pill err">error</span>
+    </div>
+    <div id="themeMsg" class="msg"></div>
   </div>
 </section>
 
@@ -2872,6 +3282,7 @@ async function loadConfig() {
     $("schedCron").value = (await api("/api/status")).schedule || "";
     $("rebootTime").value = data.config.REBOOT_TIME || "";
   } catch (e) { msg($("configMsg"), e.message, false); }
+  loadTheme();
 }
 
 $("btnReloadConfig").onclick = loadConfig;
@@ -2887,6 +3298,107 @@ $("btnSaveConfig").onclick = async () => {
     msg($("configMsg"), "Saved: " + res.saved.join(", "), true);
   } catch (e) { msg($("configMsg"), e.message, false); }
 };
+
+// --- appearance ---
+// Every colour in the stylesheet already goes through a CSS custom property, so
+// previewing a change is one setProperty call per token — no re-render, no
+// stylesheet rebuild. Saving persists it for every browser, not just this one.
+const THEME_KEYS = ["accent", "ok", "warn", "err"];
+let THEME_DEFAULTS_CLIENT = {};
+
+function themeInputs(key) {
+  return [$("th-" + key), $("th-" + key + "-hex")];
+}
+
+function srgbToLinear(c) {
+  c /= 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+// Same WCAG relative-luminance test the server uses, so the live preview
+// matches exactly what gets saved. White unless white would be unreadable.
+function readableOn(hex) {
+  const r = parseInt(hex.slice(1, 3), 16),
+        g = parseInt(hex.slice(3, 5), 16),
+        b = parseInt(hex.slice(5, 7), 16);
+  const lum = 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b);
+  return 1.05 / (lum + 0.05) >= 3.0 ? "#ffffff" : "#000000";
+}
+
+function previewTheme() {
+  const root = document.documentElement;
+  THEME_KEYS.forEach((k) => {
+    const v = $("th-" + k).value;
+    if (!/^#[0-9a-fA-F]{6}$/.test(v)) return;
+    root.style.setProperty("--" + k, v);
+    root.style.setProperty("--on-" + k, readableOn(v));
+    if (k === "accent") {
+      const r = parseInt(v.slice(1, 3), 16),
+            g = parseInt(v.slice(3, 5), 16),
+            b = parseInt(v.slice(5, 7), 16);
+      root.style.setProperty("--accent-dim", "rgba(" + r + "," + g + "," + b + ",0.35)");
+    }
+  });
+}
+
+function setThemeInputs(theme) {
+  THEME_KEYS.forEach((k) => {
+    const [picker, hex] = themeInputs(k);
+    const v = theme[k] || THEME_DEFAULTS_CLIENT[k] || "#000000";
+    picker.value = v;
+    hex.value = v;
+  });
+  previewTheme();
+}
+
+function collectTheme() {
+  const out = {};
+  THEME_KEYS.forEach((k) => { out[k] = $("th-" + k).value; });
+  return out;
+}
+
+THEME_KEYS.forEach((k) => {
+  const [picker, hex] = themeInputs(k);
+  picker.addEventListener("input", () => { hex.value = picker.value; previewTheme(); });
+  hex.addEventListener("input", () => {
+    const v = hex.value.trim();
+    if (/^#[0-9a-fA-F]{6}$/.test(v)) { picker.value = v; previewTheme(); }
+  });
+});
+
+document.querySelectorAll("button.preset").forEach((btn) => {
+  btn.onclick = async () => {
+    try {
+      const res = await post("/api/theme", {preset: btn.dataset.preset});
+      setThemeInputs(res.theme);
+      msg($("themeMsg"), "Applied and saved.", true);
+    } catch (e) { msg($("themeMsg"), e.message, false); }
+  };
+});
+
+$("btnSaveTheme").onclick = async () => {
+  try {
+    const res = await post("/api/theme", {theme: collectTheme()});
+    setThemeInputs(res.theme);
+    msg($("themeMsg"), "Appearance saved.", true);
+  } catch (e) { msg($("themeMsg"), e.message, false); }
+};
+
+$("btnResetTheme").onclick = async () => {
+  try {
+    const res = await post("/api/theme", {reset: true});
+    setThemeInputs(res.theme);
+    msg($("themeMsg"), "Reset to the Proxmox default.", true);
+  } catch (e) { msg($("themeMsg"), e.message, false); }
+};
+
+async function loadTheme() {
+  try {
+    const data = await api("/api/theme");
+    THEME_DEFAULTS_CLIENT = data.defaults || {};
+    setThemeInputs(data.theme || {});
+  } catch (e) { /* keep whatever the server already rendered */ }
+}
 
 // --- logs ---
 async function loadLogList() {
