@@ -377,8 +377,21 @@ fi
 
 # Optional config values with defaults
 EXCLUDE_IDS="${EXCLUDE_IDS:-}"
-WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT:-1200}"
+WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT:-3600}"
 START_STOPPED_WINDOWS="${START_STOPPED_WINDOWS:-false}"
+
+# How long a Windows guest that this script started gets to shut itself down
+# again, in seconds.
+#
+# Windows runs its servicing stack on shutdown ("Working on updates — do not
+# turn off your computer"), which routinely takes far longer than an ACPI
+# request normally would. This budget is never escalated to a forced stop: if
+# the guest is still going when it expires, it is left running and reported.
+WINDOWS_SHUTDOWN_TIMEOUT="${WINDOWS_SHUTDOWN_TIMEOUT:-900}"
+
+# How long a Linux guest that this script started gets to shut down before it
+# is forcibly stopped.
+LINUX_SHUTDOWN_TIMEOUT="${LINUX_SHUTDOWN_TIMEOUT:-180}"
 START_STOPPED_LXC="${START_STOPPED_LXC:-true}"
 START_STOPPED_LINUX_VMS="${START_STOPPED_LINUX_VMS:-true}"
 REBOOT_TIME="${REBOOT_TIME:-00:00}"
@@ -590,19 +603,109 @@ wait_for_agent() {
 # ==============================================================================
 # HELPER: Detect VM operating system via guest agent
 # ==============================================================================
+# Is a Proxmox `ostype` value one of the Windows ones?
+#
+# Proxmox uses: wxp w2k w2k3 w2k8 wvista win7 win8 win10 win11 for Windows, and
+# l24 l26 solaris other for everything else. Matching on the substring "win"
+# therefore missed wxp/w2k/w2k3/w2k8/wvista entirely, which meant those guests
+# were treated as Linux and gated on START_STOPPED_LINUX_VMS (default true)
+# rather than START_STOPPED_WINDOWS (default false) — so a config that
+# explicitly refused to boot stopped Windows guests booted them anyway. Anchor
+# on a leading "w", the same test the web UI patch already uses.
+is_windows_ostype() {
+    echo "${1:-}" | grep -qiE '^w'
+}
+
+# Classify a running guest. `ostype` from the VM config is authoritative when it
+# is set to a Windows value: it is what the administrator declared, it is
+# available without talking to the guest, and it cannot be spoofed by the guest.
+# The agent probe is only used to refine "not declared Windows".
+#
+# Returns: windows | linux | unknown
+#
+# "unknown" matters. This used to fall back to "linux" whenever the probe failed
+# or returned nothing, which sent Windows guests down the Linux path, where the
+# exec of /bin/bash fails and the guest is reported as a generic agent error —
+# and, more importantly, is never actually patched.
 detect_vm_os() {
     local vmid="$1"
+    local ostype=""
+    ostype=$(config_field qm "${vmid}" ostype)
+    if is_windows_ostype "${ostype}"; then
+        echo "windows"
+        return
+    fi
+
     local os_info=""
     os_info=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/get-osinfo" \
         --output-format json 2>/dev/null) || true
 
     if [ -n "$os_info" ]; then
-        if echo "$os_info" | grep -qi "mswindows\|windows\|microsoft"; then
+        # Match the machine-readable id field rather than grepping the whole
+        # blob: "pretty-name":"Microsoft Azure Linux 3.0" is not Windows, but a
+        # blob-wide search for "microsoft" said it was.
+        local os_id=""
+        os_id=$(echo "${os_info}" | jq -r '.id // empty' 2>/dev/null || true)
+        if [ -n "${os_id}" ]; then
+            case "${os_id}" in
+                mswindows|windows) echo "windows"; return ;;
+                *)                 echo "linux";   return ;;
+            esac
+        fi
+        # No usable id — fall back to the old substring test on the name fields.
+        if echo "$os_info" | grep -qi "mswindows"; then
             echo "windows"
             return
         fi
+        echo "linux"
+        return
     fi
-    echo "linux"
+
+    # The probe gave us nothing at all. Say so rather than guessing Linux.
+    if [ -n "${ostype}" ] && [ "${ostype}" != "other" ]; then
+        echo "linux"
+        return
+    fi
+    echo "unknown"
+}
+
+# Return a VM that this script started back to its stopped state.
+#
+# The distinction that matters here is Windows. A Windows guest may be running
+# its servicing stack — installing or rolling back updates — during shutdown,
+# and cutting power at that point is the one action in this whole script that
+# can leave a guest unbootable. So Windows gets a much longer budget and is
+# *never* escalated to `qm stop`; if it will not stop in time it is left running
+# and counted as mid-update, which also suppresses the host reboot.
+#
+# Linux guests keep the previous behaviour: ask, wait, then force.
+restore_stopped_vm() {
+    local vmid="$1" name="$2" ostype="${3:-linux}"
+
+    if [ "${DRY_RUN}" = "true" ]; then
+        print_skip "VM ${vmid} (${name}) — would be stopped again ${C_DIM}[dry run]${C_NC}"
+        return 0
+    fi
+
+    print_stop "Stopping VM ${vmid} (${name}) ${C_DIM}[restoring state]${C_NC}..."
+    qm shutdown "${vmid}" >/dev/null 2>&1 || true
+
+    local budget="${LINUX_SHUTDOWN_TIMEOUT}"
+    [ "${ostype}" = "windows" ] && budget="${WINDOWS_SHUTDOWN_TIMEOUT}"
+
+    if wait_for_status "vm" "${vmid}" "stopped" "${budget}"; then
+        return 0
+    fi
+
+    if [ "${ostype}" = "windows" ]; then
+        print_warn "VM ${vmid} (${name}) — still shutting down after ${budget}s; left running to finish safely"
+        GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+        return 1
+    fi
+
+    print_warn "VM ${vmid} (${name}) — ACPI shutdown timeout, forcing stop..."
+    qm stop "${vmid}" >/dev/null 2>&1 || true
+    return 1
 }
 
 # ==============================================================================
@@ -1649,11 +1752,26 @@ update_windows_vm() {
 
     # PowerShell script for Windows Update (uses COM objects, no modules needed)
     local ps_script='
-$ErrorActionPreference = "SilentlyContinue"
+# Stop, not SilentlyContinue. With SilentlyContinue a non-terminating COM
+# failure does not throw, so the catch below never ran: $SearchResult could be
+# $null, `$null.Updates.Count -eq 0` evaluates to False in PowerShell, and
+# execution fell through to report "UPDATED:" with an empty count — a
+# successful update of a guest that installed nothing.
+$ErrorActionPreference = "Stop"
+# Redirected stdout is otherwise encoded with the console OEM code page, which
+# mangles non-ASCII update titles by the time they reach the report.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
 try {
     $Session = New-Object -ComObject Microsoft.Update.Session
     $Searcher = $Session.CreateUpdateSearcher()
     $SearchResult = $Searcher.Search("IsInstalled=0 and Type='"'"'Software'"'"'")
+    if ($null -eq $SearchResult -or $null -eq $SearchResult.Updates) {
+        Write-Output "ERROR:Windows Update search returned no result object"
+        exit 0
+    }
     if ($SearchResult.Updates.Count -eq 0) {
         Write-Output "NO_UPDATES"
         exit 0
@@ -1673,6 +1791,10 @@ try {
     $Downloader = $Session.CreateUpdateDownloader()
     $Downloader.Updates = $SearchResult.Updates
     $DownloadResult = $Downloader.Download()
+    if ($DownloadResult.ResultCode -ne 2) {
+        Write-Output "ERROR:Download returned result code $($DownloadResult.ResultCode) (HRESULT $($DownloadResult.HResult))"
+        exit 0
+    }
     $Installer = New-Object -ComObject Microsoft.Update.UpdateInstaller
     $Installer.Updates = $SearchResult.Updates
     $InstallResult = $Installer.Install()
@@ -1683,6 +1805,10 @@ try {
     Write-Output "UPDATED:$Count"
     foreach ($name in $Names) {
         Write-Output $name
+    }
+    # Last, so it cannot disturb the "first line is UPDATED:<count>" contract.
+    if ($InstallResult.RebootRequired) {
+        Write-Output "__REBOOT_PENDING__"
     }
 } catch {
     Write-Output "ERROR:$($_.Exception.Message)"
@@ -1706,7 +1832,7 @@ ${ps_script}"
     # Execute via guest agent
     local exec_result=""
     exec_result=$(pvesh create "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec" \
-        --command "powershell.exe -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded_cmd}" \
+        --command "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded_cmd}" \
         --output-format json 2>&1) || {
         echo "EXEC_FAILED"
         return
@@ -1944,7 +2070,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
 
         # Check if this is a Windows VM before starting (from config)
         VM_OSTYPE_CONFIG=$(config_field qm "${VMID}" ostype)
-        if echo "${VM_OSTYPE_CONFIG}" | grep -qi "win"; then
+        if is_windows_ostype "${VM_OSTYPE_CONFIG}"; then
             VM_OS_TYPE="windows"
             # Respect START_STOPPED_WINDOWS setting
             if [ "${START_STOPPED_WINDOWS}" != "true" ]; then
@@ -1979,10 +2105,15 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
                     ERRORS_OCCURRED=true
                     record_guest_failure "${VMID}" "${VM_NAME}" "guest agent not responding"
                     VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Agent Timeout</span></td><td>VM started but QEMU Guest Agent did not respond within ${agent_timeout} seconds.</td></tr>"
-                    # Shut it back down
-                    print_stop "Stopping VM ${VMID} (${VM_NAME}) ${C_DIM}[restoring state]${C_NC}..."
-                    qm shutdown "${VMID}" >/dev/null 2>&1 || true
-                    wait_for_status "vm" "${VMID}" "stopped" 120 || qm stop "${VMID}" >/dev/null 2>&1 || true
+                    # Shut it back down.
+                    #
+                    # Never force-stop a Windows guest here. The most likely
+                    # reason a Windows VM we just started has no guest agent is
+                    # that it is sitting at "Configuring Windows updates" from a
+                    # previous cycle — which is precisely when pulling the power
+                    # corrupts it. Ask politely, and if it will not go, leave it
+                    # running and say so.
+                    restore_stopped_vm "${VMID}" "${VM_NAME}" "${VM_OS_TYPE}"
                     continue
                 fi
                 stop_spinner
@@ -2018,6 +2149,19 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
         VM_OS_TYPE=$(detect_vm_os "${VMID}")
     fi
 
+    # An OS we could not identify must not be guessed at. Running the Linux
+    # payload against a Windows guest silently leaves it unpatched, and running
+    # it against anything else is a shot in the dark.
+    if [ "${VM_OS_TYPE}" = "unknown" ]; then
+        print_fail "VM ${VMID} (${VM_NAME}) — could not determine the guest OS"
+        VM_ERRORS=$((VM_ERRORS + 1))
+        ERRORS_OCCURRED=true
+        record_guest_failure "${VMID}" "${VM_NAME}" "could not determine guest OS"
+        VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-error'>Unknown OS</span></td><td>The guest agent returned no OS information and <code>ostype</code> is not set in the VM config. Set <code>ostype</code> so the correct update method is used.</td></tr>"
+        [ "${VM_WAS_STOPPED}" = true ] && restore_stopped_vm "${VMID}" "${VM_NAME}" "linux"
+        continue
+    fi
+
     # Build display suffix
     local_suffix=""
     [ "${VM_WAS_STOPPED}" = true ] && local_suffix=" ${C_DIM}[was stopped]${C_NC}"
@@ -2048,7 +2192,15 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
     if [ "${VM_OS_TYPE}" = "windows" ]; then
         # ---- WINDOWS VM UPDATE ----
         start_spinner "Updating VM ${VMID} (${VM_NAME}) [Windows]..."
-        WIN_OUTPUT=$(update_windows_vm "${VMID}" "${WINDOWS_UPDATE_TIMEOUT}")
+        # Strip carriage returns once, here, rather than in each branch below.
+        # PowerShell terminates every line with CRLF, and command substitution
+        # removes the trailing newline but never the CR. That left WIN_OUTPUT as
+        # "NO_UPDATES\r", so the exact-equality test against "NO_UPDATES" was
+        # false for every healthy Windows guest and each one was reported as an
+        # unrecognised-output error on every run. It also left stray CRs inside
+        # the extracted counts and update titles, which corrupted the console
+        # output and the HTML report.
+        WIN_OUTPUT=$(update_windows_vm "${VMID}" "${WINDOWS_UPDATE_TIMEOUT}" | tr -d '\r')
         stop_spinner
 
         if [ "${WIN_OUTPUT}" = "EXEC_FAILED" ] || [ "${WIN_OUTPUT}" = "ENCODE_FAILED" ]; then
@@ -2070,6 +2222,14 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             print_warn "VM ${VMID} (${VM_NAME}) — Windows Update timed out after ${WINDOWS_UPDATE_TIMEOUT}s${local_suffix}"
             VM_WIN_TIMEOUT=$((VM_WIN_TIMEOUT + 1))
             GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+            # A timeout leaves the guest in an unknown state, so it has to count
+            # as a failure. It previously set no error flag at all, which meant
+            # the run was recorded as "ok", a failure-only notification stayed
+            # silent, and — because the id never reached FAILED_THIS_RUN — any
+            # existing failure streak for this guest was reset to zero.
+            VM_ERRORS=$((VM_ERRORS + 1))
+            ERRORS_OCCURRED=true
+            record_guest_failure "${VMID}" "${VM_NAME}" "Windows Update timed out after ${WINDOWS_UPDATE_TIMEOUT}s"
             # Don't shut down a Windows VM mid-update! Leave it running.
             VM_WAS_STOPPED=false
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Timeout</span></td><td>Windows Update did not complete within ${WINDOWS_UPDATE_TIMEOUT}s. VM left running to finish.</td></tr>"
@@ -2091,11 +2251,31 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td><strong>${WIN_COUNT} update(s) would be installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
         elif echo "${WIN_OUTPUT}" | grep -q "^UPDATED:"; then
             WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^UPDATED://')
-            WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2)
+            WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2 | grep -v '^__REBOOT_PENDING__$' || true)
+            WIN_REBOOT_PENDING=false
+            echo "${WIN_OUTPUT}" | grep -q '^__REBOOT_PENDING__$' && WIN_REBOOT_PENDING=true
             print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${WIN_COUNT} Windows updates installed${C_NC}${local_suffix}"
             VM_WIN_UPDATED=$((VM_WIN_UPDATED + 1))
             VM_UPDATED=$((VM_UPDATED + 1))
-            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${WIN_COUNT} update(s) installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
+            WIN_LEFT_RUNNING=""
+            if [ "${WIN_REBOOT_PENDING}" = true ]; then
+                WIN_LEFT_RUNNING=" Windows reports a reboot is required to finish installing."
+            fi
+            if [ "${VM_WAS_STOPPED}" = true ]; then
+                # This is the dangerous case, and it used to be the unguarded
+                # one. Updates have just been written and a servicing reboot is
+                # pending, so the guest is about to spend a long time in
+                # "Working on updates — do not turn off your computer". The
+                # restore-state block below would ask it to shut down and then
+                # force-stop it a few minutes later, cutting power in the middle
+                # of that. Leave it running instead and let it settle; the next
+                # scheduled run will find it idle and stop it then.
+                print_warn "VM ${VMID} (${VM_NAME}) — left running to finish installing (was stopped)"
+                VM_WAS_STOPPED=false
+                GUESTS_MID_UPDATE=$((GUESTS_MID_UPDATE + 1))
+                WIN_LEFT_RUNNING="${WIN_LEFT_RUNNING} It was started by this run and has been left running to complete servicing safely; it will be returned to its stopped state once it settles."
+            fi
+            VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-success'>Updated</span></td><td><strong>${WIN_COUNT} update(s) installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul>${WIN_LEFT_RUNNING}</td></tr>"
         else
             # Unrecognised output means the PowerShell script did not finish.
             # Treating that as "up to date" would hide a broken guest.
@@ -2190,12 +2370,7 @@ for VMID in $(qm list | awk 'NR>1 {print $1}'); do
 
     # Restore stopped state if needed
     if [ "${VM_WAS_STOPPED}" = true ]; then
-        print_stop "Stopping VM ${VMID} (${VM_NAME}) ${C_DIM}[restoring state]${C_NC}..."
-        qm shutdown "${VMID}" >/dev/null 2>&1 || true
-        if ! wait_for_status "vm" "${VMID}" "stopped" 180; then
-            print_warn "VM ${VMID} — ACPI shutdown timeout, forcing stop..."
-            qm stop "${VMID}" >/dev/null 2>&1 || true
-        fi
+        restore_stopped_vm "${VMID}" "${VM_NAME}" "${VM_OS_TYPE}"
     fi
 done
 
