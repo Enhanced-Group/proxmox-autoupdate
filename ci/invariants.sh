@@ -109,6 +109,40 @@ for key in ${PANEL_ONLY}; do
     fi
 done
 
+# --- 3b. Shared JS only touches elements both pages have ---------------------
+# SHARED_JS is loaded by the main panel *and* by the per-guest page. An element
+# lookup for something only the main page has throws on the guest page, and
+# because it is usually inside a timer or an event handler it fails silently
+# rather than at load. This caught exactly that: a run timer added to the main
+# page, referenced from shared code, with no such element on the guest page.
+echo "== shared JS element references =="
+python3 - <<'PYCHECK'
+import re, sys
+
+src = open("webui/pve-autoupdate-ui", encoding="utf-8").read()
+
+def block(name):
+    i = src.index(name + ' = r"""')
+    j = src.index('"""', i + len(name) + 8)
+    return src[i:j]
+
+shared = block("SHARED_JS")
+refs = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', shared))
+
+bad = False
+for tpl in ("PAGE_TEMPLATE", "GUEST_TEMPLATE"):
+    ids = set(re.findall(r'id="([A-Za-z0-9_-]+)"', block(tpl)))
+    missing = sorted(r for r in refs if r not in ids)
+    if missing:
+        print("  [FAIL] SHARED_JS references %s, which %s does not contain"
+              % (", ".join(missing), tpl))
+        bad = True
+    else:
+        print("  [ ok ] every SHARED_JS lookup exists in %s" % tpl)
+sys.exit(1 if bad else 0)
+PYCHECK
+[ $? -eq 0 ] || FAILED=1
+
 # --- 4. No CR bytes ----------------------------------------------------------
 # A CRLF in a shebang makes the kernel look for an interpreter literally named
 # "bash\r". .gitattributes normalises this, but a file added without a matching

@@ -339,9 +339,36 @@ JSBLOCK_HEAD
         win.show();
     }
 
+    /* Which theme is Proxmox actually showing?
+       Not the same question as the operating system's preference: Proxmox has
+       its own light/dark setting, and a dark Proxmox on a light desktop opened
+       this panel in light mode inside a dark window.
+
+       Measured from the rendered page rather than read from a cookie or a class
+       name, so it keeps working when Proxmox renames or restructures its
+       themes — which it has done before. */
+    function proxmoxTheme() {
+        try {
+            var probe = document.querySelector('.x-panel-body') || document.body;
+            var bg = window.getComputedStyle(probe).backgroundColor || '';
+            var m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(bg);
+            if (!m) { return null; }
+            /* Perceived brightness. Anything below the midpoint is a dark theme. */
+            var lum = (0.2126 * +m[1] + 0.7152 * +m[2] + 0.0722 * +m[3]) / 255;
+            return lum < 0.5 ? 'dark' : 'light';
+        } catch (e) { return null; }
+    }
+
+    function withTheme(url) {
+        var theme = proxmoxTheme();
+        if (!theme) { return url; }
+        return url + (url.indexOf('?') === -1 ? '?' : '&') + 'theme=' + theme;
+    }
+
     function openPanel(title, url) {
+        var themed = withTheme(url);
         probePanel().then(function (reachable) {
-            if (reachable) { openWindow(title, url); } else { showCertHelp(url); }
+            if (reachable) { openWindow(title, themed); } else { showCertHelp(url); }
         });
     }
 

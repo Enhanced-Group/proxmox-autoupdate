@@ -12,6 +12,30 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.2.1 — 2026-08-11
+
+### Fixed
+
+- **The panel followed the operating system's light/dark preference, not
+  Proxmox's.** Those are frequently not the same — a dark Proxmox on a light
+  desktop opened this panel in light mode inside a dark window, which is most
+  of why it looked like a foreign object. The toolbar patch now measures the
+  theme Proxmox is actually rendering and passes it in the panel URL, and the
+  panel applies it in `<head>` so it never paints in the wrong theme first.
+  Opened directly rather than through the button, it still falls back to the
+  system preference.
+
+  The theme is measured from the rendered page rather than read from a cookie
+  or a class name, so it keeps working when Proxmox renames or restructures its
+  themes — which it has done before. Only `dark` and `light` are accepted from
+  the URL.
+
+- **Scrollbars used the browser default**, which on a dark panel reads as a
+  pale hole punched through it. They now derive from the theme tokens, so they
+  follow light and dark and pick up a custom accent on hover. Log output keeps
+  its own darker scrollbar, because it stays a console view in both themes —
+  the page scrollbar there would have been a light bar on black.
+
 ## 4.2.0 — 2026-08-11
 
 ### Added

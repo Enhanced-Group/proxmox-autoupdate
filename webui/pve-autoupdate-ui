@@ -2305,25 +2305,6 @@ function relTime(when) {
   return years + (years === 1 ? " year ago" : " years ago");
 }
 
-// Elapsed-time readout for a run in progress. Ticks once a second rather than
-// only on the 2s status poll, so it reads as a live clock instead of a value
-// that lurches.
-let runStartedAt = null;
-function fmtElapsed(secs) {
-  if (secs < 60) { return secs + "s"; }
-  if (secs < 3600) {
-    return Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0") + "s";
-  }
-  return Math.floor(secs / 3600) + "h " +
-         String(Math.floor((secs % 3600) / 60)).padStart(2, "0") + "m";
-}
-function tickTimer() {
-  // started_at is a Unix timestamp in seconds, not milliseconds and not ISO.
-  if (!runStartedAt) { return; }
-  const secs = Math.max(0, Math.round(Date.now() / 1000 - runStartedAt));
-  $("runTimer").textContent = "running for " + fmtElapsed(secs);
-}
-setInterval(() => { if (!$("runTimer").classList.contains("hidden")) { tickTimer(); } }, 1000);
 
 function humanSize(bytes) {
   if (bytes < 1024) { return bytes + " B"; }
@@ -2515,14 +2496,48 @@ SHARED_CSS = r"""  :root {
     --bg: #1e1e1e; --panel: #2a2a2a; --border: #3d3d3d; --text: #e8e8e8;
     --muted: #9a9a9a; --accent: #e65c00; --ok: #4caf50; --warn: #ffb300;
     --err: #f44336; --btn: #3a3a3a;
+    --scroll-thumb: #4a4a4a; --scroll-thumb-hover: #5c5c5c; --scroll-track: #242424;
+    --code-bg: #111111; --code-text: #dddddd;
+    --code-scroll-thumb: #3a3a3a; --code-scroll-track: #0b0b0b;
   }
+  /* The operating system's preference is only a fallback. Proxmox has its own
+     light/dark setting, and it is frequently not the same as the OS one — a
+     dark Proxmox on a light desktop rendered this panel light inside a dark
+     window. The toolbar patch passes the real theme in the panel URL, which
+     sets data-theme below and wins over this. */
   @media (prefers-color-scheme: light) {
     :root {
       --bg: #f4f6f9; --panel: #fff; --border: #dee2e6; --text: #24292f;
       --muted: #6c757d; --btn: #f0f0f0;
+      --scroll-thumb: #c1c7cf; --scroll-thumb-hover: #a8b0ba; --scroll-track: #eef1f4;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #1e1e1e; --panel: #2a2a2a; --border: #3d3d3d; --text: #e8e8e8;
+    --muted: #9a9a9a; --btn: #3a3a3a;
+    --scroll-thumb: #4a4a4a; --scroll-thumb-hover: #5c5c5c; --scroll-track: #242424;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6f9; --panel: #fff; --border: #dee2e6; --text: #24292f;
+    --muted: #6c757d; --btn: #f0f0f0;
+    --scroll-thumb: #c1c7cf; --scroll-thumb-hover: #a8b0ba; --scroll-track: #eef1f4;
+  }
   * { box-sizing: border-box; }
+
+  /* Scrollbars.
+     The browser default is a light grey bar, which on a dark panel reads as a
+     hole punched through it. scrollbar-color is the standard property; the
+     -webkit- pseudo-elements cover Safari and older Chromium. Both derive from
+     the theme tokens, so they follow light/dark and the chosen accent. */
+  * { scrollbar-color: var(--scroll-thumb) var(--scroll-track); scrollbar-width: thin; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--scroll-track); }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scroll-thumb); border-radius: 5px;
+    border: 2px solid var(--scroll-track);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }
+  ::-webkit-scrollbar-corner { background: var(--scroll-track); }
   body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
          font: 13px/1.5 "Segoe UI", Tahoma, sans-serif; }
   h1 { font-size: 17px; margin: 0 0 4px; color: var(--accent); }
@@ -2544,9 +2559,20 @@ SHARED_CSS = r"""  :root {
                   border: 1px solid var(--border); background: var(--bg);
                   color: var(--text); font: inherit; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
-  pre { background: #111; color: #ddd; padding: 10px; border-radius: 4px;
+  /* Log output stays dark in both themes — it is console output, and Proxmox's
+     own task viewer reads the same way. It therefore needs its own scrollbar
+     colours rather than the page ones, which would be a pale bar on black in
+     light mode. */
+  pre { background: var(--code-bg); color: var(--code-text); padding: 10px;
+        border-radius: 4px; border: 1px solid var(--border);
         max-height: 380px; overflow: auto; font: 11px/1.45 "Cascadia Mono",
-        "Courier New", monospace; white-space: pre-wrap; word-break: break-word; margin: 0; }
+        "Courier New", monospace; white-space: pre-wrap; word-break: break-word; margin: 0;
+        scrollbar-color: var(--code-scroll-thumb) var(--code-scroll-track); }
+  pre::-webkit-scrollbar-track { background: var(--code-scroll-track); }
+  pre::-webkit-scrollbar-thumb {
+    background: var(--code-scroll-thumb); border: 2px solid var(--code-scroll-track);
+  }
+  pre::-webkit-scrollbar-thumb:hover { background: var(--accent); }
   .pill { display: inline-block; padding: 2px 9px; border-radius: 10px;
           font-size: 11px; font-weight: 600; }
   .pill.idle { background: #444; color: #ddd; }
@@ -2694,6 +2720,15 @@ PAGE_TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Proxmox Auto-Update</title>
 <style>{{CSS}}</style>
+<script>
+/* Adopt the theme Proxmox is actually using, which the toolbar patch passes in
+   the URL. Runs in <head> so the page never paints in the wrong theme first.
+   Falls back to the operating system preference when opened directly. */
+(function () {
+  var m = /[?&]theme=(dark|light)/.exec(location.search);
+  if (m) { document.documentElement.setAttribute("data-theme", m[1]); }
+})();
+</script>
 </head>
 <body>
 <h1>Proxmox Auto-Update</h1>
@@ -3897,6 +3932,28 @@ $("btnSaveExcl").onclick = async () => {
 // --- status + live log ---
 let logOffset = 0, activeLog = null, wasRunning = false;
 
+// Elapsed-time readout for a run in progress. Lives here rather than in the
+// shared script because only this page has a timer: shared code that reaches
+// for an element the per-guest page lacks fails silently inside a timer.
+let runStartedAt = null;
+function fmtElapsed(secs) {
+  if (secs < 60) { return secs + "s"; }
+  if (secs < 3600) {
+    return Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0") + "s";
+  }
+  return Math.floor(secs / 3600) + "h " +
+         String(Math.floor((secs % 3600) / 60)).padStart(2, "0") + "m";
+}
+function tickTimer() {
+  // started_at is a Unix timestamp in seconds, not milliseconds and not ISO.
+  if (!runStartedAt) { return; }
+  const secs = Math.max(0, Math.round(Date.now() / 1000 - runStartedAt));
+  $("runTimer").textContent = "running for " + fmtElapsed(secs);
+}
+setInterval(() => {
+  if (!$("runTimer").classList.contains("hidden")) { tickTimer(); }
+}, 1000);
+
 async function poll() {
   try {
     const st = await api("/api/status");
@@ -4458,6 +4515,15 @@ GUEST_TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Auto-Update — {{VMID}}</title>
 <style>{{CSS}}</style>
+<script>
+/* Adopt the theme Proxmox is actually using, which the toolbar patch passes in
+   the URL. Runs in <head> so the page never paints in the wrong theme first.
+   Falls back to the operating system preference when opened directly. */
+(function () {
+  var m = /[?&]theme=(dark|light)/.exec(location.search);
+  if (m) { document.documentElement.setAttribute("data-theme", m[1]); }
+})();
+</script>
 </head>
 <body>
 <div class="card">
