@@ -19,11 +19,15 @@ CLI_DRY_RUN=""
 ONLY_IDS=""
 SEND_EMAIL="true"
 DETACH="false"
+DOCTOR="false"
 RAW_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         -n|--dry-run)
             CLI_DRY_RUN="true"
+            ;;
+        --doctor)
+            DOCTOR="true"
             ;;
         --detach)
             DETACH="true"
@@ -52,6 +56,11 @@ Usage: update-everything.sh [options]
 
   --no-email        Do not send any notification for this run. Useful when the
                     output is already being watched live.
+
+  --doctor          Check this installation and report what would stop it
+                    working, without changing anything. Run this first if a
+                    scheduled run appears to do nothing. Exits non-zero if any
+                    check fails.
 
   --detach          Hand the run to systemd and return immediately. Use this
                     from the Proxmox web shell: the run then survives closing
@@ -223,6 +232,251 @@ notify_fatal() {
     esac
     return 0
 }
+
+# --- SELF-DIAGNOSTIC ---
+# Everything the update path silently depends on, checked in one place and
+# reported in plain language. This exists because the failure modes that matter
+# most are the quiet ones: a host whose repositories are broken, a node where
+# pmxcfs is down, an install on a machine that is not a Proxmox host at all. All
+# of those used to end in "all clear" and an empty report.
+#
+# Read-only. Changes nothing, sends nothing, starts nothing.
+DOC_FAIL=0
+DOC_WARN=0
+_d_ok()   { echo "  [ ok ] $1"; }
+_d_warn() { echo "  [warn] $1"; DOC_WARN=$((DOC_WARN + 1)); }
+_d_fail() { echo "  [FAIL] $1"; DOC_FAIL=$((DOC_FAIL + 1)); }
+_d_head() { echo ""; echo "── $1"; }
+
+run_doctor() {
+    echo ""
+    echo "proxmox-autoupdate — self-check (version ${PAU_VERSION})"
+    echo "Nothing is changed by this command."
+
+    _d_head "Host"
+    if [ "$(id -u)" -eq 0 ]; then
+        _d_ok "running as root"
+    else
+        _d_fail "not running as root — the real run needs root for pct, qm and apt"
+    fi
+
+    if command -v pveversion >/dev/null 2>&1 && [ -d /etc/pve ]; then
+        _d_ok "Proxmox VE detected: $(pveversion 2>/dev/null | head -1)"
+    else
+        _d_fail "this is not a Proxmox VE host (pveversion and /etc/pve required)"
+        _d_fail "  → run this on the PVE host itself, not in a VM or container"
+    fi
+
+    local t
+    for t in pct qm pvesh; do
+        command -v "${t}" >/dev/null 2>&1 && _d_ok "${t} found" || _d_fail "${t} not found on PATH"
+    done
+
+    _d_head "Cluster filesystem"
+    if pct list >/dev/null 2>&1; then
+        _d_ok "pct list works ($(pct list 2>/dev/null | awk 'NR>1' | wc -l) container(s))"
+    else
+        _d_fail "pct list failed — containers cannot be enumerated"
+        _d_fail "  → check: systemctl status pve-cluster"
+    fi
+    if qm list >/dev/null 2>&1; then
+        _d_ok "qm list works ($(qm list 2>/dev/null | awk 'NR>1' | wc -l) VM(s))"
+    else
+        _d_fail "qm list failed — VMs cannot be enumerated"
+        _d_fail "  → check: systemctl status pve-cluster"
+    fi
+
+    _d_head "Dependencies"
+    local pkg
+    for t in jq python3 curl flock; do
+        case "${t}" in
+            flock) pkg="util-linux" ;;
+            *)     pkg="${t}" ;;
+        esac
+        command -v "${t}" >/dev/null 2>&1 && _d_ok "${t}" \
+            || _d_fail "${t} missing (required) — apt-get install -y ${pkg}"
+    done
+    command -v systemd-run >/dev/null 2>&1 && _d_ok "systemd-run (needed by --detach)" \
+        || _d_warn "systemd-run missing — --detach will not work"
+    command -v fuser >/dev/null 2>&1 && _d_ok "fuser (used by the panel's run-in-progress guard)" \
+        || _d_warn "fuser missing — apt-get install -y psmisc"
+    command -v linux-version >/dev/null 2>&1 && _d_ok "linux-version (accurate kernel comparison)" \
+        || _d_warn "linux-version missing — apt-get install -y linux-base"
+
+    _d_head "This installation"
+    local installed="/usr/local/bin/update-everything.sh"
+    if [ -f "${installed}" ]; then
+        if head -1 "${installed}" | grep -q '^#!'; then
+            if bash -n "${installed}" 2>/dev/null; then
+                if grep -q '^PAU_VERSION=' "${installed}"; then
+                    _d_ok "${installed} looks like a valid copy of this script"
+                else
+                    _d_fail "${installed} parses but has no PAU_VERSION — it is not this script"
+                fi
+            else
+                _d_fail "${installed} is not valid shell — the download was corrupted"
+                _d_fail "  → reinstall; a proxy or captive portal may have replaced it with an error page"
+            fi
+        else
+            _d_fail "${installed} does not start with #! — it is not a script at all"
+            _d_fail "  → head -3 ${installed}   (probably an HTML error page)"
+        fi
+    else
+        _d_warn "${installed} not present (running from a checkout?)"
+    fi
+
+    _d_head "Configuration"
+    if [ -f "${CONFIG_FILE}" ]; then
+        _d_ok "${CONFIG_FILE} exists"
+        if bash -n "${CONFIG_FILE}" 2>/dev/null; then
+            _d_ok "config parses as shell"
+        else
+            _d_fail "config is not valid shell — the run will abort on it"
+        fi
+        local mode
+        mode=$(stat -c '%a' "${CONFIG_FILE}" 2>/dev/null || echo "?")
+        if [ "${mode}" = "600" ]; then
+            _d_ok "config permissions are 600"
+        else
+            _d_warn "config is mode ${mode}; it holds credentials — chmod 600 ${CONFIG_FILE}"
+        fi
+        local m
+        m=$(cfg_read NOTIFY_METHODS)
+        if [ -z "${m}" ] || [ "${m}" = "none" ]; then
+            _d_warn "no notification channel configured — failures will be silent"
+        else
+            _d_ok "notification methods: ${m}"
+        fi
+        if [ "$(cfg_read DRY_RUN)" = "true" ]; then
+            _d_warn "DRY_RUN=true — scheduled runs report but never install anything"
+        fi
+    else
+        _d_fail "${CONFIG_FILE} not found — run the installer"
+    fi
+
+    _d_head "Host package sources"
+    if [ "$(id -u)" -eq 0 ]; then
+        local apterr rc=0
+        apterr=$(apt-get update -qy 2>&1 >/dev/null) || rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            _d_ok "apt-get update succeeds"
+            local n
+            n=$(LC_ALL=C apt list --upgradable 2>/dev/null | grep -c '/' || true)
+            _d_ok "${n} host package(s) currently upgradable"
+        else
+            _d_fail "apt-get update exited ${rc} — the host cannot be updated"
+            echo "${apterr}" | tail -n 3 | sed 's/^/         /'
+        fi
+    else
+        _d_warn "skipping apt check (needs root)"
+    fi
+    if grep -rqs 'enterprise\.proxmox\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+        if [ -s /etc/subscription ]; then
+            _d_ok "enterprise repository enabled and a subscription is present"
+        else
+            _d_fail "enterprise repository enabled but no subscription — apt will fail every run"
+            _d_fail "  → switch to pve-no-subscription, or disable the enterprise repository"
+        fi
+    fi
+
+    _d_head "Scheduling"
+    if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1 \
+       || systemctl is-active --quiet cron 2>/dev/null; then
+        _d_ok "a cron daemon is running"
+    else
+        _d_fail "no cron daemon is running — nothing will ever trigger a scheduled run"
+        _d_fail "  → systemctl enable --now cron"
+    fi
+    if crontab -l 2>/dev/null | grep -q 'update-everything.sh'; then
+        _d_ok "crontab entry present: $(crontab -l 2>/dev/null | grep 'update-everything.sh' | head -1)"
+    else
+        _d_warn "no crontab entry for update-everything.sh"
+    fi
+
+    _d_head "Runtime state"
+    if [ -e "${LOCKFILE}" ]; then
+        if command -v fuser >/dev/null 2>&1 && fuser "${LOCKFILE}" >/dev/null 2>&1; then
+            _d_warn "a run is in progress right now (lock held)"
+        else
+            _d_ok "lockfile present but not held (normal between runs)"
+        fi
+    else
+        _d_ok "no lockfile"
+    fi
+    local logdir
+    logdir=$(cfg_read LOG_DIR); logdir="${logdir:-/var/log/proxmox-autoupdate}"
+    if [ -d "${logdir}" ] && [ -w "${logdir}" ]; then
+        _d_ok "log directory writable: ${logdir}"
+    else
+        _d_warn "log directory missing or not writable: ${logdir}"
+    fi
+    local avail_root avail_boot
+    avail_root=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "${avail_root}" ] && { [ "${avail_root}" -lt 1024 ] \
+        && _d_warn "only ${avail_root} MB free on / — an upgrade may fail" \
+        || _d_ok "${avail_root} MB free on /"; }
+    if mountpoint -q /boot 2>/dev/null; then
+        avail_boot=$(df -Pm /boot 2>/dev/null | awk 'NR==2{print $4}')
+        [ -n "${avail_boot}" ] && { [ "${avail_boot}" -lt 100 ] \
+            && _d_fail "only ${avail_boot} MB free on /boot — a kernel upgrade will fail" \
+            || _d_ok "${avail_boot} MB free on /boot"; }
+    fi
+    _d_ok "timezone: $(date +%Z) (reboot times are interpreted in this zone)"
+
+    _d_head "Web panel"
+    local uiport
+    uiport=$(cfg_read WEB_UI_PORT); uiport="${uiport:-8007}"
+    if [ "$(cfg_read ENABLE_WEB_UI)" = "true" ]; then
+        if systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
+            _d_ok "panel service is running on port ${uiport}"
+        else
+            _d_fail "panel is enabled in the config but the service is not running"
+            _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
+            if command -v ss >/dev/null 2>&1 && ss -lntH 2>/dev/null | grep -q ":${uiport} "; then
+                _d_fail "  → port ${uiport} is already in use by something else"
+                _d_fail "     (Proxmox Backup Server uses 8007 — pick another port)"
+            fi
+        fi
+    else
+        _d_ok "web panel not enabled"
+    fi
+
+    _d_head "Guests"
+    if qm list >/dev/null 2>&1; then
+        local vid vstate vname
+        while read -r vid vname vstate _; do
+            [ -z "${vid}" ] && continue
+            if [ "${vstate}" = "running" ]; then
+                if qm agent "${vid}" ping >/dev/null 2>&1; then
+                    _d_ok "VM ${vid} (${vname}): guest agent responding"
+                else
+                    _d_warn "VM ${vid} (${vname}): running but the guest agent is not responding — it cannot be updated"
+                fi
+            fi
+        done < <(qm list 2>/dev/null | awk 'NR>1 {print $1, $2, $3}')
+    fi
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+    if [ "${DOC_FAIL}" -gt 0 ]; then
+        echo "  ${DOC_FAIL} problem(s) will stop this working, ${DOC_WARN} warning(s)."
+        echo "  Fix the [FAIL] lines above, then run --doctor again."
+    elif [ "${DOC_WARN}" -gt 0 ]; then
+        echo "  No blocking problems. ${DOC_WARN} warning(s) worth a look."
+    else
+        echo "  Everything checks out."
+    fi
+    echo "────────────────────────────────────────────────────────────"
+    echo ""
+    [ "${DOC_FAIL}" -gt 0 ] && return 1
+    return 0
+}
+
+if [ "${DOCTOR}" = "true" ]; then
+    LOCKFILE="/var/run/proxmox-autoupdate.lock"
+    run_doctor
+    exit $?
+fi
 
 # --- PREFLIGHT ---
 # These checks come before the lockfile, because the lockfile itself needs root
@@ -558,6 +812,11 @@ REBOOT_TIME="${REBOOT_TIME:-00:00}"
 # How long a Linux guest (VM or LXC) gets to finish its upgrade, in seconds.
 # A real dist-upgrade over a slow mirror routinely exceeds five minutes.
 LINUX_UPDATE_TIMEOUT="${LINUX_UPDATE_TIMEOUT:-1800}"
+
+# How long the guest-agent poll loop tolerates exec-status errors before it
+# concludes the agent is gone. A guest that upgrades its own qemu-guest-agent
+# restarts it mid-run, which drops the exec-pid table for a while.
+AGENT_ERROR_GRACE="${AGENT_ERROR_GRACE:-120}"
 
 # How long apt waits for the dpkg/apt lock inside a guest before giving up.
 # Distros with unattended-upgrades enabled (Ubuntu by default) will otherwise
@@ -1150,52 +1409,86 @@ guest_exec_wait() {
 
     GX_STATE="timeout"
     GX_EXITCODE=""
+    GX_SIGNAL=""
     GX_OUT=""
     GX_ERR=""
 
-    local max_polls=$(( timeout / poll_interval ))
-    [ "${max_polls}" -lt 1 ] && max_polls=1
-    local wait_count=0
+    # Budget against the wall clock, not against a poll count.
+    #
+    # This used to be max_polls = timeout / poll_interval, which charged only
+    # the sleeps and never the pvesh round-trip. With a 1800s setting and a
+    # ~0.5-1.5s API call per poll the real budget was closer to 2000-2300s, so
+    # the configured timeout did not mean what it said — and it meant something
+    # different again on the LXC path, which uses a real timeout(1).
+    local deadline=$(( $(date +%s) + timeout ))
     local consecutive_failures=0
+    local first_failure_at=0
     local parse_failures=0
 
-    while [ ${wait_count} -lt ${max_polls} ]; do
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
         local exec_status=""
         if ! exec_status=$(pvesh get "/nodes/${NODE_NAME}/qemu/${vmid}/agent/exec-status" \
                 --pid "${exec_pid}" --output-format json 2>/dev/null); then
-            # A single hiccup on the API or the agent socket is not a failed
-            # update. Only give up after three consecutive misses.
+            # A hiccup on the API or the agent socket is not a failed update.
+            #
+            # Three consecutive misses was about fifteen seconds, which is far
+            # too little: a Linux guest upgrading its own qemu-guest-agent
+            # restarts the agent mid-run and drops the exec-pid table, and any
+            # brief pvedaemon stall looks identical. Giving up here marks the
+            # guest mid-update, which also cancels the host's kernel reboot for
+            # the night. Tolerate it for a couple of minutes, and confirm with a
+            # ping before declaring the agent gone.
             consecutive_failures=$((consecutive_failures + 1))
-            if [ ${consecutive_failures} -ge 3 ]; then
-                GX_STATE="apierror"
-                return
+            [ "${first_failure_at}" -eq 0 ] && first_failure_at=$(date +%s)
+            if [ $(( $(date +%s) - first_failure_at )) -ge "${AGENT_ERROR_GRACE}" ]; then
+                if ! qm agent "${vmid}" ping >/dev/null 2>&1; then
+                    GX_STATE="apierror"
+                    return
+                fi
+                # Agent is alive; the exec record is what we lost. Keep waiting.
+                first_failure_at=$(date +%s)
             fi
-            sleep ${poll_interval}
-            wait_count=$((wait_count + 1))
+            sleep "${poll_interval}"
             continue
         fi
         consecutive_failures=0
+        first_failure_at=0
 
         # A reply that isn't JSON will never become JSON on a later poll — it
         # means --output-format json isn't being honoured. Fail fast and say so,
         # rather than silently burning the whole timeout and reporting a bogus
         # "timed out" for an update that actually ran.
+        # An empty reply is a parse failure too. jq exits 0 on empty input and
+        # prints nothing, so `exited` came back empty, the case below matched
+        # nothing, and the loop burned the entire timeout before reporting a
+        # bogus "timed out" — exactly what the comment above says it avoids.
         local exited=""
-        if ! exited=$(echo "${exec_status}" | jq -r '.exited // empty' 2>/dev/null); then
+        if [ -z "${exec_status}" ] || \
+           ! exited=$(echo "${exec_status}" | jq -re '.exited' 2>/dev/null); then
             parse_failures=$((parse_failures + 1))
             if [ ${parse_failures} -ge 2 ]; then
                 GX_STATE="badjson"
                 GX_OUT="${exec_status}"
                 return
             fi
-            sleep ${poll_interval}
-            wait_count=$((wait_count + 1))
+            sleep "${poll_interval}"
             continue
         fi
 
         case "${exited}" in
             1|true)
-                GX_EXITCODE=$(echo "${exec_status}" | jq -r '.exitcode // 0' 2>/dev/null || echo 0)
+                GX_EXITCODE=$(echo "${exec_status}" | jq -r '.exitcode // empty' 2>/dev/null || true)
+                # A process killed by a signal reports `signal`, not `exitcode`.
+                # Defaulting to 0 hid that entirely, so an OOM-killed upgrade
+                # looked like a clean exit.
+                GX_SIGNAL=$(echo "${exec_status}" | jq -r '.signal // empty' 2>/dev/null || true)
+                if [ -z "${GX_EXITCODE}" ]; then
+                    if [ -n "${GX_SIGNAL}" ]; then
+                        GX_EXITCODE="signal:${GX_SIGNAL}"
+                    else
+                        GX_EXITCODE="0"
+                    fi
+                fi
                 GX_OUT=$(echo "${exec_status}" | jq -r '."out-data" // empty' 2>/dev/null || true)
                 GX_ERR=$(echo "${exec_status}" | jq -r '."err-data" // empty' 2>/dev/null || true)
                 # Flag truncation so a clipped package list isn't mistaken for a
@@ -1209,8 +1502,7 @@ __LOG__ (output truncated by the guest agent)"
                 ;;
         esac
 
-        sleep ${poll_interval}
-        wait_count=$((wait_count + 1))
+        sleep "${poll_interval}"
     done
 
     GX_STATE="timeout"
@@ -2154,6 +2446,16 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
             LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})</td><td><span class='status-badge badge-warning'>Skipped</span></td><td>Stopped container — auto-start disabled in config.</td></tr>"
             continue
         fi
+        # A dry run reports; it does not change the state of the machine.
+        # Booting every stopped guest, waiting a minute each, then stopping them
+        # again is emphatically a change — and --help promises the opposite.
+        if [ "${DRY_RUN}" = "true" ]; then
+            print_skip "LXC ${CTID} (${CT_NAME}) — stopped; would be started and checked ${C_DIM}[dry run]${C_NC}"
+            LXC_SKIPPED=$((LXC_SKIPPED + 1))
+            LXC_HTML="${LXC_HTML}<tr><td><strong>${CTID}</strong> (${CT_NAME})</td><td><span class='status-badge badge-dim'>Skipped</span></td><td>Stopped container. A real run would start it, update it and stop it again.</td></tr>"
+            continue
+        fi
+
         print_action "Starting LXC ${CTID} (${CT_NAME}) ${C_DIM}[was stopped]${C_NC}..."
 
         if pct start "${CTID}" >/dev/null 2>&1; then
@@ -2207,7 +2509,7 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
     start_spinner "Updating LXC ${CTID} (${CT_NAME})..."
     CT_OUTPUT=""
     CT_RC=0
-    CT_OUTPUT=$(build_guest_update_script | timeout "${LINUX_UPDATE_TIMEOUT}" pct exec "${CTID}" -- /bin/sh 2>&1) || CT_RC=$?
+    CT_OUTPUT=$(build_guest_update_script | timeout -k 60 "${LINUX_UPDATE_TIMEOUT}" pct exec "${CTID}" -- /bin/sh 2>&1) || CT_RC=$?
     stop_spinner
 
     if [ "${CT_RC}" -eq 124 ]; then
@@ -2274,13 +2576,16 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
     esac
 
     # Restore stopped state if needed
-    if [ "${CT_WAS_STOPPED}" = true ]; then
+    if [ "${CT_WAS_STOPPED}" = true ] && [ "${DRY_RUN}" != "true" ]; then
         print_stop "Stopping LXC ${CTID} (${CT_NAME}) ${C_DIM}[restoring state]${C_NC}..."
-        pct shutdown "${CTID}" >/dev/null 2>&1 || pct stop "${CTID}" >/dev/null 2>&1 || true
-        wait_for_status "ct" "${CTID}" "stopped" 120 || {
+        # `pct shutdown` blocks for its own timeout and then exits non-zero, so
+        # `|| pct stop` fired an immediate force-stop and the wait below was
+        # dead weight. Ask first, wait properly, and only then force.
+        pct shutdown "${CTID}" >/dev/null 2>&1 || true
+        if ! wait_for_status "ct" "${CTID}" "stopped" "${LINUX_SHUTDOWN_TIMEOUT}"; then
             print_warn "LXC ${CTID} — shutdown timeout, forcing stop..."
             pct stop "${CTID}" >/dev/null 2>&1 || true
-        }
+        fi
     fi
 done
 
@@ -2349,6 +2654,14 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
                 VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-warning'>Skipped</span></td><td>Stopped Linux VM — auto-start disabled in config.</td></tr>"
                 continue
             fi
+        fi
+
+        # See the container loop: a dry run must not boot the machine.
+        if [ "${DRY_RUN}" = "true" ]; then
+            print_skip "VM ${VMID} (${VM_NAME}) — stopped; would be started and checked ${C_DIM}[dry run]${C_NC}"
+            VM_SKIPPED=$((VM_SKIPPED + 1))
+            VM_HTML="${VM_HTML}<tr><td><strong>${VMID}</strong> (${VM_NAME})</td><td><span class='status-badge badge-dim'>Skipped</span></td><td>Stopped VM. A real run would start it, update it and stop it again.</td></tr>"
+            continue
         fi
 
         print_action "Starting VM ${VMID} (${VM_NAME}) ${C_DIM}[was stopped]${C_NC}..."
@@ -2767,15 +3080,50 @@ fi   # end of full-sweep-only host section
 REBOOT_NEEDED=false
 REBOOT_REASON=""
 RUNNING_KERNEL=$(uname -r)
-LATEST_KERNEL=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|/boot/vmlinuz-||' || true)
+
+# Pick the highest kernel *version*, not the most recently written file.
+#
+# `ls -t` orders by mtime, which is not version order. Reinstalling or pinning
+# an older kernel — routine after a NIC or GPU driver problem, and what a /boot
+# restore does — made that older image the "latest", so the running kernel never
+# matched it and the host was rebooted at REBOOT_TIME after every single run,
+# forever, each time reporting a kernel change that had not happened.
+#
+# linux-version (from linux-base) knows how to order kernel versions properly;
+# sort -V is the fallback.
+KERNEL_LIST=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' || true)
+LATEST_KERNEL=""
+if [ -n "${KERNEL_LIST}" ]; then
+    if command -v linux-version >/dev/null 2>&1; then
+        LATEST_KERNEL=$(echo "${KERNEL_LIST}" | linux-version sort --reverse 2>/dev/null | head -1)
+    fi
+    [ -z "${LATEST_KERNEL}" ] && LATEST_KERNEL=$(echo "${KERNEL_LIST}" | sort -V | tail -1)
+fi
+
+# Did this run actually install a kernel? A version difference that predates the
+# run is a pre-existing skew (a pinned kernel, a stock Debian image pulled in as
+# a dependency), and rebooting for it every week is not an update, it is an
+# unexplained weekly outage.
+KERNEL_UPGRADED_THIS_RUN=false
+if [ -n "${HOST_UPDATES:-}" ] && \
+   echo "${HOST_UPDATES}" | grep -qE '(proxmox-kernel|pve-kernel|linux-image)'; then
+    KERNEL_UPGRADED_THIS_RUN=true
+fi
 
 if [ -n "${ONLY_IDS}" ]; then
     # Never reboot the host because of a targeted guest run.
     REBOOT_REASON="Reboot not considered — targeted run (--only ${ONLY_IDS})"
-elif [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
+elif [ "${KERNEL_UPGRADED_THIS_RUN}" = true ] && [ -n "${LATEST_KERNEL}" ] \
+     && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
     REBOOT_NEEDED=true
     REBOOT_REASON="Kernel updated: ${RUNNING_KERNEL} &rarr; ${LATEST_KERNEL}"
     print_warn "Kernel change detected: ${C_BOLD}${RUNNING_KERNEL} → ${LATEST_KERNEL}${C_NC}"
+elif [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" != "${LATEST_KERNEL}" ]; then
+    # Newer kernel present but not installed by this run. Report it; do not
+    # reboot for it, or every scheduled run reboots the host again.
+    print_warn "Running an older kernel than the newest installed (${RUNNING_KERNEL} vs ${LATEST_KERNEL})"
+    print_warn "No kernel was installed by this run, so no reboot has been scheduled."
+    REBOOT_REASON="Not rebooting: ${LATEST_KERNEL} is installed but was not updated by this run (running ${RUNNING_KERNEL})"
 fi
 
 if [ -z "${ONLY_IDS}" ] && [ -f /var/run/reboot-required ]; then
