@@ -18,6 +18,7 @@ import html
 import json
 import os
 import re
+import shlex
 import signal
 import ssl
 import subprocess
@@ -820,9 +821,67 @@ done
 
 
 GITHUB_REPO = "Enhanced-Group/proxmox-autoupdate"
-GITHUB_RAW = "https://raw.githubusercontent.com/%s/main" % GITHUB_REPO
-INSTALL_SCRIPT_URL = "%s/install.sh" % GITHUB_RAW
 UNINSTALL_SCRIPT = "/usr/local/bin/pve-autoupdate-uninstall"
+LATEST_RELEASE_API = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+
+# Update channel. "release" tracks published tags; "main" tracks the branch and
+# is for development only.
+#
+# This used to be pinned to /main unconditionally, and "Install update" runs the
+# installer unattended as root — so every push to this repository, reviewed or
+# not, finished or not, went straight into a root cron job on every machine that
+# clicked the button. Tracking releases means a commit has to be deliberately
+# tagged before it reaches anyone.
+UPDATE_CHANNEL = os.environ.get("PAU_UPDATE_CHANNEL", "release")
+
+_release_cache = {"ref": None, "at": 0.0}
+_release_lock = threading.Lock()
+
+
+def latest_release_ref():
+    """The newest published release tag, or None if it cannot be determined."""
+    if UPDATE_CHANNEL == "main":
+        return "main"
+    now = time.monotonic()
+    with _release_lock:
+        if _release_cache["ref"] and now - _release_cache["at"] < 300:
+            return _release_cache["ref"]
+    ref = None
+    try:
+        req = urllib.request.Request(
+            LATEST_RELEASE_API,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "proxmox-autoupdate (https://github.com/%s)" % GITHUB_REPO},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read(1_000_000).decode("utf-8", "replace"))
+        tag = data.get("tag_name")
+        if isinstance(tag, str) and re.match(r"\A[A-Za-z0-9._/-]{1,64}\Z", tag):
+            ref = tag
+    except (urllib.error.URLError, OSError, ValueError, ssl.SSLError):
+        ref = None
+    if ref:
+        with _release_lock:
+            _release_cache["ref"] = ref
+            _release_cache["at"] = now
+    return ref
+
+
+def github_raw_base(ref=None):
+    """Raw base URL for a ref, or None if no release ref could be resolved.
+
+    Deliberately does not fall back to main. Silently pulling an untagged branch
+    when the release lookup fails is exactly the behaviour this replaced.
+    """
+    ref = ref or latest_release_ref()
+    if not ref:
+        return None
+    return "https://raw.githubusercontent.com/%s/%s" % (GITHUB_REPO, ref)
+
+
+def install_script_url(ref=None):
+    base = github_raw_base(ref)
+    return "%s/install.sh" % base if base else None
 
 
 def installed_version():
@@ -844,7 +903,11 @@ def _version_tuple(v):
     return tuple(parts or [0])
 
 
-CHANGELOG_URL = "%s/CHANGELOG.md" % GITHUB_RAW
+def changelog_url(ref=None):
+    base = github_raw_base(ref)
+    return "%s/CHANGELOG.md" % base if base else None
+
+
 LOCAL_CHANGELOG = "/usr/local/share/proxmox-autoupdate/CHANGELOG.md"
 
 
@@ -911,8 +974,15 @@ def parse_changelog(text, limit=1):
 
 def fetch_changelog():
     """Published changelog, falling back to the copy installed alongside us."""
+    url = changelog_url()
+    if not url:
+        try:
+            with open(LOCAL_CHANGELOG, encoding="utf-8") as fh:
+                return fh.read(), "Showing the installed copy — no release found on GitHub."
+        except OSError:
+            return "", "Could not determine the latest release from GitHub."
     try:
-        return _fetch_raw(CHANGELOG_URL), None
+        return _fetch_raw(url), None
     except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
         try:
             with open(LOCAL_CHANGELOG, encoding="utf-8") as fh:
@@ -929,11 +999,17 @@ def check_for_updates():
     silently onto a node that merely looked.
     """
     current = installed_version()
+    ref = latest_release_ref()
+    if not ref:
+        return {"current": current, "latest": None,
+                "error": "Could not determine the latest release from GitHub. "
+                         "Nothing has been changed."}
+    base = github_raw_base(ref)
     try:
         # Read enough to be safe if the assignment ever moves further down the
         # file — a check that silently reports "up to date" because it stopped
         # reading too early is worse than a slightly larger fetch.
-        head = _fetch_raw("%s/update-everything.sh" % GITHUB_RAW, limit=65_536)
+        head = _fetch_raw("%s/update-everything.sh" % base, limit=65_536)
     except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
         return {"current": current, "latest": None,
                 "error": "Could not reach GitHub: %s" % exc}
@@ -954,7 +1030,8 @@ def check_for_updates():
         "update_available": bool(behind),
         "checked_at": time.strftime("%H:%M:%S"),
         "repo": "https://github.com/%s" % GITHUB_REPO,
-        "command": "curl -sSL %s | bash" % INSTALL_SCRIPT_URL,
+        "ref": ref,
+        "command": "curl -fsSL %s | bash" % install_script_url(ref),
     }
 
 
@@ -1588,7 +1665,7 @@ class Handler(BaseHTTPRequestHandler):
                 "entries": parse_changelog(text),
                 "installed": installed_version(),
                 "warning": warning,
-                "url": "https://github.com/%s/blob/main/CHANGELOG.md" % GITHUB_REPO,
+                "url": "https://github.com/%s/releases" % GITHUB_REPO,
             })
         elif path == "/api/config":
             # Secrets are redacted here, on the server.
@@ -1709,17 +1786,33 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": "A self-update or uninstall is already running."})
             return
 
+        ref = latest_release_ref()
+        url = install_script_url(ref)
+        if not url:
+            self._json(503, {"error": "Could not determine the latest release from GitHub. "
+                                      "Nothing has been changed."})
+            return
+
         # Runs detached: the installer replaces this very script and restarts
         # this service, so it cannot be a child of the request handling it.
-        # `set -o pipefail` and an explicit tmpdir keep a partial download from
-        # ever being executed.
+        #
+        # The downloaded installer is checked before it is executed. curl --fail
+        # already rejects an HTTP error, but a captive portal or filtering proxy
+        # can return 200 with its own body, and this runs as root — so confirm
+        # it is a shell script, that it parses, and that it is recognisably our
+        # installer before handing it to bash. PAU_REF pins the child install to
+        # the same tag we just resolved, so the version that gets installed is
+        # the one that was checked.
         command = (
-            "set -e; "
+            "set -eu; "
             "d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; "
-            "curl -fsSL %s -o \"$d/install.sh\"; "
+            "curl -fsSL --retry 3 --retry-delay 2 -m 120 %s -o \"$d/install.sh\"; "
             "test -s \"$d/install.sh\"; "
-            "bash \"$d/install.sh\" --unattended"
-        ) % INSTALL_SCRIPT_URL
+            "head -1 \"$d/install.sh\" | grep -q '^#!'; "
+            "grep -q 'proxmox-autoupdate' \"$d/install.sh\"; "
+            "bash -n \"$d/install.sh\"; "
+            "PAU_REF=%s bash \"$d/install.sh\" --unattended"
+        ) % (shlex.quote(url), shlex.quote(ref))
         # Remember what we are installing, so the button stays disabled until
         # that exact version is confirmed running rather than merely until the
         # unit exits.
@@ -1758,9 +1851,20 @@ class Handler(BaseHTTPRequestHandler):
         if os.path.isfile(UNINSTALL_SCRIPT):
             command = "%s --yes%s" % (UNINSTALL_SCRIPT, purge)
         else:
-            command = ("curl -fsSL %s/uninstall.sh -o /tmp/pau-uninstall.sh && "
-                       "bash /tmp/pau-uninstall.sh --yes%s; "
-                       "rm -f /tmp/pau-uninstall.sh" % (GITHUB_RAW, purge))
+            base = github_raw_base()
+            if not base:
+                self._json(503, {"error": "The local uninstaller is missing and the latest "
+                                          "release could not be resolved. Nothing was changed."})
+                return
+            command = (
+                "set -eu; "
+                "d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; "
+                "curl -fsSL --retry 3 -m 120 %s/uninstall.sh -o \"$d/uninstall.sh\"; "
+                "test -s \"$d/uninstall.sh\"; "
+                "head -1 \"$d/uninstall.sh\" | grep -q '^#!'; "
+                "bash -n \"$d/uninstall.sh\"; "
+                "bash \"$d/uninstall.sh\" --yes%s"
+            ) % (shlex.quote(base), purge)
 
         ok, detail = run_detached(command, UNINSTALL_UNIT)
         if not ok:

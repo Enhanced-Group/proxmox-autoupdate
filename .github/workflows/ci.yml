@@ -1,0 +1,148 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This project is distributed by `curl | bash` and runs as root on a
+      # hypervisor. A syntax error reaching main reaches every installation's
+      # root crontab, so the cheap checks matter more here than usual.
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck -S error -e SC1090,SC1091 \
+            install.sh uninstall.sh update-everything.sh \
+            webui/patch-webui.sh ci/invariants.sh
+
+      - name: bash -n
+        run: |
+          for f in install.sh uninstall.sh update-everything.sh \
+                   webui/patch-webui.sh ci/invariants.sh; do
+            bash -n "$f"
+          done
+
+      - name: python
+        run: |
+          python3 -m py_compile webui/pve-autoupdate-ui
+          pip install --quiet pyflakes
+          pyflakes webui/pve-autoupdate-ui
+
+      # These exit before the lockfile and before any privileged work, so they
+      # are safe to run in CI.
+      - name: cli smoke
+        run: |
+          bash update-everything.sh --help >/dev/null
+          ! bash update-everything.sh --only abc 2>/dev/null
+          ! bash update-everything.sh --bogus 2>/dev/null
+          bash install.sh --help >/dev/null
+
+      # --doctor is read-only by contract. On a runner it will report a long
+      # list of failures (this is not a Proxmox host) and exit 1; what is being
+      # checked is that it runs to completion and changes nothing.
+      - name: doctor runs read-only
+        run: |
+          before=$(find /etc /usr/local -newermt '-1 minute' 2>/dev/null | sort)
+          bash update-everything.sh --doctor >/dev/null 2>&1 || true
+          after=$(find /etc /usr/local -newermt '-1 minute' 2>/dev/null | sort)
+          if [ "$before" != "$after" ]; then
+            echo "--doctor modified the filesystem"; exit 1
+          fi
+
+      - name: repo invariants
+        run: bash ci/invariants.sh
+
+  patcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The web-UI patcher rewrites Proxmox's 5 MB pvemanagerlib.js. A bad edit
+      # there takes out the entire Proxmox web interface, so exercise the real
+      # apply/remove cycle against a stand-in file.
+      - name: patcher round-trip
+        run: |
+          work=$(mktemp -d)
+          {
+            echo 'var a = 1;'
+            echo 'Ext.define("PVE.StdWorkspace", {});'
+            head -c 100000 /dev/zero | tr '\0' 'x'
+            echo
+            echo 'var b = 2;'
+          } > "$work/lib.js"
+          cp "$work/lib.js" "$work/pristine.js"
+          export PAU_TARGET="$work/lib.js" PAU_BACKUP="$work/backup.js" PAU_CONFIG="$work/none.conf"
+
+          bash webui/patch-webui.sh apply
+          grep -q 'BEGIN proxmox-autoupdate button' "$work/lib.js"
+
+          # A second apply must not touch the file at all: the apt hook runs
+          # this after every dpkg transaction.
+          before=$(stat -c '%Y %i %s' "$work/lib.js")
+          bash webui/patch-webui.sh apply
+          after=$(stat -c '%Y %i %s' "$work/lib.js")
+          [ "$before" = "$after" ] || { echo "second apply rewrote the file"; exit 1; }
+
+          bash webui/patch-webui.sh remove
+          cmp "$work/lib.js" "$work/pristine.js" || { echo "remove was not byte-for-byte"; exit 1; }
+
+          # A damaged target must be refused, and must not overwrite the backup.
+          bash webui/patch-webui.sh apply >/dev/null
+          head -c 40 "$work/lib.js" > "$work/t" && mv "$work/t" "$work/lib.js"
+          if bash webui/patch-webui.sh apply; then
+            echo "apply accepted a truncated target"; exit 1
+          fi
+          cmp "$work/backup.js" "$work/pristine.js" || { echo "backup was clobbered"; exit 1; }
+
+          bash webui/patch-webui.sh restore
+          cmp "$work/lib.js" "$work/pristine.js" || { echo "restore failed"; exit 1; }
+
+          ls "$work" | grep -q 'pau\.' && { echo "staging file left behind"; exit 1; }
+          echo "patcher round-trip OK"
+
+  guest-payload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The script that runs inside every container and VM is a heredoc, so
+      # `bash -n` on the outer file does not validate it at all. It is piped
+      # into /bin/sh — dash on Debian, BusyBox ash on Alpine — so check it
+      # against both.
+      - name: guest script is POSIX
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y dash busybox
+          APT_LOCK_TIMEOUT=600 DRY_RUN=false bash -c '
+            eval "$(sed -n "/^build_guest_update_script() {/,/^GUESTSCRIPT$/p" update-everything.sh; echo "}")"
+            build_guest_update_script' > /tmp/guest.sh
+          test -s /tmp/guest.sh
+          dash -n /tmp/guest.sh
+          busybox sh -n /tmp/guest.sh
+          echo "guest payload parses under dash and busybox ash"
+
+      # A guest whose mirrors are unreachable must report a failure, not "up to
+      # date with zero packages" — that silent success was the single most
+      # likely cause of installations that appeared to work and patched nothing.
+      - name: guest reports apt failure
+        run: |
+          APT_LOCK_TIMEOUT=600 DRY_RUN=false bash -c '
+            eval "$(sed -n "/^build_guest_update_script() {/,/^GUESTSCRIPT$/p" update-everything.sh; echo "}")"
+            build_guest_update_script' > /tmp/guest.sh
+          fake=$(mktemp -d)
+          printf '#!/bin/sh\necho "Err: cannot resolve" >&2\nexit 100\n' > "$fake/apt-get"
+          printf '#!/bin/sh\nexit 100\n' > "$fake/apt"
+          chmod +x "$fake/apt-get" "$fake/apt"
+          result=$(PATH="$fake:$PATH" sh /tmp/guest.sh 2>&1 | grep '^__RESULT__' || true)
+          echo "got: $result"
+          case "$result" in
+            *FAIL*) echo "correctly reported FAIL" ;;
+            *) echo "guest reported success despite apt failing"; exit 1 ;;
+          esac
