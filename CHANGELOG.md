@@ -12,6 +12,24 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.3.0 — 2026-08-11
+
+### Added
+
+- **A sticky header, with Save in it.** The title, status, schedule and tabs
+  stay put while the page scrolls, and the header carries a save button on the
+  right that applies to whichever section is open. The per-card save buttons sit
+  at very different scroll depths depending on the section, so finding one meant
+  hunting for it.
+
+  The header button does not implement saving — it finds the save control for
+  the current section and clicks it, so each save keeps exactly one
+  implementation and the two cannot drift apart. It names what it will save
+  ("Save exclusions", "Save configuration"), greys out on sections that have
+  nothing to save rather than disappearing, and marks itself when there are
+  unsaved changes. On narrow screens it stops being sticky, where a fixed header
+  would eat most of the viewport.
+
 ## 4.2.2 — 2026-08-11
 
 ### Fixed

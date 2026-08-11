@@ -2434,6 +2434,8 @@ function paintDirty(section, on) {
     const anySub = ["exclusions", "schedule", "notify", "config"].some((s) => dirty.has(s));
     settingsBtn.classList.toggle("dirty", anySub);
   }
+  // Keep the header's save button in step with the dirty state.
+  if (typeof syncBarSave === "function") { syncBarSave(); }
 }
 
 /* Any input inside a tab marks that tab dirty. Registered once, on the
@@ -2578,6 +2580,27 @@ SHARED_CSS = r"""  :root {
     --scroll-thumb: #c1c7cf; --scroll-thumb-hover: #a8b0ba; --scroll-track: #eef1f4;
   }
   * { box-sizing: border-box; }
+
+  /* Sticky header.
+     Negative margins pull it out to the body's padding edge so it covers the
+     full width as content scrolls under it, and the matching padding puts the
+     contents back where they were. */
+  .topbar { position: sticky; top: 0; z-index: 50;
+            margin: -16px -16px 14px; padding: 12px 16px 0;
+            background: var(--bg); border-bottom: 1px solid var(--border); }
+  .topbar-row { display: flex; align-items: flex-start; justify-content: space-between;
+                gap: 12px; flex-wrap: wrap; }
+  .topbar-title h1 { margin: 0 0 4px; }
+  .topbar-title .sub { margin-bottom: 10px; }
+  .topbar-actions { display: flex; align-items: center; gap: 8px;
+                    flex-shrink: 0; padding-top: 2px; }
+  .topbar .tabs { margin-bottom: 0; }
+  /* Nothing to save is a disabled button, not a missing one — a control that
+     appears and disappears is harder to aim at than one that greys out. */
+  #barSave:disabled { opacity: .45; }
+  @media (max-width: 600px) {
+    .topbar { position: static; margin: 0 0 14px; padding: 0 0 10px; }
+  }
 
   /* Scrollbars.
      The browser default is a light grey bar, which on a dark panel reads as a
@@ -2786,27 +2809,40 @@ PAGE_TEMPLATE = r"""<!doctype html>
 </script>
 </head>
 <body>
-<h1>Proxmox Auto-Update</h1>
-<div class="sub">
-  Signed in as <strong>{{USER}}</strong> &middot;
-  Status: <span id="statusPill" class="pill idle">checking…</span> &middot;
-  Schedule: <code id="schedDisplay">—</code>
+<!-- Sticky header. The tabs and the save action stay reachable from anywhere
+     on the page: the per-card save buttons sit at wildly different scroll
+     depths depending on which section is open, so finding one meant hunting. -->
+<div class="topbar">
+  <div class="topbar-row">
+    <div class="topbar-title">
+      <h1>Proxmox Auto-Update</h1>
+      <div class="sub">
+        Signed in as <strong>{{USER}}</strong> &middot;
+        Status: <span id="statusPill" class="pill idle">checking…</span> &middot;
+        Schedule: <code id="schedDisplay">—</code>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="barSaveHint" class="hint" style="margin:0"></span>
+      <button id="barSave" class="primary" disabled>Save</button>
+    </div>
+  </div>
+
+  <div class="tabs" role="tablist" aria-label="Sections">
+    <button data-tab="run" class="active" role="tab" aria-selected="true"
+            aria-controls="tab-run" id="tabbtn-run">Overview</button>
+    <button data-tab="settings" role="tab" aria-selected="false"
+            aria-controls="tab-settings" id="tabbtn-settings" tabindex="-1">Settings</button>
+    <button data-tab="logs" role="tab" aria-selected="false"
+            aria-controls="tab-logs" id="tabbtn-logs" tabindex="-1">Logs &amp; Reports</button>
+    <button data-tab="maint" role="tab" aria-selected="false"
+            aria-controls="tab-maint" id="tabbtn-maint" tabindex="-1">Maintenance</button>
+  </div>
 </div>
 
 <div id="offline" class="unsaved hidden">
   Lost contact with the panel — retrying. The Proxmox API restarts during a host
   upgrade, so this is expected mid-run.
-</div>
-
-<div class="tabs" role="tablist" aria-label="Sections">
-  <button data-tab="run" class="active" role="tab" aria-selected="true"
-          aria-controls="tab-run" id="tabbtn-run">Overview</button>
-  <button data-tab="settings" role="tab" aria-selected="false"
-          aria-controls="tab-settings" id="tabbtn-settings" tabindex="-1">Settings</button>
-  <button data-tab="logs" role="tab" aria-selected="false"
-          aria-controls="tab-logs" id="tabbtn-logs" tabindex="-1">Logs &amp; Reports</button>
-  <button data-tab="maint" role="tab" aria-selected="false"
-          aria-controls="tab-maint" id="tabbtn-maint" tabindex="-1">Maintenance</button>
 </div>
 
 <!-- OVERVIEW -->
@@ -3468,6 +3504,7 @@ function selectTop(name) {
   } else {
     loadFor(name);
   }
+  syncBarSave();
 }
 
 let currentSub = "exclusions";
@@ -3481,6 +3518,7 @@ function selectSub(name) {
   });
   SUB_TABS.forEach((t) => $("tab-" + t).classList.toggle("hidden", t !== name));
   loadFor(name);
+  syncBarSave();
 }
 
 // Arrow-key navigation, which is what a tablist is expected to do and what
@@ -3502,6 +3540,53 @@ function wireTablist(selector, onSelect) {
 
 wireTablist(".tabs:not(.subtabs) button", selectTop);
 wireTablist(".subtabs button", selectSub);
+
+// --- the save button in the sticky header ---
+//
+// It does not implement saving. It finds the save control for whichever
+// section is open and clicks it, so every save keeps exactly one
+// implementation and this cannot drift away from what the in-page button does.
+const SECTION_SAVE = {
+  exclusions: {btn: "btnSaveExcl",   label: "Save exclusions"},
+  schedule:   {btn: "btnSaveSched",  label: "Save schedule"},
+  notify:     {btn: "btnSaveNotify", label: "Save notifications"},
+  config:     {btn: "btnSaveConfig", label: "Save configuration"},
+  logs:       {btn: "btnSaveLogCfg", label: "Save log settings"},
+};
+
+function activeSection() {
+  const top = document.querySelector('.tabs:not(.subtabs) button.active');
+  const name = top ? top.dataset.tab : "run";
+  return name === "settings" ? currentSub : name;
+}
+
+function syncBarSave() {
+  const section = activeSection();
+  const target = SECTION_SAVE[section];
+  const btn = $("barSave");
+  const hint = $("barSaveHint");
+
+  if (!target || !$(target.btn)) {
+    btn.disabled = true;
+    btn.textContent = "Save";
+    btn.classList.remove("needs-save");
+    hint.textContent = "";
+    return;
+  }
+  btn.textContent = target.label;
+  btn.disabled = false;
+  const isDirty = dirty.has(section);
+  btn.classList.toggle("needs-save", isDirty);
+  hint.textContent = isDirty ? "unsaved changes" : "";
+}
+
+$("barSave").onclick = () => {
+  const target = SECTION_SAVE[activeSection()];
+  const real = target && $(target.btn);
+  if (real && !real.disabled) { real.click(); }
+};
+
+syncBarSave();
 
 // --- notifications ---
 const METHOD_IDS = {email: "m_email", discord: "m_discord", slack: "m_slack",
