@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.1.0"
+PAU_VERSION="4.1.1"
 
 set -u
 set -o pipefail
@@ -553,8 +553,27 @@ else
     C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_CYAN='' C_BOLD='' C_DIM='' C_NC=''
 fi
 
-# Spinner state
+# Spinner / heartbeat state
 _SPIN_PID=""
+_HEARTBEAT_PID=""
+_SPIN_MSG=""
+_SPIN_START=""
+
+# How often to report that a long operation is still going, in seconds. Set to
+# 0 to turn the heartbeat off.
+HEARTBEAT_SECS="${HEARTBEAT_SECS:-30}"
+
+# Seconds as "3m 05s" / "1h 02m".
+fmt_duration() {
+    local s="${1:-0}"
+    if [ "${s}" -lt 60 ]; then
+        printf '%ds' "${s}"
+    elif [ "${s}" -lt 3600 ]; then
+        printf '%dm %02ds' $(( s / 60 )) $(( s % 60 ))
+    else
+        printf '%dh %02dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+    fi
+}
 
 # The spinner writes to /dev/tty rather than stdout so it never lands in the log.
 # If the terminal disappears mid-run — closing the Proxmox shell tab does exactly
@@ -568,6 +587,38 @@ fi
 
 start_spinner() {
     local msg="$1"
+
+    # Say what is being worked on, in the log, before anything else.
+    #
+    # The spinner writes to /dev/tty, so it is invisible to anything reading the
+    # log — which is every run from the web panel and every run from cron. A
+    # guest upgrade can legitimately take half an hour (LINUX_UPDATE_TIMEOUT
+    # defaults to 1800s), and for all of that time the log said nothing at all.
+    # A run that is working normally on a slow mirror was indistinguishable from
+    # one that had hung.
+    _SPIN_MSG="${msg}"
+    _SPIN_START=$(date +%s)
+    if [ "${_TTY_OK}" != true ]; then
+        printf "  %s %s\n" "▶" "$(printf '%s' "${msg}" | sed 's/\x1b\[[0-9;]*m//g')"
+    fi
+
+    # Heartbeat. Prints elapsed time periodically so a long silent stretch is
+    # visibly still alive, and so it is obvious afterwards *where* the time
+    # went. Runs regardless of whether there is a terminal.
+    (
+        trap 'exit 0' TERM
+        trap '' HUP
+        local waited=0
+        while true; do
+            sleep "${HEARTBEAT_SECS}"
+            waited=$(( waited + HEARTBEAT_SECS ))
+            printf "      %s still working — %s elapsed\n" "…" "$(fmt_duration ${waited})" \
+                2>/dev/null || exit 0
+        done
+    ) &
+    _HEARTBEAT_PID=$!
+    disown "$_HEARTBEAT_PID" 2>/dev/null
+
     [ "${_TTY_OK}" = true ] || return 0
     (
         trap 'exit 0' TERM
@@ -585,11 +636,25 @@ start_spinner() {
 }
 
 stop_spinner() {
+    if [ -n "${_HEARTBEAT_PID}" ]; then
+        kill "${_HEARTBEAT_PID}" 2>/dev/null
+        wait "${_HEARTBEAT_PID}" 2>/dev/null || true
+        _HEARTBEAT_PID=""
+    fi
     if [ -n "${_SPIN_PID}" ]; then
         kill "${_SPIN_PID}" 2>/dev/null
         wait "${_SPIN_PID}" 2>/dev/null || true
         _SPIN_PID=""
         [ "${_TTY_OK}" = true ] && { printf "\r\033[K" >&9 2>/dev/null || true; }
+    fi
+    # Report how long it actually took whenever it was long enough to have been
+    # worth wondering about.
+    if [ -n "${_SPIN_START}" ]; then
+        local took=$(( $(date +%s) - _SPIN_START ))
+        if [ "${took}" -ge "${HEARTBEAT_SECS}" ] && [ "${_TTY_OK}" != true ]; then
+            printf "      %s took %s\n" "·" "$(fmt_duration ${took})"
+        fi
+        _SPIN_START=""
     fi
 }
 

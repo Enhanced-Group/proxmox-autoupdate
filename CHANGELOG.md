@@ -8,6 +8,30 @@ install and nothing else. Earlier releases are in the git history and on the
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.1.1 — 2026-08-11
+
+### Fixed
+
+- **A run in progress produced no output at all.** The progress spinner writes
+  to `/dev/tty`, so it was invisible to anything reading the log — which is
+  every run started from the web panel and every run from cron. A guest upgrade
+  may legitimately take up to `LINUX_UPDATE_TIMEOUT` (30 minutes by default),
+  and for all of that time the log said nothing, so a run working normally
+  through a slow mirror looked identical to one that had hung.
+
+  Each step now announces itself in the log, a heartbeat reports elapsed time
+  every `HEARTBEAT_SECS` (30 by default, `0` disables), and anything that took
+  longer than that reports how long it took when it finishes. This makes it
+  obvious both that a run is alive and, afterwards, where the time went.
+
+### Added
+
+- **An elapsed timer for a run in progress**, in the live output header. It is
+  driven from the run's own start time, so it survives a page reload rather
+  than counting from when the tab was opened, and it ticks every second rather
+  than only on the status poll. A run started outside the panel — by cron — is
+  labelled as such instead of showing a misleading clock.
+
 ## 4.1.0 — 2026-08-11
 
 An interface release, on top of the correctness work in 4.0.0. The panel now

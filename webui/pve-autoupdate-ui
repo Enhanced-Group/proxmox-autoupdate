@@ -2265,6 +2265,26 @@ function relTime(when) {
   return years + (years === 1 ? " year ago" : " years ago");
 }
 
+// Elapsed-time readout for a run in progress. Ticks once a second rather than
+// only on the 2s status poll, so it reads as a live clock instead of a value
+// that lurches.
+let runStartedAt = null;
+function fmtElapsed(secs) {
+  if (secs < 60) { return secs + "s"; }
+  if (secs < 3600) {
+    return Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0") + "s";
+  }
+  return Math.floor(secs / 3600) + "h " +
+         String(Math.floor((secs % 3600) / 60)).padStart(2, "0") + "m";
+}
+function tickTimer() {
+  // started_at is a Unix timestamp in seconds, not milliseconds and not ISO.
+  if (!runStartedAt) { return; }
+  const secs = Math.max(0, Math.round(Date.now() / 1000 - runStartedAt));
+  $("runTimer").textContent = "running for " + fmtElapsed(secs);
+}
+setInterval(() => { if (!$("runTimer").classList.contains("hidden")) { tickTimer(); } }, 1000);
+
 function humanSize(bytes) {
   if (bytes < 1024) { return bytes + " B"; }
   if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(1) + " KB"; }
@@ -2712,6 +2732,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="card">
     <h2>Live output <span id="liveTag" class="pill run hidden">live</span>
+      <span id="runTimer" class="hint hidden" style="margin:0"></span>
       <span id="logSource" class="hint" style="margin:0"></span></h2>
     <pre id="logView">No run started from this page yet.</pre>
   </div>
@@ -3752,6 +3773,29 @@ async function poll() {
     $("runProgress").classList.toggle("active", runLive);
     $("liveTag").classList.toggle("hidden", !runLive);
     $("logView").classList.toggle("live", runLive);
+
+    // Elapsed time for a run in progress.
+    //
+    // A guest upgrade can legitimately take half an hour, and a panel showing
+    // an unchanging log with no clock gives you no way to tell "working" from
+    // "wedged". Driven off the job's own start time so it survives a page
+    // reload rather than counting from when the tab was opened.
+    // Only trust started_at while this panel's own job is running. A cron run
+    // holds the lockfile but is not our subprocess, so started_at would still
+    // be whatever the last panel-started run left behind — and the clock would
+    // read hours or days.
+    if (st.running && st.started_at) {
+      runStartedAt = st.started_at;
+      $("runTimer").classList.remove("hidden");
+      tickTimer();
+    } else if (st.lock_held) {
+      runStartedAt = null;
+      $("runTimer").textContent = "started outside this panel";
+      $("runTimer").classList.remove("hidden");
+    } else {
+      runStartedAt = null;
+      $("runTimer").classList.add("hidden");
+    }
 
     // Still disabled during a self-update: the script is being replaced.
     $("btnDry").disabled = busy;
