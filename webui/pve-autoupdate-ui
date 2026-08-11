@@ -129,7 +129,8 @@ def _v_nonempty(v):
     return len(v.strip()) > 0 and "\n" not in v and '"' not in v
 
 
-VALID_METHODS = {"email", "discord", "slack", "webhook"}
+VALID_METHODS = {"email", "discord", "slack", "teams", "ntfy", "gotify",
+                 "telegram", "webhook"}
 
 
 def _v_methods(v):
@@ -146,6 +147,22 @@ def _v_url(v):
     if _has_shell_meta(v):
         return False
     return v.startswith("https://") and " " not in v and len(v) < 2048
+
+
+def _v_local_url(v):
+    """A URL that may be plain http, for self-hosted services on a LAN.
+
+    Separate from _v_url deliberately. For a Slack or Discord webhook the URL
+    *is* the credential, so requiring https there is right. ntfy and Gotify are
+    usually a box on your own network with a token sent separately, and
+    refusing http would just mean nobody could use them.
+    """
+    if v == "":
+        return True
+    if _has_shell_meta(v):
+        return False
+    return (v.startswith("https://") or v.startswith("http://")) \
+        and " " not in v and len(v) < 2048
 
 
 def _v_optional_email(v):
@@ -183,6 +200,24 @@ EDITABLE_KEYS = {
     "DISCORD_USER_ID": lambda v: v == "" or v.isdigit(),
     "SLACK_WEBHOOK_URL": _v_url,
     "GENERIC_WEBHOOK_URL": _v_url,
+    "TEAMS_WEBHOOK_URL": _v_url,
+    # ntfy and Gotify are routinely self-hosted on a LAN address without TLS,
+    # so these accept http:// as well — unlike the hosted-service webhooks
+    # above, where the URL is the only credential.
+    "NTFY_URL": _v_local_url,
+    "NTFY_TOKEN": _v_optional,
+    "NTFY_PRIORITY": lambda v: v in ("", "min", "low", "default", "high", "urgent"),
+    "GOTIFY_URL": _v_local_url,
+    "GOTIFY_TOKEN": _v_optional,
+    "TELEGRAM_BOT_TOKEN": _v_optional,
+    "TELEGRAM_CHAT_ID": lambda v: v == "" or re.match(r"\A-?[0-9]+\Z", v) is not None,
+    # Email transport
+    "EMAIL_TRANSPORT": lambda v: v in ("", "mailgun", "smtp"),
+    "SMTP_HOST": _v_optional,
+    "SMTP_PORT": _v_int,
+    "SMTP_USER": _v_optional,
+    "SMTP_PASSWORD": _v_optional,
+    "SMTP_SECURITY": lambda v: v in ("", "starttls", "ssl", "none"),
     "CONFIRM_UPDATES": _v_bool,
     # Consumed by patch-webui.sh, not by the update script.
     "SUPPRESS_SUBSCRIPTION_NOTICE": _v_bool,
@@ -214,6 +249,11 @@ SENSITIVE_KEYS = {
     "DISCORD_BOT_TOKEN",
     "SLACK_WEBHOOK_URL",
     "GENERIC_WEBHOOK_URL",
+    "TEAMS_WEBHOOK_URL",
+    "NTFY_TOKEN",
+    "GOTIFY_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "SMTP_PASSWORD",
 }
 
 
@@ -2825,11 +2865,19 @@ PAGE_TEMPLATE = r"""<!doctype html>
     </div>
     <div class="row" style="gap:16px;margin-bottom:12px">
       <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
-        <input type="checkbox" id="m_email" style="width:auto"><span>Email (Mailgun)</span></label>
+        <input type="checkbox" id="m_email" style="width:auto"><span>Email</span></label>
       <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
         <input type="checkbox" id="m_discord" style="width:auto"><span>Discord</span></label>
       <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
-        <input type="checkbox" id="m_slack" style="width:auto"><span>Slack / Teams</span></label>
+        <input type="checkbox" id="m_slack" style="width:auto"><span>Slack</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_teams" style="width:auto"><span>Microsoft Teams</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_ntfy" style="width:auto"><span>ntfy</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_gotify" style="width:auto"><span>Gotify</span></label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+        <input type="checkbox" id="m_telegram" style="width:auto"><span>Telegram</span></label>
       <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
         <input type="checkbox" id="m_webhook" style="width:auto"><span>Generic webhook</span></label>
     </div>
@@ -2841,19 +2889,60 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="card" id="cardEmail">
-    <h2>Email (Mailgun)</h2>
-    <div class="grid">
-      <div><label for="cfg2_MAILGUN_API_KEY">API key</label>
-        <input type="password" id="cfg2_MAILGUN_API_KEY" data-key="MAILGUN_API_KEY"></div>
-      <div><label for="cfg2_MAILGUN_DOMAIN">Domain</label>
-        <input id="cfg2_MAILGUN_DOMAIN" data-key="MAILGUN_DOMAIN"></div>
-      <div><label for="cfg2_MAILGUN_REGION">Region</label>
-        <select id="cfg2_MAILGUN_REGION" data-key="MAILGUN_REGION">
-          <option>EU</option><option>US</option></select></div>
-      <div><label for="cfg2_SENDER_EMAIL">Sender</label>
-        <input id="cfg2_SENDER_EMAIL" data-key="SENDER_EMAIL"></div>
-      <div><label for="cfg2_RECIPIENT_EMAIL">Recipient</label>
-        <input id="cfg2_RECIPIENT_EMAIL" data-key="RECIPIENT_EMAIL"></div>
+    <h2>Email</h2>
+    <div style="max-width:280px">
+      <label for="cfg2_EMAIL_TRANSPORT">Send via</label>
+      <select id="cfg2_EMAIL_TRANSPORT" data-key="EMAIL_TRANSPORT">
+        <option value="smtp">SMTP server</option>
+        <option value="mailgun">Mailgun API</option>
+      </select>
+      <div class="hint">
+        SMTP works with any mail server — your own, your ISP's, or a provider's
+        relay. Mailgun is kept for existing installations.
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:12px">
+      <div><label for="cfg2_SENDER_EMAIL">From</label>
+        <input id="cfg2_SENDER_EMAIL" data-key="SENDER_EMAIL" placeholder="proxmox@example.com"></div>
+      <div><label for="cfg2_RECIPIENT_EMAIL">To</label>
+        <input id="cfg2_RECIPIENT_EMAIL" data-key="RECIPIENT_EMAIL" placeholder="admin@example.com"></div>
+    </div>
+
+    <div id="emailSmtp" style="margin-top:12px">
+      <div class="grid">
+        <div><label for="cfg2_SMTP_HOST">SMTP host</label>
+          <input id="cfg2_SMTP_HOST" data-key="SMTP_HOST" placeholder="smtp.example.com"></div>
+        <div><label for="cfg2_SMTP_PORT">Port</label>
+          <input type="number" id="cfg2_SMTP_PORT" data-key="SMTP_PORT" placeholder="587"></div>
+        <div><label for="cfg2_SMTP_SECURITY">Encryption</label>
+          <select id="cfg2_SMTP_SECURITY" data-key="SMTP_SECURITY">
+            <option value="starttls">STARTTLS (587)</option>
+            <option value="ssl">SSL/TLS (465)</option>
+            <option value="none">None (local relay)</option>
+          </select></div>
+        <div><label for="cfg2_SMTP_USER">Username <span class="hint">(optional)</span></label>
+          <input id="cfg2_SMTP_USER" data-key="SMTP_USER" autocomplete="off"></div>
+        <div><label for="cfg2_SMTP_PASSWORD">Password <span class="hint">(optional)</span></label>
+          <input type="password" id="cfg2_SMTP_PASSWORD" data-key="SMTP_PASSWORD" autocomplete="new-password"></div>
+      </div>
+      <div class="hint">
+        Leave the username and password empty for an unauthenticated relay on
+        your own network. For Gmail or Microsoft 365 you need an app password,
+        not your account password.
+      </div>
+    </div>
+
+    <div id="emailMailgun" style="margin-top:12px">
+      <div class="grid">
+        <div><label for="cfg2_MAILGUN_API_KEY">API key</label>
+          <input type="password" id="cfg2_MAILGUN_API_KEY" data-key="MAILGUN_API_KEY"></div>
+        <div><label for="cfg2_MAILGUN_DOMAIN">Domain</label>
+          <input id="cfg2_MAILGUN_DOMAIN" data-key="MAILGUN_DOMAIN"></div>
+        <div><label for="cfg2_MAILGUN_REGION">Region</label>
+          <select id="cfg2_MAILGUN_REGION" data-key="MAILGUN_REGION">
+            <option>EU</option><option>US</option></select></div>
+      </div>
     </div>
   </div>
 
@@ -2893,11 +2982,69 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="card" id="cardSlack">
-    <h2>Slack / Teams</h2>
+    <h2>Slack</h2>
     <label for="cfg2_SLACK_WEBHOOK_URL">Webhook URL</label>
     <input type="password" id="cfg2_SLACK_WEBHOOK_URL" data-key="SLACK_WEBHOOK_URL"
            placeholder="https://hooks.slack.com/services/...">
-    <div class="hint">Teams works too via an incoming-webhook connector.</div>
+    <div class="hint">
+      Teams is a separate channel — it does not understand Slack's message
+      format, so sending Slack's payload to it produced unreadable output.
+    </div>
+  </div>
+
+  <div class="card" id="cardTeams">
+    <h2>Microsoft Teams</h2>
+    <label for="cfg2_TEAMS_WEBHOOK_URL">Webhook URL</label>
+    <input type="password" id="cfg2_TEAMS_WEBHOOK_URL" data-key="TEAMS_WEBHOOK_URL"
+           placeholder="https://....logic.azure.com/workflows/... or outlook.office.com/webhook/...">
+    <div class="hint">
+      Works with both a Power Automate "when a Teams webhook request is
+      received" trigger and a legacy Office 365 connector. Sent as a
+      MessageCard with the run summary as fields.
+    </div>
+  </div>
+
+  <div class="card" id="cardNtfy">
+    <h2>ntfy</h2>
+    <label for="cfg2_NTFY_URL">Topic URL</label>
+    <input type="text" id="cfg2_NTFY_URL" data-key="NTFY_URL"
+           placeholder="https://ntfy.sh/my-topic or http://ntfy.lan/proxmox">
+    <div class="hint">The topic is part of the URL. Plain http is accepted for a self-hosted server.</div>
+    <label for="cfg2_NTFY_TOKEN" style="margin-top:8px">Access token <span class="hint">(optional)</span></label>
+    <input type="password" id="cfg2_NTFY_TOKEN" data-key="NTFY_TOKEN" placeholder="tk_...">
+    <label for="cfg2_NTFY_PRIORITY" style="margin-top:8px">Priority for a clean run</label>
+    <select id="cfg2_NTFY_PRIORITY" data-key="NTFY_PRIORITY">
+      <option value="min">min</option>
+      <option value="low">low</option>
+      <option value="default">default</option>
+      <option value="high">high</option>
+      <option value="urgent">urgent</option>
+    </select>
+    <div class="hint">Failures are always sent at high priority regardless.</div>
+  </div>
+
+  <div class="card" id="cardGotify">
+    <h2>Gotify</h2>
+    <label for="cfg2_GOTIFY_URL">Server URL</label>
+    <input type="text" id="cfg2_GOTIFY_URL" data-key="GOTIFY_URL"
+           placeholder="https://gotify.example.com">
+    <label for="cfg2_GOTIFY_TOKEN" style="margin-top:8px">Application token</label>
+    <input type="password" id="cfg2_GOTIFY_TOKEN" data-key="GOTIFY_TOKEN" placeholder="A...">
+    <div class="hint">Sent in a header rather than the query string, so it stays out of your server's access log.</div>
+  </div>
+
+  <div class="card" id="cardTelegram">
+    <h2>Telegram</h2>
+    <label for="cfg2_TELEGRAM_BOT_TOKEN">Bot token</label>
+    <input type="password" id="cfg2_TELEGRAM_BOT_TOKEN" data-key="TELEGRAM_BOT_TOKEN"
+           placeholder="123456789:AA...">
+    <label for="cfg2_TELEGRAM_CHAT_ID" style="margin-top:8px">Chat ID</label>
+    <input type="text" id="cfg2_TELEGRAM_CHAT_ID" data-key="TELEGRAM_CHAT_ID"
+           placeholder="123456789 or -1001234567890 for a group">
+    <div class="hint">
+      Create a bot with @BotFather, send it a message, then read your chat ID
+      from <code>https://api.telegram.org/bot&lt;token&gt;/getUpdates</code>.
+    </div>
   </div>
 
   <div class="card" id="cardWebhook">
@@ -3099,6 +3246,18 @@ PAGE_TEMPLATE = r"""<!doctype html>
   <div class="card">
     <h2>What's new <span id="clSource" class="hint" style="margin:0"></span></h2>
     <div id="changelog" class="hint">Loading…</div>
+    <div class="row" style="margin-top:12px">
+      <a class="btnlink" id="lnkReleases" target="_blank" rel="noopener noreferrer"
+         href="https://github.com/Enhanced-Group/proxmox-autoupdate/releases">All releases</a>
+      <a class="btnlink" id="lnkChangelog" target="_blank" rel="noopener noreferrer"
+         href="https://github.com/Enhanced-Group/proxmox-autoupdate/blob/main/CHANGELOG.md">Full changelog</a>
+      <a class="btnlink" id="lnkRepo" target="_blank" rel="noopener noreferrer"
+         href="https://github.com/Enhanced-Group/proxmox-autoupdate">Source</a>
+    </div>
+    <div class="hint">
+      Only the release you would install is shown above. Every earlier release
+      is on GitHub.
+    </div>
   </div>
 
   <div class="card">
@@ -3248,16 +3407,25 @@ wireTablist(".tabs:not(.subtabs) button", selectTop);
 wireTablist(".subtabs button", selectSub);
 
 // --- notifications ---
-const METHOD_IDS = {email: "m_email", discord: "m_discord",
-                    slack: "m_slack", webhook: "m_webhook"};
+const METHOD_IDS = {email: "m_email", discord: "m_discord", slack: "m_slack",
+                    teams: "m_teams", ntfy: "m_ntfy", gotify: "m_gotify",
+                    telegram: "m_telegram", webhook: "m_webhook"};
+const METHOD_CARDS = {m_email: "cardEmail", m_discord: "cardDiscord",
+                      m_slack: "cardSlack", m_teams: "cardTeams",
+                      m_ntfy: "cardNtfy", m_gotify: "cardGotify",
+                      m_telegram: "cardTelegram", m_webhook: "cardWebhook"};
 
 function syncNotifyCards() {
-  $("cardEmail").style.display   = $("m_email").checked ? "" : "none";
-  $("cardDiscord").style.display = $("m_discord").checked ? "" : "none";
-  $("cardSlack").style.display   = $("m_slack").checked ? "" : "none";
-  $("cardWebhook").style.display = $("m_webhook").checked ? "" : "none";
+  Object.keys(METHOD_CARDS).forEach((box) => {
+    $(METHOD_CARDS[box]).style.display = $(box).checked ? "" : "none";
+  });
+  // The email card shows either the Mailgun fields or the SMTP fields.
+  const smtp = $("cfg2_EMAIL_TRANSPORT").value === "smtp";
+  $("emailMailgun").style.display = smtp ? "none" : "";
+  $("emailSmtp").style.display = smtp ? "" : "none";
 }
 Object.values(METHOD_IDS).forEach((id) => { $(id).onchange = syncNotifyCards; });
+$("cfg2_EMAIL_TRANSPORT").onchange = syncNotifyCards;
 
 async function loadNotify() {
   // Populating fields is not an edit.

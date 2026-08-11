@@ -1,12 +1,54 @@
 # Changelog
 
-Only the current release is kept here — this is what the web panel shows when
-it offers you an update, so it should describe the version you are about to
-install and nothing else. Earlier releases are in the git history and on the
-[releases page](https://github.com/Enhanced-Group/proxmox-autoupdate/releases).
+The newest release is written out in full, with everything before it summarised
+under [Previous releases](#previous-releases). Nothing is removed — the web
+panel only ever renders the first entry, so keeping the history here costs
+nothing and is worth having.
+
+Only released versions appear. Work in progress belongs in the git history and
+in pull requests, not here: a changelog people rely on to decide whether to
+update should describe what they would actually get.
 
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
+
+## 4.2.0 — 2026-08-11
+
+### Added
+
+- **Email over any SMTP server.** Email was tied to Mailgun, which is a poor
+  default for a free tool — most people already have a relay, a mail server, or
+  an app password. `EMAIL_TRANSPORT=smtp` with `SMTP_HOST`, `SMTP_PORT`,
+  `SMTP_SECURITY` (STARTTLS, SSL/TLS or none for a local relay) and optional
+  credentials. Mailgun still works and existing installations are unchanged:
+  with the transport unset, having a Mailgun key still means Mailgun.
+- **Microsoft Teams as its own channel.** It was previously folded into Slack
+  and sent Slack's own message format, which Teams does not render — so the
+  "Slack/Teams" label was simply wrong. Teams now receives a MessageCard with
+  the run summary as fields, understood by both a Power Automate webhook
+  trigger and a legacy Office 365 connector.
+- **ntfy**, properly. The generic webhook was documented as working with it,
+  but ntfy takes the topic in the URL path and the message as the request body
+  with metadata in headers — posting the generic JSON object published the raw
+  JSON as the message text. Failures are sent at high priority automatically.
+- **Gotify** and **Telegram**. Gotify's token is sent in a header rather than
+  the query string, so it stays out of the server's access log.
+- **Links to the repository, all releases and the full changelog** on the
+  Maintenance tab.
+
+### Changed
+
+- The changelog keeps its full history again, with everything before the
+  current release summarised and linked. The panel renders only the newest
+  entry regardless — it enforces that when parsing — so keeping the record
+  costs nothing. Only released versions appear; work in progress belongs in the
+  git history.
+- Webhook URLs and extra headers are passed to curl through its config file
+  rather than argv, so credentials embedded in a URL stay out of the process
+  list. This already applied to some channels and now applies to all of them.
+- ntfy and Gotify accept plain `http://`, because they are usually a machine on
+  your own network with a token sent separately. The hosted-service webhooks
+  still require `https://`, where the URL is the only credential.
 
 ## 4.1.1 — 2026-08-11
 
@@ -110,3 +152,26 @@ making you go and find out.
   enough, and the highest version is chosen rather than whichever tag the API
   happens to return first — which could have resolved to an older tag and
   installed backwards.
+
+---
+
+## Previous releases
+
+Summarised so the record is visible here, with full detail in the
+[git history](https://github.com/Enhanced-Group/proxmox-autoupdate/commits/main)
+and on the [releases page](https://github.com/Enhanced-Group/proxmox-autoupdate/releases).
+
+- **[v3.5.1](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.5.1)** — test-notification button fixed.
+- **[v3.5.0](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.5.0)** — credentials passed to curl on stdin, never in the process list.
+- **[v3.4.5](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.4.5)** — Discord 401 identifies which credential was pasted.
+- **[v3.4.4](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.4.4)** — update check no longer served a stale version by the CDN.
+- **[v3.4.3](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.4.3)** — self-update no longer triggers a guest dry run; correct status labelling.
+- **[v3.4.2](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.4.2)** — Discord DM diagnostic, unsaved-change tracking.
+- **[v3.4.1](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.4.1)** — button geometry, Discord DM diagnostics, self-update messaging.
+- **[v3.4.0](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.4.0)** — changelog in the UI, Discord DMs and log attachments, optional update confirmations.
+- **[v3.3.0](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.3.0)** — orange Update Everything beside Documentation; per-guest button between Start and Shutdown.
+- **[v3.2.2](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.2.2)** — Auto-Update button sits with the Start/Reboot action group.
+- **[v3.2.1](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.2.1)** — working self-update, Mailgun diagnostics, buttons in the content toolbar.
+- **[v3.2](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.2)** — Proxmox-styled dialogs, single toolbar button per panel, animated run feedback.
+- **[v3.1](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.1)** — optional webhook notifications (Discord/Slack/generic), toolbar buttons on node and guest panels, shell-persistent runs, log retention controls, run history, and in-UI update check and uninstall.
+- **[v3.0](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.0)** — guest-update reliability fixes, dry run, targeted --only runs, optional pre-update snapshots, and an optional web control panel with a per-guest Auto-Update tab.

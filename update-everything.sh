@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.1.1"
+PAU_VERSION="4.2.0"
 
 set -u
 set -o pipefail
@@ -777,9 +777,45 @@ MAILGUN_REGION="${MAILGUN_REGION:-EU}"
 SENDER_EMAIL="${SENDER_EMAIL:-}"
 RECIPIENT_EMAIL="${RECIPIENT_EMAIL:-}"
 
+# How email is sent: "mailgun" or "smtp".
+#
+# Left empty this infers the old behaviour — a Mailgun key means Mailgun —
+# so existing installations are unaffected. SMTP exists because tying the only
+# email path to one commercial provider is a poor default for a free tool: most
+# people already have a relay, a mail server, or an app password.
+EMAIL_TRANSPORT="${EMAIL_TRANSPORT:-}"
+if [ -z "${EMAIL_TRANSPORT}" ]; then
+    if [ -n "${MAILGUN_API_KEY}" ]; then EMAIL_TRANSPORT="mailgun"; else EMAIL_TRANSPORT="smtp"; fi
+fi
+
+SMTP_HOST="${SMTP_HOST:-}"
+SMTP_PORT="${SMTP_PORT:-587}"
+SMTP_USER="${SMTP_USER:-}"
+SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+# starttls (default, port 587) | ssl (port 465) | none (unencrypted, local relay)
+SMTP_SECURITY="${SMTP_SECURITY:-starttls}"
+
 DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL:-}"
+
+# Microsoft Teams. A separate channel from Slack rather than a shared one: the
+# Slack payload is Slack's own mrkdwn and Teams does not render it, so the old
+# "Slack/Teams" label was simply wrong.
+TEAMS_WEBHOOK_URL="${TEAMS_WEBHOOK_URL:-}"
+
+# ntfy. The topic is part of the URL, e.g. https://ntfy.sh/my-topic.
+NTFY_URL="${NTFY_URL:-}"
+NTFY_TOKEN="${NTFY_TOKEN:-}"
+NTFY_PRIORITY="${NTFY_PRIORITY:-default}"
+
+# Gotify. URL is the server root; the token is an application token.
+GOTIFY_URL="${GOTIFY_URL:-}"
+GOTIFY_TOKEN="${GOTIFY_TOKEN:-}"
+
+# Telegram bot.
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 # Discord direct message. With both of these set the report is DM'd to that user
 # instead of posted to a channel; the webhook, if also configured, is kept as a
@@ -805,11 +841,53 @@ for METHOD in $(echo "${NOTIFY_METHODS}" | tr ',' ' '); do
     case "${METHOD}" in
         none|"") ;;
         email)
-            if [ -n "${MAILGUN_API_KEY}" ] && [ -n "${MAILGUN_DOMAIN}" ] \
-               && [ -n "${SENDER_EMAIL}" ] && [ -n "${RECIPIENT_EMAIL}" ]; then
-                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} email"
+            # Two ways to send mail. EMAIL_TRANSPORT picks one; when it is
+            # unset, having a Mailgun key implies mailgun and anything else
+            # implies smtp, so existing installs keep working untouched.
+            case "${EMAIL_TRANSPORT}" in
+                smtp)
+                    if [ -n "${SMTP_HOST}" ] && [ -n "${SENDER_EMAIL}" ] && [ -n "${RECIPIENT_EMAIL}" ]; then
+                        NOTIFY_ACTIVE="${NOTIFY_ACTIVE} email"
+                    else
+                        NOTIFY_DISABLED="${NOTIFY_DISABLED} email(SMTP needs SMTP_HOST, SENDER_EMAIL and RECIPIENT_EMAIL)"
+                    fi
+                    ;;
+                *)
+                    if [ -n "${MAILGUN_API_KEY}" ] && [ -n "${MAILGUN_DOMAIN}" ] \
+                       && [ -n "${SENDER_EMAIL}" ] && [ -n "${RECIPIENT_EMAIL}" ]; then
+                        NOTIFY_ACTIVE="${NOTIFY_ACTIVE} email"
+                    else
+                        NOTIFY_DISABLED="${NOTIFY_DISABLED} email(incomplete Mailgun settings)"
+                    fi
+                    ;;
+            esac
+            ;;
+        teams)
+            if [ -n "${TEAMS_WEBHOOK_URL}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} teams"
             else
-                NOTIFY_DISABLED="${NOTIFY_DISABLED} email(incomplete Mailgun settings)"
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} teams(no URL)"
+            fi
+            ;;
+        ntfy)
+            if [ -n "${NTFY_URL}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} ntfy"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} ntfy(no URL)"
+            fi
+            ;;
+        gotify)
+            if [ -n "${GOTIFY_URL}" ] && [ -n "${GOTIFY_TOKEN}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} gotify"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} gotify(needs URL and token)"
+            fi
+            ;;
+        telegram)
+            if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+                NOTIFY_ACTIVE="${NOTIFY_ACTIVE} telegram"
+            else
+                NOTIFY_DISABLED="${NOTIFY_DISABLED} telegram(needs bot token and chat ID)"
             fi
             ;;
         discord)
@@ -1843,6 +1921,64 @@ elif fmt == "slack":
     if len(body) > 3500:
         text += "\n… truncated, see the log for the rest"
     payload = {"text": "*" + subject + "*\n```" + text + "```"}
+elif fmt == "teams":
+    # Teams does not render Slack mrkdwn, which is what it was previously being
+    # sent. A MessageCard is understood both by the legacy Office 365 connector
+    # webhooks and by the "when a Teams webhook request is received" trigger in
+    # Power Automate, which is what new webhooks create.
+    text = body[:6000]
+    if len(body) > 6000:
+        text += "\n… truncated, see the log for the rest"
+    colour = "7A5FBF" if dry else ("D93025" if failed else "2E9E4F")
+    facts = [
+        {"name": "Host", "value": os.environ.get("PAU_HOST", "") or "unknown"},
+        {"name": "Proxmox", "value": os.environ.get("PAU_PVE", "") or "unknown"},
+        {"name": "Containers", "value": "%s updated, %s errors"
+            % (os.environ.get("PAU_LXC_UPDATED", "0"), os.environ.get("PAU_LXC_ERRORS", "0"))},
+        {"name": "VMs", "value": "%s updated, %s errors"
+            % (os.environ.get("PAU_VM_UPDATED", "0"), os.environ.get("PAU_VM_ERRORS", "0"))},
+        {"name": "Host packages", "value": os.environ.get("PAU_HOST_PKGS", "0")},
+    ]
+    if os.environ.get("PAU_REBOOT") == "true":
+        facts.append({"name": "Reboot", "value": "scheduled"})
+    if os.environ.get("PAU_OFFENDERS", "").strip():
+        facts.append({"name": "Failing repeatedly", "value": os.environ["PAU_OFFENDERS"]})
+    payload = {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": subject[:250] or "Proxmox Auto-Update",
+        "themeColor": colour,
+        "title": subject[:250] or "Proxmox Auto-Update",
+        "sections": [{
+            "facts": facts,
+            # Teams collapses runs of whitespace, so the report is sent as a
+            # preformatted block rather than as loose text.
+            "text": "<pre>" + (text or "(no output)")
+                    .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>",
+        }],
+    }
+elif fmt == "gotify":
+    text = body[:4000]
+    if len(body) > 4000:
+        text += "\n… truncated, see the log for the rest"
+    payload = {
+        "title": subject[:250] or "Proxmox Auto-Update",
+        "message": text or "(no output)",
+        # Gotify priorities: 0-3 quiet, 4-7 normal, 8+ pops up.
+        "priority": 8 if failed else 4,
+        "extras": {"client::display": {"contentType": "text/plain"}},
+    }
+elif fmt == "telegram":
+    # Telegram caps a message at 4096 characters including the markup.
+    text = body[:3600]
+    if len(body) > 3600:
+        text += "\n… truncated, see the log for the rest"
+    payload = {
+        "chat_id": os.environ.get("PAU_TELEGRAM_CHAT", ""),
+        "text": "*" + subject.replace("*", "") + "*\n```\n" + (text or "(no output)") + "\n```",
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
 else:
     def num(name):
         try:
@@ -1880,7 +2016,9 @@ build_payload() {
     (
         export PAU_FAILED PAU_DRY PAU_HOST PAU_TIMESTAMP PAU_PVE PAU_LOG \
                PAU_REBOOT PAU_OFFENDERS PAU_FOOTER PAU_LXC_UPDATED \
-               PAU_LXC_ERRORS PAU_VM_UPDATED PAU_VM_ERRORS PAU_HOST_PKGS
+               PAU_LXC_ERRORS PAU_VM_UPDATED PAU_VM_ERRORS PAU_HOST_PKGS \
+               PAU_TELEGRAM_CHAT
+        PAU_TELEGRAM_CHAT="${TELEGRAM_CHAT_ID:-}"
         PAU_FAILED="$([ "${ERRORS_OCCURRED}" = true ] && echo true || echo false)"
         PAU_DRY="${DRY_RUN}"
         PAU_HOST="${HOST_NAME}"
@@ -1901,9 +2039,14 @@ build_payload() {
 
 # POST a payload and report the outcome. Never fails the run.
 post_webhook() {
-    local label="$1" url="$2" payload="$3"
+    local label="$1" url="$2" payload="$3" extra_header="${4:-}" hide_url="${5:-}"
     local code
-    code=$(curl_cfg "${url}" | curl -s --config - --max-time 30 \
+    # The URL goes in via --config, not argv, so credentials embedded in it stay
+    # out of the process list. Same for any extra header.
+    code=$( { curl_cfg "${url}"
+              [ -n "${extra_header}" ] && printf 'header = "%s"\n' "$(cfg_escape "${extra_header}")"
+              true; } \
+        | curl -s --config - --max-time 30 \
         -o /dev/null -w "%{http_code}" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "${payload}" 2>/dev/null) || code="000"
@@ -1911,12 +2054,88 @@ post_webhook() {
         print_ok "${label} notified"
     elif [ "${code}" = "000" ]; then
         print_fail "${label} unreachable (network error or timeout)"
+        [ "${hide_url}" = "hide-url" ] || print_fail "  ${url}"
     else
         print_fail "${label} returned HTTP ${code}"
     fi
 }
 
+# Send the report over SMTP.
+#
+# Credentials arrive as environment variables rather than on the command line,
+# so they never appear in /proc/<pid>/cmdline. The HTML report and the plain
+# text are both attached, so a client that refuses HTML still shows something
+# readable.
+SMTP_HELPER='
+import os, smtplib, ssl, sys
+from email.message import EmailMessage
+
+subject, html_path = sys.argv[1], sys.argv[2]
+text_body = sys.stdin.read()
+
+msg = EmailMessage()
+msg["Subject"] = subject
+msg["From"] = os.environ["PAU_SMTP_FROM"]
+msg["To"] = os.environ["PAU_SMTP_TO"]
+msg.set_content(text_body or "(no output)")
+if html_path and os.path.isfile(html_path):
+    try:
+        with open(html_path, encoding="utf-8", errors="replace") as fh:
+            msg.add_alternative(fh.read(), subtype="html")
+    except OSError:
+        pass
+
+host = os.environ["PAU_SMTP_HOST"]
+port = int(os.environ.get("PAU_SMTP_PORT") or 587)
+user = os.environ.get("PAU_SMTP_USER") or ""
+password = os.environ.get("PAU_SMTP_PASSWORD") or ""
+security = (os.environ.get("PAU_SMTP_SECURITY") or "starttls").lower()
+
+try:
+    if security == "ssl":
+        server = smtplib.SMTP_SSL(host, port, timeout=45,
+                                  context=ssl.create_default_context())
+    else:
+        server = smtplib.SMTP(host, port, timeout=45)
+    with server:
+        server.ehlo()
+        if security == "starttls":
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+        if user:
+            server.login(user, password)
+        server.send_message(msg)
+except Exception as exc:
+    sys.stderr.write("%s: %s\n" % (type(exc).__name__, exc))
+    sys.exit(1)
+'
+
+notify_email_smtp() {
+    local subject="$1" body="$2" html_file="$3"
+    local err
+    err=$(
+        export PAU_SMTP_HOST="${SMTP_HOST}" PAU_SMTP_PORT="${SMTP_PORT}" \
+               PAU_SMTP_USER="${SMTP_USER}" PAU_SMTP_PASSWORD="${SMTP_PASSWORD}" \
+               PAU_SMTP_SECURITY="${SMTP_SECURITY}" \
+               PAU_SMTP_FROM="${SENDER_EMAIL}" PAU_SMTP_TO="${RECIPIENT_EMAIL}"
+        printf '%s' "${body}" | python3 -c "${SMTP_HELPER}" "${subject}" "${html_file}" 2>&1 >/dev/null
+    ) && {
+        print_ok "Email sent to ${C_BOLD}${RECIPIENT_EMAIL}${C_NC} ${C_DIM}(SMTP ${SMTP_HOST}:${SMTP_PORT})${C_NC}"
+        return 0
+    }
+    print_fail "SMTP send failed: ${err}"
+    return 1
+}
+
 notify_email() {
+    if [ "${EMAIL_TRANSPORT}" = "smtp" ]; then
+        notify_email_smtp "$@"
+        return
+    fi
+    notify_email_mailgun "$@"
+}
+
+notify_email_mailgun() {
     local subject="$1" html_file="$3"
     NOTIFY_RESPONSE_FILE="/tmp/notify_response_$$.txt"
     local code
@@ -2163,7 +2382,56 @@ notify_discord() {
 }
 
 notify_slack() {
-    post_webhook "Slack/Teams" "${SLACK_WEBHOOK_URL}" "$(build_payload slack "$1" "$2")"
+    post_webhook "Slack" "${SLACK_WEBHOOK_URL}" "$(build_payload slack "$1" "$2")"
+}
+
+notify_teams() {
+    post_webhook "Teams" "${TEAMS_WEBHOOK_URL}" "$(build_payload teams "$1" "$2")"
+}
+
+notify_gotify() {
+    # Token goes in a header rather than the query string so it stays out of the
+    # server's access log.
+    local url="${GOTIFY_URL%/}/message"
+    post_webhook "Gotify" "${url}" "$(build_payload gotify "$1" "$2")" \
+        "X-Gotify-Key: ${GOTIFY_TOKEN}"
+}
+
+notify_telegram() {
+    local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+    # The bot token is in the URL by Telegram's design, so keep it out of the
+    # console: post_webhook prints the URL on failure.
+    post_webhook "Telegram" "${url}" "$(build_payload telegram "$1" "$2")" "" "hide-url"
+}
+
+notify_ntfy() {
+    # ntfy is not JSON-shaped like the others: the topic is the URL path and the
+    # body is the message text, with metadata in headers. Posting the generic
+    # JSON object to it — which is what the old "generic webhook works with
+    # ntfy" claim amounted to — published the raw JSON as the message body.
+    local subject="$1" body="$2"
+    local prio="${NTFY_PRIORITY}"
+    [ "${ERRORS_OCCURRED}" = true ] && prio="high"
+    local tags="white_check_mark"
+    [ "${ERRORS_OCCURRED}" = true ] && tags="rotating_light"
+    [ "${DRY_RUN}" = "true" ] && tags="mag"
+
+    local code
+    code=$( { [ -n "${NTFY_TOKEN}" ] && printf 'header = "Authorization: Bearer %s"\n' "$(cfg_escape "${NTFY_TOKEN}")"; true; } \
+        | curl -s --config - --max-time 30 -o /dev/null -w "%{http_code}" \
+            -H "Title: $(printf '%s' "${subject}" | tr -d '\r\n')" \
+            -H "Priority: ${prio}" \
+            -H "Tags: ${tags}" \
+            --data-binary @- "${NTFY_URL}" <<NTFYBODY 2>/dev/null || true
+$(printf '%s' "${body}" | head -c 4000)
+NTFYBODY
+    )
+    if [ "${code}" = "200" ]; then
+        print_ok "ntfy notified"
+    else
+        print_fail "ntfy returned HTTP ${code}"
+        ERRORS_OCCURRED=true
+    fi
 }
 
 # Generic: structured JSON, so ntfy/Gotify/Home Assistant/n8n and anything else
@@ -2182,10 +2450,14 @@ notify_all() {
     local channel
     for channel in ${NOTIFY_ACTIVE}; do
         case "${channel}" in
-            email)   notify_email   "${subject}" "${body}" "${html_file}" ;;
-            discord) notify_discord "${subject}" "${body}" ;;
-            slack)   notify_slack   "${subject}" "${body}" ;;
-            webhook) notify_webhook "${subject}" "${body}" ;;
+            email)    notify_email    "${subject}" "${body}" "${html_file}" ;;
+            discord)  notify_discord  "${subject}" "${body}" ;;
+            slack)    notify_slack    "${subject}" "${body}" ;;
+            teams)    notify_teams    "${subject}" "${body}" ;;
+            ntfy)     notify_ntfy     "${subject}" "${body}" ;;
+            gotify)   notify_gotify   "${subject}" "${body}" ;;
+            telegram) notify_telegram "${subject}" "${body}" ;;
+            webhook)  notify_webhook  "${subject}" "${body}" ;;
         esac
     done
 }

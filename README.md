@@ -17,7 +17,7 @@ This tool performs weekly updates across your entire Proxmox stack — including
 - **Self-Diagnostic:** `update-everything.sh --doctor` checks everything a run depends on — Proxmox detected, cluster filesystem answering, dependencies present, repositories working, cron running, guest agents responding, disk space — and exits non-zero with a numbered list of what to fix. Read-only.
 - **Pre-Update Snapshots:** Optionally snapshot each guest before updating, with automatic pruning of old auto-snapshots.
 - **Web Control Panel:** Optional **Update Everything** button in the Proxmox toolbar (left of *Documentation*) — run updates, manage exclusions, edit the schedule and config, and read past reports without touching a shell. Authorised by your existing Proxmox login.
-- **Flexible Notifications:** Discord (channel *or* direct message, with the log attached as a file), Slack/Teams, any JSON webhook, and Mailgun email — in any combination, or none at all.
+- **Flexible Notifications:** Email over **any SMTP server** or Mailgun, Discord (channel *or* direct message, with the log attached as a file), Slack, **Microsoft Teams**, **ntfy**, **Gotify**, **Telegram**, and any JSON webhook — in any combination, or none at all.
 - **Per-Guest Updates:** Each VM and container gets an **Update Now** button in its toolbar — patch a single guest without running the whole sweep, or exclude it from the schedule with one click. Also available as `--only <id>` on the CLI.
 - **Fancy Terminal Output:** Braille dot spinners, ANSI color-coded results, Unicode box-drawing banners, and a summary table.
 - **Interactive Configuration:** Prompts for notification channels, exclusion list, timeouts, schedule, reboot time and the web panel during install. Stored in `/etc/proxmox-autoupdate.conf` (`chmod 600`, created with those permissions before anything is written to it).
@@ -56,7 +56,7 @@ Required packages — the installer adds the first two automatically if missing,
 | `linux-base` | Optional. Accurate kernel version comparison |
 | `systemd` (`systemd-run`) | Optional. Needed by `--detach` |
 
-**Notifications are entirely optional.** With no channel configured the tool still updates on schedule — it just does so quietly. Mailgun is only needed if you want email specifically.
+**Notifications are entirely optional.** With no channel configured the tool still updates on schedule — it just does so quietly. Email works with any SMTP server; Mailgun is supported but no longer required.
 
 > **⚠ Important:** VMs without the QEMU Guest Agent will be reported as "Agent Offline" and skipped. For Windows VMs, ensure the VirtIO guest tools are installed.
 
