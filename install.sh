@@ -44,7 +44,14 @@ resolve_ref() {
     local tag=""
     tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
           | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    if [ -n "${tag}" ]; then
+    # Fall back to the newest git tag when no Release has been published — a
+    # tag on its own is a perfectly good release marker, and requiring the
+    # extra "publish release" step would otherwise break every install.
+    if [ -z "${tag}" ]; then
+        tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/tags?per_page=1" 2>/dev/null \
+              | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+    if echo "${tag}" | grep -qE '^[A-Za-z0-9._/-]{1,64}$'; then
         echo "${tag}"
     else
         echo "${PAU_FALLBACK_REF}"
