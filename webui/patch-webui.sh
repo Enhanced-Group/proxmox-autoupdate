@@ -20,9 +20,11 @@
 
 set -uo pipefail
 
-TARGET="/usr/share/pve-manager/js/pvemanagerlib.js"
-BACKUP="/var/lib/proxmox-autoupdate/pvemanagerlib.js.orig"
-CONFIG_FILE="/etc/proxmox-autoupdate.conf"
+# Paths are overridable purely so the test suite can exercise apply/remove
+# against a throwaway copy. Nothing in normal operation sets these.
+TARGET="${PAU_TARGET:-/usr/share/pve-manager/js/pvemanagerlib.js}"
+BACKUP="${PAU_BACKUP:-/var/lib/proxmox-autoupdate/pvemanagerlib.js.orig}"
+CONFIG_FILE="${PAU_CONFIG:-/etc/proxmox-autoupdate.conf}"
 BEGIN_MARKER="/* ==== BEGIN proxmox-autoupdate button ==== */"
 END_MARKER="/* ==== END proxmox-autoupdate button ==== */"
 
@@ -53,9 +55,100 @@ require_target() {
     fi
 }
 
+file_size() { wc -c < "$1" 2>/dev/null || echo 0; }
+
+# Does TARGET look like a complete pvemanagerlib.js rather than a fragment?
+# A truncated file is the one failure mode that must never be propagated into
+# the backup, because the backup is the only way back.
+target_looks_sane() {
+    grep -qF "${SENTINEL}" "${TARGET}" 2>/dev/null || return 1
+    [ "$(file_size "${TARGET}")" -ge 65536 ] || return 1
+    return 0
+}
+
+# Snapshot the shipped file, but only when it is worth snapshotting.
+#
+# pve-manager upgrades legitimately change this file, so the backup cannot be
+# write-once. It must, however, refuse to overwrite a good copy with a damaged
+# one: previously the copy was taken unconditionally, so once TARGET was
+# truncated the truncated version replaced the last good backup on the very next
+# apt transaction.
+backup_target() {
+    if ! target_looks_sane; then
+        warn "${TARGET} does not look intact — keeping the existing reference copy"
+        return 1
+    fi
+    if [ -f "${BACKUP}" ]; then
+        local new old
+        new=$(file_size "${TARGET}")
+        old=$(file_size "${BACKUP}")
+        # Allow growth and modest shrinkage between releases; reject a collapse.
+        if [ "${old}" -gt 0 ] && [ "$(( new * 10 ))" -lt "$(( old * 9 ))" ]; then
+            warn "${TARGET} is much smaller than the reference copy — not replacing it"
+            return 1
+        fi
+    fi
+    mkdir -p "$(dirname "${BACKUP}")" 2>/dev/null || true
+    cp -f "${TARGET}" "${BACKUP}" 2>/dev/null || {
+        warn "Could not write the reference copy at ${BACKUP}"
+        return 1
+    }
+    return 0
+}
+
 is_patched() {
     grep -qF "${BEGIN_MARKER}" "${TARGET}" 2>/dev/null
 }
+
+# A fingerprint of the exact block this version of the script would emit. It is
+# written into the file directly after the begin marker, so `apply` can tell
+# "patched with this block" from "patched with an older one" and skip the
+# rewrite entirely. This is what makes the apt hook cheap: pve-manager is a 5 MB
+# file and the hook fires after *every* dpkg transaction, so re-writing it each
+# time is both wasteful and an unnecessary corruption window.
+_BLOCK_STAMP=""
+block_stamp() {
+    if [ -z "${_BLOCK_STAMP}" ]; then
+        local h
+        h=$(emit_block | sha256sum 2>/dev/null | cut -c1-16)
+        [ -n "${h}" ] || h="nohash"
+        _BLOCK_STAMP="/* pau-block: ${h} */"
+    fi
+    printf '%s' "${_BLOCK_STAMP}"
+}
+
+is_current() {
+    grep -qF "$(block_stamp)" "${TARGET}" 2>/dev/null
+}
+
+# Replace TARGET with the contents of a staging file, atomically.
+#
+# The staging file is created in TARGET's own directory so that rename(2) stays
+# within one filesystem and is therefore atomic: readers see either the whole
+# old file or the whole new one, never a fragment. The previous implementation
+# used `cat tmp > TARGET`, which truncates the live file to zero and streams
+# 5 MB back into it — any interruption there (power loss, OOM, ENOSPC) leaves a
+# partial pvemanagerlib.js, and because that file is a single script a truncated
+# tail is a syntax error for the whole thing, so the entire Proxmox web UI loads
+# blank until pve-manager is reinstalled.
+atomic_replace() {
+    local src="$1" dst="$2"
+    chmod --reference="${dst}" "${src}" 2>/dev/null || chmod 644 "${src}"
+    chown --reference="${dst}" "${src}" 2>/dev/null || true
+    mv -f "${src}" "${dst}"
+}
+
+# Staging file next to the target, cleaned up on any exit path.
+_STAGE=""
+stage_file() {
+    _STAGE=$(mktemp "${TARGET}.pau.XXXXXX" 2>/dev/null) || return 1
+    printf '%s' "${_STAGE}"
+}
+cleanup_stage() {
+    [ -n "${_STAGE}" ] && rm -f "${_STAGE}"
+    _STAGE=""
+}
+trap cleanup_stage EXIT INT TERM
 
 # The injected block. Kept in a function so both apply and the self-test can
 # reach it without duplicating the source.
@@ -547,40 +640,76 @@ JSBLOCK
 do_apply() {
     require_target
 
-    # Keep a pristine copy of whatever pve-manager shipped, for reference and
-    # for a worst-case manual restore.
-    mkdir -p "$(dirname "${BACKUP}")"
-    if is_patched; then
-        act "Existing patch found — replacing it"
-        do_remove --quiet || return 1
+    # Fast path. The apt hook runs this after every dpkg transaction, so when the
+    # exact block we would write is already in place there is nothing to do —
+    # and nothing should touch a 5 MB file that the whole web UI depends on.
+    if is_current; then
+        [ "${1:-}" = "--quiet" ] || ok "Toolbar button already up to date"
+        return 0
     fi
-    cp -f "${TARGET}" "${BACKUP}"
+
+    # Refuse to build on top of a file that is already damaged, and say exactly
+    # how to get back. Appending to a truncated pvemanagerlib.js would produce a
+    # file that passes the size check while still being broken JavaScript.
+    if ! target_looks_sane; then
+        fail "${TARGET} does not look like a complete pvemanagerlib.js."
+        if [ -f "${BACKUP}" ]; then
+            fail "Restore it with:  $0 restore"
+        fi
+        fail "Or reinstall it with:  apt-get install --reinstall pve-manager"
+        return 1
+    fi
+
+    if is_patched; then
+        act "Existing patch is from a different version — replacing it"
+        do_remove --quiet || return 1
+    else
+        # Only snapshot a file that is genuinely unpatched and intact.
+        backup_target || true
+    fi
 
     local tmp
-    tmp=$(mktemp) || { fail "mktemp failed"; return 1; }
-    cat "${TARGET}" > "${tmp}"
+    tmp=$(stage_file) || { fail "Could not create a staging file next to ${TARGET}"; return 1; }
+
+    if ! cat "${TARGET}" > "${tmp}"; then
+        fail "Could not stage a copy of ${TARGET} (out of space?)"
+        cleanup_stage
+        return 1
+    fi
     # Ensure the file ends with a newline so the block starts on its own line —
     # but do not add a blank one, or removing the block would not restore the
     # file byte for byte.
     if [ -s "${tmp}" ] && [ "$(tail -c 1 "${tmp}" | od -An -c | tr -d ' ')" != '\n' ]; then
         printf '\n' >> "${tmp}"
     fi
-    emit_block >> "${tmp}"
+    # The stamp rides on the end of the BEGIN marker line, so it is inside the
+    # block and gets removed with it, and both is_patched and the removal awk
+    # still match the marker as a substring.
+    if ! emit_block | sed "1s|\$| $(block_stamp)|" >> "${tmp}"; then
+        fail "Could not append the button block (out of space?)"
+        cleanup_stage
+        return 1
+    fi
 
     # Sanity-check before swapping it in.
     if ! grep -qF "${SENTINEL}" "${tmp}"; then
         fail "Refusing to install: result no longer contains ${SENTINEL}"
-        rm -f "${tmp}"
+        cleanup_stage
+        return 1
+    fi
+    if ! grep -qF "${END_MARKER}" "${tmp}"; then
+        fail "Refusing to install: the appended block is incomplete"
+        cleanup_stage
         return 1
     fi
     if [ "$(wc -c < "${tmp}")" -lt "$(wc -c < "${TARGET}")" ]; then
         fail "Refusing to install: result is smaller than the original"
-        rm -f "${tmp}"
+        cleanup_stage
         return 1
     fi
 
-    cat "${tmp}" > "${TARGET}"
-    rm -f "${tmp}"
+    atomic_replace "${tmp}" "${TARGET}" || { fail "Could not replace ${TARGET}"; cleanup_stage; return 1; }
+    _STAGE=""
     ok "Button added to the Proxmox toolbar"
     echo -e "     ${C_DIM}Hard-refresh the Proxmox UI (Ctrl+Shift+R) to see it.${C_NC}"
     return 0
@@ -596,29 +725,66 @@ do_remove() {
     fi
 
     local tmp
-    tmp=$(mktemp) || { fail "mktemp failed"; return 1; }
+    tmp=$(stage_file) || { fail "Could not create a staging file next to ${TARGET}"; return 1; }
 
     # Delete strictly between the markers, inclusive.
-    awk -v b="${BEGIN_MARKER}" -v e="${END_MARKER}" '
+    if ! awk -v b="${BEGIN_MARKER}" -v e="${END_MARKER}" '
         index($0, b) { skip = 1 }
         !skip        { print }
         index($0, e) { skip = 0 }
-    ' "${TARGET}" > "${tmp}"
+    ' "${TARGET}" > "${tmp}"; then
+        fail "Could not stage the unpatched file (out of space?)"
+        cleanup_stage
+        return 1
+    fi
 
     if grep -qF "${BEGIN_MARKER}" "${tmp}" || grep -qF "${END_MARKER}" "${tmp}"; then
         fail "Removal left marker text behind — leaving the file untouched"
-        rm -f "${tmp}"
+        cleanup_stage
         return 1
     fi
     if ! grep -qF "${SENTINEL}" "${tmp}"; then
         fail "Refusing to write: result no longer contains ${SENTINEL}"
-        rm -f "${tmp}"
+        cleanup_stage
         return 1
     fi
 
-    cat "${tmp}" > "${TARGET}"
-    rm -f "${tmp}"
+    atomic_replace "${tmp}" "${TARGET}" || { fail "Could not replace ${TARGET}"; cleanup_stage; return 1; }
+    _STAGE=""
     [ "${quiet}" = "--quiet" ] || ok "Button removed from the Proxmox toolbar"
+    return 0
+}
+
+# Put the reference copy back. This is the manual recovery path for a
+# pvemanagerlib.js that has been damaged — by an interrupted write from an older
+# version of this script, or by anything else that left it truncated.
+do_restore() {
+    if [ ! -f "${BACKUP}" ]; then
+        fail "No reference copy at ${BACKUP}"
+        fail "Reinstall the shipped file with:  apt-get install --reinstall pve-manager"
+        return 1
+    fi
+    if ! grep -qF "${SENTINEL}" "${BACKUP}" 2>/dev/null; then
+        fail "The reference copy at ${BACKUP} does not look intact either."
+        fail "Reinstall the shipped file with:  apt-get install --reinstall pve-manager"
+        return 1
+    fi
+    if [ ! -f "${TARGET}" ]; then
+        fail "Not found: ${TARGET}"
+        return 1
+    fi
+
+    local tmp
+    tmp=$(stage_file) || { fail "Could not create a staging file next to ${TARGET}"; return 1; }
+    if ! cat "${BACKUP}" > "${tmp}"; then
+        fail "Could not stage the reference copy (out of space?)"
+        cleanup_stage
+        return 1
+    fi
+    atomic_replace "${tmp}" "${TARGET}" || { fail "Could not replace ${TARGET}"; cleanup_stage; return 1; }
+    _STAGE=""
+    ok "Restored ${TARGET} from the reference copy"
+    echo -e "     ${C_DIM}Hard-refresh the Proxmox UI (Ctrl+Shift+R).${C_NC}"
     return 0
 }
 
@@ -634,11 +800,17 @@ do_status() {
 }
 
 case "${1:-}" in
-    apply)  do_apply ;;
-    remove) do_remove ;;
-    status) do_status ;;
+    apply)   do_apply "${2:-}" ;;
+    remove)  do_remove "${2:-}" ;;
+    restore) do_restore ;;
+    status)  do_status ;;
     *)
-        echo "Usage: $0 apply|remove|status"
+        echo "Usage: $0 apply|remove|status|restore [--quiet]"
+        echo ""
+        echo "  apply    add the Auto-Update buttons to the Proxmox web UI"
+        echo "  remove   take them out again"
+        echo "  status   report whether they are installed"
+        echo "  restore  put back the reference copy of pvemanagerlib.js"
         exit 2
         ;;
 esac
