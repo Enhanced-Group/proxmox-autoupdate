@@ -2366,8 +2366,13 @@ SHARED_CSS = r"""  :root {
   pre.live::after { content: '▌'; color: var(--accent); animation: blink 1s step-end infinite; }
   .log-line-new { animation: fadeIn .25s ease-out; }
   .stat { transition: color .25s ease; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  td, th { padding: 5px 7px; border-bottom: 1px solid var(--border); text-align: left; }
+  /* Tables scroll inside their own card rather than squeezing the name column
+     to nothing on a phone. Proxmox's UI is routinely driven from a tablet. */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 420px; }
+  td, th { padding: 5px 7px; border-bottom: 1px solid var(--border); text-align: left;
+           white-space: nowrap; }
+  td.wrap, th.wrap { white-space: normal; }
   a { color: var(--accent); }
 """
 
@@ -2404,10 +2409,11 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div class="row">
       <button id="btnDry" class="primary">Dry run</button>
       <button id="btnFull" class="danger">Update everything now</button>
-      <span class="hint" style="margin:0">Both email the report to your configured recipient.</span>
+      <span class="hint" id="runChannels" style="margin:0"></span>
     </div>
     <div class="hint">
-      A dry run installs nothing and never reboots. A full run updates the host and
+      A dry run changes nothing at all — no packages, no snapshots, no reboot,
+      and no starting or stopping of guests. A full run updates the host and
       every guest, and may schedule a reboot if the kernel changes.
     </div>
     <div id="runMsg" class="msg"></div>
@@ -2426,18 +2432,19 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <h2>Guests excluded from scheduled updates</h2>
     <div class="hint" style="margin-bottom:10px">
       Ticked guests are skipped by the scheduled run. You can still update an
-      excluded guest by hand from its own Auto-Update tab.
+      excluded guest by hand with its <strong>Update Now</strong> button in the
+      Proxmox UI, or <code>update-everything.sh --only &lt;id&gt;</code>.
     </div>
     <div class="row" style="margin-bottom:10px">
       <button id="btnRefreshGuests">Refresh</button>
       <button id="btnExcludeNone">Include all</button>
       <span id="exclCount" class="hint" style="margin:0"></span>
     </div>
-    <table>
+    <div class="table-wrap"><table>
       <thead><tr><th style="width:44px">Skip</th><th style="width:70px">ID</th>
-        <th>Name</th><th style="width:80px">Type</th><th style="width:90px">Status</th></tr></thead>
+        <th class="wrap">Name</th><th style="width:80px">Type</th><th style="width:90px">Status</th></tr></thead>
       <tbody id="guestList"><tr><td colspan="5">Loading…</td></tr></tbody>
-    </table>
+    </table></div>
     <div class="row" style="margin-top:12px">
       <button id="btnSaveExcl" class="primary">Save exclusions</button>
     </div>
@@ -2681,7 +2688,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="card">
     <h2>Past reports</h2>
-    <table><tbody id="logList"></tbody></table>
+    <div class="table-wrap"><table><tbody id="logList"></tbody></table></div>
   </div>
   <div class="card">
     <h2>Selected log</h2>
@@ -2737,10 +2744,10 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
   <div class="card">
     <h2>Recent runs</h2>
-    <table>
+    <div class="table-wrap"><table>
       <thead><tr><th>When</th><th>Result</th><th>Scope</th><th>Failed</th></tr></thead>
       <tbody id="histList"><tr><td colspan="4">Loading…</td></tr></tbody>
-    </table>
+    </table></div>
     <div id="offenders" class="hint"></div>
   </div>
 
@@ -3304,6 +3311,14 @@ async function poll() {
       pill.innerHTML = '<span class="spinner"></span>scheduled run in progress';
     } else if (st.returncode === 0) {
       pill.className = "pill ok"; pill.textContent = "last run OK";
+    } else if (st.returncode === 2) {
+      // Not a failure. The run completed, but one or more guests were left
+      // mid-update — typically a Windows guest still installing — so the host
+      // reboot was deliberately held back.
+      pill.className = "pill warn-pill";
+      pill.textContent = "guests left mid-update";
+      pill.title = "The run finished, but at least one guest was still updating. " +
+                   "Any host reboot was postponed.";
     } else if (st.returncode !== null && st.returncode !== undefined) {
       pill.className = "pill err"; pill.textContent = "last run failed (" + st.returncode + ")";
     } else {
@@ -3576,8 +3591,28 @@ async function showLog(name) {
   } catch (e) { $("logFile").textContent = e.message; }
 }
 
+// Say where a report will actually go, rather than assuming email. With no
+// channel configured a run is simply quiet, and claiming otherwise sends people
+// looking for a message that was never going to arrive.
+async function describeChannels() {
+  try {
+    const cfg = (await api("/api/config")).config;
+    const methods = (cfg.NOTIFY_METHODS || "").split(",")
+      .map((s) => s.trim()).filter((s) => s && s !== "none");
+    const el = $("runChannels");
+    if (!methods.length) {
+      el.textContent = "No notification channel configured — the output appears below.";
+    } else if (cfg.NOTIFY_ON_FAILURE_ONLY === "true") {
+      el.textContent = "Reports go to " + methods.join(", ") + ", failures only.";
+    } else {
+      el.textContent = "Reports go to " + methods.join(", ") + ".";
+    }
+  } catch (e) { /* leave it blank rather than guess */ }
+}
+
 watchForChanges();
 loadConfig();
+describeChannels();
 poll();
 setInterval(poll, 2000);
 </script>
@@ -3617,7 +3652,7 @@ GUEST_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="hint">
     Only this guest is touched. The Proxmox host is not updated and no reboot is
-    ever scheduled from here. No report email is sent — the output appears below.
+    ever scheduled from here. No report is sent — the output appears below.
   </div>
   <div id="runMsg" class="msg"></div>
   <div id="runProgress" class="progress"><div></div></div>
