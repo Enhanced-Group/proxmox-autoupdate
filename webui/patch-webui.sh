@@ -40,6 +40,29 @@ fi
 # A string that must still be present after any edit, as a corruption canary.
 SENTINEL="PVE.StdWorkspace"
 
+# --- Subscription notice ------------------------------------------------------
+# Proxmox shows a "No valid subscription" dialog on every login when the node
+# has no subscription key. Suppressing it is opt-in and off by default.
+#
+# To be explicit about what this does and does not do: it stops one dialog
+# rendering. It does not create, alter or fake a subscription, it does not
+# change which repositories the node can reach, and it does not touch
+# /etc/subscription or the subscription API. `pvesubscription get` reports
+# exactly what it did before. If you run Proxmox commercially, buy a
+# subscription — it is what funds the thing you are updating.
+NAG_TARGET="${PAU_NAG_TARGET:-/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js}"
+NAG_SENTINEL="checked_command"
+NAG_BEGIN="/* ==== BEGIN proxmox-autoupdate subscription-notice ==== */"
+NAG_END="/* ==== END proxmox-autoupdate subscription-notice ==== */"
+
+# Read the opt-in from the same config file everything else uses.
+SUPPRESS_NAG="false"
+if [ -r "${CONFIG_FILE}" ]; then
+    _nag=$(sed -n 's/^[[:space:]]*SUPPRESS_SUBSCRIPTION_NOTICE[[:space:]]*=[[:space:]]*['"'"'"]\{0,1\}\([A-Za-z]*\).*/\1/p' \
+        "${CONFIG_FILE}" | tail -1)
+    [ "${_nag}" = "true" ] && SUPPRESS_NAG="true"
+fi
+
 C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
 C_CYAN='\033[0;36m'; C_DIM='\033[2m'; C_NC='\033[0m'
 ok()   { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
@@ -138,10 +161,11 @@ atomic_replace() {
     mv -f "${src}" "${dst}"
 }
 
-# Staging file next to the target, cleaned up on any exit path.
+# Staging file next to a target, cleaned up on any exit path.
 _STAGE=""
 stage_file() {
-    _STAGE=$(mktemp "${TARGET}.pau.XXXXXX" 2>/dev/null) || return 1
+    local dest="${1:-${TARGET}}"
+    _STAGE=$(mktemp "${dest}.pau.XXXXXX" 2>/dev/null) || return 1
     printf '%s' "${_STAGE}"
 }
 cleanup_stage() {
@@ -182,11 +206,26 @@ JSBLOCK_HEAD
             /* box-sizing matters: without it the border below is added on top
                of the width ExtJS measured at layout time, and the button
                overflows into its neighbour. */
+            /* Colours come from CSS custom properties so the panel's chosen
+               palette can be applied at runtime without re-patching this file.
+               The fallbacks are the Proxmox orange, so the buttons look right
+               before the first status fetch completes and stay right if the
+               panel is unreachable. */
+            ':root {',
+            '  --pau-accent: #e57000;',
+            '  --pau-accent-hover: #ff8c1a;',
+            '  --pau-accent-pressed: #c96200;',
+            '  --pau-accent-border: #b35700;',
+            '  --pau-on-accent: #ffffff;',
+            '  --pau-ok: #46c46b;',
+            '  --pau-warn: #ffd24d;',
+            '  --pau-err: #ff4d4d;',
+            '}',
             '.pau-btn, .pau-btn * { box-sizing: border-box !important; }',
             '.pau-btn {',
-            '  background: #e57000 !important;',
+            '  background: var(--pau-accent) !important;',
             '  background-image: none !important;',
-            '  border: 1px solid #b35700 !important;',
+            '  border: 1px solid var(--pau-accent-border) !important;',
             '  border-radius: 3px !important;',
             '  overflow: visible !important;',
             '}',
@@ -195,15 +234,16 @@ JSBLOCK_HEAD
             '  background-image: none !important;',
             '}',
             '.pau-btn .x-btn-inner {',
-            '  color: #ffffff !important;',
+            '  color: var(--pau-on-accent) !important;',
             '  font-weight: 600 !important;',
             '}',
+            '.pau-btn .x-btn-icon-el { color: var(--pau-on-accent) !important; }',
             '.pau-btn.x-btn-over, .pau-btn.x-btn-focus, .pau-btn:hover {',
-            '  background: #ff8c1a !important;',
-            '  border-color: #c96200 !important;',
+            '  background: var(--pau-accent-hover) !important;',
+            '  border-color: var(--pau-accent-pressed) !important;',
             '}',
             '.pau-btn.x-btn-pressed, .pau-btn.x-btn-menu-active {',
-            '  background: #c96200 !important;',
+            '  background: var(--pau-accent-pressed) !important;',
             '}',
             /* The status indicator *is* the icon — a coloured dot in the icon
                slot, rather than a second badge tacked onto the right. */
@@ -217,12 +257,29 @@ JSBLOCK_HEAD
             '  border-radius: 50%; background: #d9d9d9;',
             '  box-shadow: 0 0 0 1px rgba(0,0,0,.25);',
             '}',
-            '.pau-btn.pau-ok      .x-btn-icon-el.pau-ico::before { background: #46c46b; }',
-            '.pau-btn.pau-error   .x-btn-icon-el.pau-ico::before { background: #ff4d4d; }',
+            '.pau-btn.pau-ok      .x-btn-icon-el.pau-ico::before { background: var(--pau-ok); }',
+            '.pau-btn.pau-error   .x-btn-icon-el.pau-ico::before { background: var(--pau-err); }',
             '.pau-btn.pau-running .x-btn-icon-el.pau-ico::before {',
-            '  background: #ffd24d; animation: pau-pulse 1.2s ease-in-out infinite;',
+            '  background: var(--pau-warn); animation: pau-pulse 1.2s ease-in-out infinite;',
             '}',
-            '@keyframes pau-pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }'
+            '@keyframes pau-pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }',
+            /* The per-guest button. It used to copy its neighbours exactly so
+               it looked native; it now carries the accent so that recolouring
+               the panel recolours every button this tool adds, which is what
+               people expect when they change a theme. */
+            '.pau-guest-btn .x-btn-inner {',
+            '  color: var(--pau-accent) !important;',
+            '  font-weight: 600 !important;',
+            '}',
+            '.pau-guest-btn .x-btn-icon-el { color: var(--pau-accent) !important; }',
+            '.pau-guest-btn.x-btn-over, .pau-guest-btn:hover {',
+            '  background: var(--pau-accent) !important;',
+            '  background-image: none !important;',
+            '}',
+            '.pau-guest-btn.x-btn-over .x-btn-inner, .pau-guest-btn:hover .x-btn-inner,',
+            '.pau-guest-btn.x-btn-over .x-btn-icon-el, .pau-guest-btn:hover .x-btn-icon-el {',
+            '  color: var(--pau-on-accent) !important;',
+            '}'
         ].join('\n');
         document.head.appendChild(el);
     }
@@ -313,8 +370,36 @@ JSBLOCK_HEAD
             return r.ok ? r.json() : null;
         }).then(function (data) {
             statusCache = {value: data, fetched: Date.now()};
+            applyTheme(data);
             return data;
         }).catch(function () { return null; });
+    }
+
+    /* Push the panel's palette onto the CSS variables the styles above read.
+       Values are validated here as well as on the server: this runs inside the
+       Proxmox origin, so anything written into a style property has to be
+       known-safe regardless of where it came from. */
+    var HEX = /^#[0-9a-fA-F]{6}$/;
+    var THEME_VARS = {
+        accent: '--pau-accent',
+        accentHover: '--pau-accent-hover',
+        accentPressed: '--pau-accent-pressed',
+        accentBorder: '--pau-accent-border',
+        onAccent: '--pau-on-accent',
+        ok: '--pau-ok',
+        warn: '--pau-warn',
+        err: '--pau-err'
+    };
+
+    function applyTheme(state) {
+        if (!state || !state.theme) { return; }
+        var root = document.documentElement;
+        Object.keys(THEME_VARS).forEach(function (key) {
+            var value = state.theme[key];
+            if (typeof value === 'string' && HEX.test(value)) {
+                root.style.setProperty(THEME_VARS[key], value);
+            }
+        });
     }
 
     /* Whether the tool is updating *itself* is deliberately distinct from a
@@ -585,6 +670,7 @@ JSBLOCK_HEAD
             var btn = tb.insert(want, Ext.apply({
                 xtype: 'button',
                 itemId: 'pauGuestBtn',
+                cls: 'pau-guest-btn',
                 text: 'Update Now',
                 iconCls: 'fa fa-refresh',
                 tooltip: 'Update only this guest. The host is not touched and no ' +
@@ -788,6 +874,134 @@ do_restore() {
     return 0
 }
 
+# ---- Subscription notice ----------------------------------------------------
+#
+# Same approach as the toolbar button: append a self-contained block rather than
+# splice into Proxmox's own code. The widely-circulated one-liners for this use
+# `sed` against the exact text of the dialog, which breaks silently whenever
+# Proxmox rewords it and, worse, edits the file in place. Overriding the method
+# after the file has loaded does not care how the dialog is worded, and appending
+# cannot corrupt the code above it.
+
+nag_emit_block() {
+    cat <<'NAGBLOCK'
+/* ==== BEGIN proxmox-autoupdate subscription-notice ==== */
+/* Added by proxmox-autoupdate because SUPPRESS_SUBSCRIPTION_NOTICE=true.
+   Removed cleanly by patch-webui.sh nag-remove.
+
+   This suppresses one dialog. It does not create or modify a subscription,
+   does not change repository access, and does not touch /etc/subscription.
+   `pvesubscription get` reports exactly what it did before. */
+(function () {
+    if (typeof Proxmox === 'undefined' || !Proxmox.Utils) { return; }
+    var original = Proxmox.Utils.checked_command;
+    if (typeof original !== 'function') { return; }
+    Proxmox.Utils.checked_command = function (orig_cmd) {
+        try {
+            if (typeof orig_cmd === 'function') { orig_cmd(); }
+        } catch (e) {
+            /* Fall back to Proxmox's own behaviour rather than swallowing a
+               real error from the command we were asked to run. */
+            try { original(orig_cmd); } catch (e2) { }
+        }
+    };
+})();
+/* ==== END proxmox-autoupdate subscription-notice ==== */
+NAGBLOCK
+}
+
+nag_is_patched() {
+    grep -qF "${NAG_BEGIN}" "${NAG_TARGET}" 2>/dev/null
+}
+
+nag_require_target() {
+    if [ ! -f "${NAG_TARGET}" ]; then
+        fail "Not found: ${NAG_TARGET}"
+        fail "Is proxmox-widget-toolkit installed?"
+        return 1
+    fi
+    if ! grep -qF "${NAG_SENTINEL}" "${NAG_TARGET}" 2>/dev/null; then
+        fail "${NAG_TARGET} does not contain ${NAG_SENTINEL} — refusing to touch it."
+        return 1
+    fi
+    return 0
+}
+
+do_nag_apply() {
+    nag_require_target || return 1
+    if nag_is_patched; then
+        [ "${1:-}" = "--quiet" ] || ok "Subscription notice already suppressed"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(stage_file "${NAG_TARGET}") || { fail "Could not stage next to ${NAG_TARGET}"; return 1; }
+    if ! cat "${NAG_TARGET}" > "${tmp}"; then
+        fail "Could not stage ${NAG_TARGET} (out of space?)"; cleanup_stage; return 1
+    fi
+    if [ -s "${tmp}" ] && [ "$(tail -c 1 "${tmp}" | od -An -c | tr -d ' ')" != '\n' ]; then
+        printf '\n' >> "${tmp}"
+    fi
+    if ! nag_emit_block >> "${tmp}"; then
+        fail "Could not append the block (out of space?)"; cleanup_stage; return 1
+    fi
+    if ! grep -qF "${NAG_END}" "${tmp}" || ! grep -qF "${NAG_SENTINEL}" "${tmp}"; then
+        fail "Refusing to install: the result does not look right"; cleanup_stage; return 1
+    fi
+    if [ "$(wc -c < "${tmp}")" -lt "$(wc -c < "${NAG_TARGET}")" ]; then
+        fail "Refusing to install: result is smaller than the original"; cleanup_stage; return 1
+    fi
+
+    atomic_replace "${tmp}" "${NAG_TARGET}" || { fail "Could not replace ${NAG_TARGET}"; cleanup_stage; return 1; }
+    _STAGE=""
+    [ "${1:-}" = "--quiet" ] || {
+        ok "Subscription notice suppressed"
+        echo -e "     ${C_DIM}Hard-refresh the Proxmox UI (Ctrl+Shift+R). This hides a dialog;${C_NC}"
+        echo -e "     ${C_DIM}it does not change your subscription or repository access.${C_NC}"
+    }
+    return 0
+}
+
+do_nag_remove() {
+    nag_require_target || return 1
+    if ! nag_is_patched; then
+        [ "${1:-}" = "--quiet" ] || warn "Subscription notice is not suppressed — nothing to do"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(stage_file "${NAG_TARGET}") || { fail "Could not stage next to ${NAG_TARGET}"; return 1; }
+    if ! awk -v b="${NAG_BEGIN}" -v e="${NAG_END}" '
+        index($0, b) { skip = 1 }
+        !skip        { print }
+        index($0, e) { skip = 0 }
+    ' "${NAG_TARGET}" > "${tmp}"; then
+        fail "Could not stage the unpatched file"; cleanup_stage; return 1
+    fi
+    if grep -qF "${NAG_BEGIN}" "${tmp}" || grep -qF "${NAG_END}" "${tmp}"; then
+        fail "Removal left marker text behind — leaving the file untouched"; cleanup_stage; return 1
+    fi
+    if ! grep -qF "${NAG_SENTINEL}" "${tmp}"; then
+        fail "Refusing to write: result no longer contains ${NAG_SENTINEL}"; cleanup_stage; return 1
+    fi
+
+    atomic_replace "${tmp}" "${NAG_TARGET}" || { fail "Could not replace ${NAG_TARGET}"; cleanup_stage; return 1; }
+    _STAGE=""
+    [ "${1:-}" = "--quiet" ] || ok "Subscription notice restored"
+    return 0
+}
+
+# Bring the notice into line with the config. Called by apply, so the apt hook
+# re-applies it after a proxmox-widget-toolkit upgrade replaces the file.
+nag_reconcile() {
+    [ -f "${NAG_TARGET}" ] || return 0
+    if [ "${SUPPRESS_NAG}" = "true" ]; then
+        nag_is_patched || do_nag_apply "${1:-}"
+    else
+        ! nag_is_patched || do_nag_remove "${1:-}"
+    fi
+}
+
 do_status() {
     require_target
     if is_patched; then
@@ -800,17 +1014,39 @@ do_status() {
 }
 
 case "${1:-}" in
-    apply)   do_apply "${2:-}" ;;
-    remove)  do_remove "${2:-}" ;;
-    restore) do_restore ;;
-    status)  do_status ;;
+    apply)
+        do_apply "${2:-}"
+        _rc=$?
+        # Reconcile the subscription notice on every apply, so the apt hook
+        # restores it after proxmox-widget-toolkit is upgraded — that package
+        # replaces proxmoxlib.js wholesale, exactly like pve-manager does to
+        # pvemanagerlib.js.
+        nag_reconcile "${2:-}" || true
+        exit ${_rc}
+        ;;
+    remove)
+        do_remove "${2:-}"
+        _rc=$?
+        do_nag_remove --quiet || true
+        exit ${_rc}
+        ;;
+    restore)     do_restore ;;
+    status)      do_status ;;
+    nag-apply)   do_nag_apply "${2:-}" ;;
+    nag-remove)  do_nag_remove "${2:-}" ;;
     *)
-        echo "Usage: $0 apply|remove|status|restore [--quiet]"
+        echo "Usage: $0 apply|remove|status|restore|nag-apply|nag-remove [--quiet]"
         echo ""
-        echo "  apply    add the Auto-Update buttons to the Proxmox web UI"
-        echo "  remove   take them out again"
-        echo "  status   report whether they are installed"
-        echo "  restore  put back the reference copy of pvemanagerlib.js"
+        echo "  apply       add the Auto-Update buttons to the Proxmox web UI, and"
+        echo "              bring the subscription notice into line with the config"
+        echo "  remove      take them out again"
+        echo "  status      report whether they are installed"
+        echo "  restore     put back the reference copy of pvemanagerlib.js"
+        echo "  nag-apply   suppress the 'No valid subscription' dialog"
+        echo "  nag-remove  restore it"
+        echo ""
+        echo "  Suppressing the notice hides a dialog. It does not create or alter"
+        echo "  a subscription, and does not change repository access."
         exit 2
         ;;
 esac

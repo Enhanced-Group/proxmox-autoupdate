@@ -15,6 +15,7 @@ Standard library only — Proxmox ships Python 3 but no extra packages.
 
 import fcntl
 import html
+import io
 import json
 import os
 import re
@@ -23,6 +24,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -38,6 +40,7 @@ LISTEN_PORT = int(os.environ.get("PAU_UI_PORT", "8007"))
 LISTEN_ADDR = os.environ.get("PAU_UI_ADDR", "0.0.0.0")
 
 UPDATE_SCRIPT = "/usr/local/bin/update-everything.sh"
+UI_PATCHER = "/usr/local/bin/pve-autoupdate-patch-webui"
 CONFIG_FILE = "/etc/proxmox-autoupdate.conf"
 LOCKFILE = "/var/run/proxmox-autoupdate.lock"
 
@@ -155,6 +158,18 @@ def _v_optional(v):
     return not _has_shell_meta(v) and '"' not in v and len(v) < 4096
 
 
+TZ_RE = re.compile(r"\A[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\Z")
+
+
+def _v_tz(v):
+    """Empty means "use the host's timezone", which is the default."""
+    if v == "":
+        return True
+    if not TZ_RE.match(v) or len(v) > 64:
+        return False
+    return os.path.exists(os.path.join("/usr/share/zoneinfo", v))
+
+
 EDITABLE_KEYS = {
     "NOTIFY_METHODS": _v_methods,
     "NOTIFY_ON_FAILURE_ONLY": _v_bool,
@@ -169,10 +184,17 @@ EDITABLE_KEYS = {
     "SLACK_WEBHOOK_URL": _v_url,
     "GENERIC_WEBHOOK_URL": _v_url,
     "CONFIRM_UPDATES": _v_bool,
+    # Consumed by patch-webui.sh, not by the update script.
+    "SUPPRESS_SUBSCRIPTION_NOTICE": _v_bool,
     "EXCLUDE_IDS": _v_idlist,
     "WINDOWS_UPDATE_TIMEOUT": _v_int,
     "LINUX_UPDATE_TIMEOUT": _v_int,
     "APT_LOCK_TIMEOUT": _v_int,
+    # Added in 4.0.0 and previously unreachable from the UI.
+    "WINDOWS_SHUTDOWN_TIMEOUT": _v_int,
+    "LINUX_SHUTDOWN_TIMEOUT": _v_int,
+    "AGENT_ERROR_GRACE": _v_int,
+    "PAU_TZ": _v_tz,
     "START_STOPPED_WINDOWS": _v_bool,
     "START_STOPPED_LXC": _v_bool,
     "START_STOPPED_LINUX_VMS": _v_bool,
@@ -538,6 +560,34 @@ def theme_css(theme=None):
         readable_on(t["accent"]), readable_on(t["ok"]),
         readable_on(t["warn"]), readable_on(t["err"]),
     )
+
+
+def _shade(hex_colour, factor):
+    """Lighten (factor > 1) or darken (factor < 1) a colour, clamped."""
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    adj = lambda c: max(0, min(255, int(round(c * factor))))
+    return "#%02x%02x%02x" % (adj(r), adj(g), adj(b))
+
+
+def theme_for_client():
+    """The palette the injected Proxmox-UI buttons need, already derived.
+
+    Hover and pressed shades and the readable foreground are computed here so
+    the JavaScript injected into pvemanagerlib.js stays as small and dumb as
+    possible — it is the one piece of this project running inside somebody
+    else's application.
+    """
+    t = read_theme()
+    return {
+        "accent": t["accent"],
+        "accentHover": _shade(t["accent"], 1.18),
+        "accentPressed": _shade(t["accent"], 0.82),
+        "accentBorder": _shade(t["accent"], 0.78),
+        "onAccent": readable_on(t["accent"]),
+        "ok": t["ok"],
+        "warn": t["warn"],
+        "err": t["err"],
+    }
 
 
 def resolve_log_dir():
@@ -1064,6 +1114,46 @@ def check_for_updates():
         "repo": "https://github.com/%s" % GITHUB_REPO,
         "ref": ref,
         "command": "curl -fsSL %s | bash" % install_script_url(ref),
+    }
+
+
+# The script pads the tag so the columns line up: "[ ok ]", "[warn]", "[FAIL]".
+DOCTOR_LINE_RE = re.compile(r"^\s*\[\s*(ok|warn|FAIL)\s*\]\s*(.*)$")
+
+
+def run_doctor():
+    """Run the update script's own self-check and return it as structured rows.
+
+    Read-only by contract — --doctor changes nothing, starts nothing and sends
+    nothing — so this needs no confirmation step, unlike every other action on
+    the Maintenance tab. It is also the single most useful thing to hand
+    somebody whose scheduled runs appear to do nothing, which is why it belongs
+    in the UI and not only on the command line.
+    """
+    if not os.path.isfile(UPDATE_SCRIPT):
+        return {"error": "%s is not installed." % UPDATE_SCRIPT}
+    try:
+        res = subprocess.run([UPDATE_SCRIPT, "--doctor"],
+                             capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return {"error": "The self-check took longer than three minutes and was stopped. "
+                         "That usually means apt or the Proxmox API is hanging."}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"error": "Could not run the self-check: %s" % exc}
+
+    rows, section = [], ""
+    for line in strip_ansi(res.stdout + res.stderr).splitlines():
+        if line.startswith("── "):
+            section = line[3:].strip()
+            continue
+        m = DOCTOR_LINE_RE.match(line)
+        if m:
+            rows.append({"level": m.group(1), "section": section, "text": m.group(2).rstrip()})
+    return {
+        "rows": rows,
+        "failures": sum(1 for r in rows if r["level"] == "FAIL"),
+        "warnings": sum(1 for r in rows if r["level"] == "warn"),
+        "returncode": res.returncode,
     }
 
 
@@ -1672,6 +1762,11 @@ class Handler(BaseHTTPRequestHandler):
                 "version": installed_version(),
                 "self_update": maint["self_update"],
                 "pending": maint["pending"],
+                # Carried here rather than on a second endpoint: the toolbar
+                # button already polls this and caches it, so the injected
+                # buttons in the Proxmox UI can follow the panel's colours
+                # without any extra request.
+                "theme": theme_for_client(),
             })
         elif path == "/api/history":
             state = read_state()
@@ -1723,10 +1818,62 @@ class Handler(BaseHTTPRequestHandler):
                              "presets": THEME_PRESETS})
         elif path == "/api/logs":
             self._json(200, {"logs": list_logs()})
+        elif path == "/api/log/download":
+            self._download_log(params)
         elif path == "/api/log":
             self._serve_log(params)
         else:
             self._json(404, {"error": "Not found"})
+
+    def _download_log(self, params):
+        """Serve one log, or all of them as a .tar.gz, as a file download.
+
+        Reading a log in the browser and getting a copy off the box are
+        different jobs: the viewer strips ANSI and pages through 256 KiB at a
+        time, which is right for reading and wrong for attaching to a bug
+        report. This serves the bytes as they are on disk.
+        """
+        name = (params.get("name") or [None])[0]
+        log_dir = resolve_log_dir()
+
+        if name in (None, "", "all"):
+            names = [n for n in sorted(os.listdir(log_dir))
+                     if n.endswith(".log")] if os.path.isdir(log_dir) else []
+            if not names:
+                self._json(404, {"error": "No logs to download"})
+                return
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for n in names:
+                    p = safe_log_path(n)
+                    if p:
+                        try:
+                            tar.add(p, arcname="proxmox-autoupdate-logs/%s" % n)
+                        except OSError:
+                            continue
+            payload = buf.getvalue()
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            self._send(200, payload, ctype="application/gzip", extra={
+                "Content-Disposition":
+                    'attachment; filename="proxmox-autoupdate-logs-%s.tar.gz"' % stamp,
+            })
+            return
+
+        path = safe_log_path(name)
+        if not path:
+            self._json(404, {"error": "No such log"})
+            return
+        try:
+            with open(path, "rb") as fh:
+                payload = fh.read()
+        except OSError as exc:
+            self._json(500, {"error": "Could not read the log: %s" % exc})
+            return
+        # safe_log_path has already confirmed this resolves inside the log
+        # directory, so the name cannot carry a path or escape the quotes.
+        self._send(200, payload, ctype="text/plain; charset=utf-8", extra={
+            "Content-Disposition": 'attachment; filename="%s"' % os.path.basename(path),
+        })
 
     def _serve_log(self, params):
         name = (params.get("name") or [None])[0]
@@ -1792,6 +1939,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"removed": removed})
         elif path == "/api/self/check":
             self._json(200, check_for_updates())
+        elif path == "/api/self/doctor":
+            self._json(200, run_doctor())
+        elif path == "/api/subscription-notice":
+            self._set_subscription_notice(body)
         elif path == "/api/self/update":
             self._self_update(body, user)
         elif path == "/api/self/uninstall":
@@ -1974,6 +2125,38 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, {"excluded": saved})
 
+    def _set_subscription_notice(self, body):
+        """Toggle the 'No valid subscription' dialog, and act on it now.
+
+        Saving the setting alone would do nothing until the next apt
+        transaction re-ran the patcher, so the toggle would appear not to work.
+        The patcher reconciles the file against the config, so applying is the
+        same call in both directions.
+        """
+        suppress = bool(body.get("suppress"))
+        try:
+            write_config({"SUPPRESS_SUBSCRIPTION_NOTICE": "true" if suppress else "false"})
+        except OSError as exc:
+            self._json(500, {"error": "Could not save the setting: %s" % exc})
+            return
+
+        if not os.path.isfile(UI_PATCHER):
+            self._json(200, {"ok": True, "suppressed": suppress,
+                             "note": "Saved. The Proxmox UI patcher is not installed, "
+                                     "so nothing was changed in the interface."})
+            return
+        try:
+            res = subprocess.run([UI_PATCHER, "nag-apply" if suppress else "nag-remove", "--quiet"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._json(500, {"error": "Setting saved, but the patcher failed: %s" % exc})
+            return
+        if res.returncode != 0:
+            self._json(500, {"error": "Setting saved, but the patcher failed: %s"
+                                      % (strip_ansi(res.stdout + res.stderr).strip() or "unknown error")})
+            return
+        self._json(200, {"ok": True, "suppressed": suppress})
+
     def _save_theme(self, body):
         incoming = body.get("theme")
         if body.get("reset"):
@@ -2060,6 +2243,34 @@ class Handler(BaseHTTPRequestHandler):
 SHARED_JS = r"""
 const $ = (id) => document.getElementById(id);
 
+// "3 days ago" reads faster than a timestamp when the question is "is this
+// recent?", which is the question being asked of every date in this panel. The
+// exact value stays available as a tooltip.
+function relTime(when) {
+  if (!when) { return "never"; }
+  const then = (when instanceof Date) ? when : new Date(when);
+  if (isNaN(then.getTime())) { return "unknown"; }
+  const secs = Math.round((Date.now() - then.getTime()) / 1000);
+  if (secs < 0)     { return "just now"; }
+  if (secs < 60)    { return secs + "s ago"; }
+  const mins = Math.round(secs / 60);
+  if (mins < 60)    { return mins + (mins === 1 ? " minute ago" : " minutes ago"); }
+  const hours = Math.round(mins / 60);
+  if (hours < 24)   { return hours + (hours === 1 ? " hour ago" : " hours ago"); }
+  const days = Math.round(hours / 24);
+  if (days < 31)    { return days + (days === 1 ? " day ago" : " days ago"); }
+  const months = Math.round(days / 30);
+  if (months < 12)  { return months + (months === 1 ? " month ago" : " months ago"); }
+  const years = Math.round(months / 12);
+  return years + (years === 1 ? " year ago" : " years ago");
+}
+
+function humanSize(bytes) {
+  if (bytes < 1024) { return bytes + " B"; }
+  if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(1) + " KB"; }
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
 function msg(el, text, ok) {
   el.textContent = text;
   el.className = "msg show " + (ok ? "ok" : "err");
@@ -2119,6 +2330,13 @@ function paintDirty(section, on) {
   const sec = document.getElementById("tab-" + section);
   if (sec) {
     sec.querySelectorAll("button.primary").forEach((b) => b.classList.toggle("needs-save", on));
+  }
+  // Unsaved changes on a settings sub-tab must also show on the Settings tab
+  // itself, or the indicator is invisible from anywhere else in the panel.
+  const settingsBtn = document.querySelector('.tabs:not(.subtabs) button[data-tab="settings"]');
+  if (settingsBtn) {
+    const anySub = ["exclusions", "schedule", "notify", "config"].some((s) => dirty.has(s));
+    settingsBtn.classList.toggle("dirty", anySub);
   }
 }
 
@@ -2309,6 +2527,39 @@ SHARED_CSS = r"""  :root {
   .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
   /* Appearance picker */
+  /* A link that reads as a button. Downloads have to be real anchors so the
+     browser handles the save; they should not look like an odd one out. */
+  a.btnlink { display: inline-block; font: inherit; padding: 7px 14px;
+              border-radius: 4px; border: 1px solid var(--border);
+              background: var(--btn); color: var(--text);
+              text-decoration: none; cursor: pointer; }
+  a.btnlink:hover { border-color: var(--accent); }
+
+  /* Status summary on the Overview tab */
+  .summary-grid { display: grid; gap: 14px;
+                  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .sum-label { color: var(--muted); font-size: 11px; text-transform: uppercase;
+               letter-spacing: .06em; margin-bottom: 3px; }
+  .sum-value { font-size: 15px; font-weight: 600; }
+
+  /* Secondary navigation inside Settings */
+  .subtabs { margin: 0 0 14px; padding-bottom: 10px;
+             border-bottom: 1px solid var(--border); }
+  .subtabs button { border-radius: 4px; font-size: 12px; padding: 5px 11px; }
+  .subtabs button.active { background: var(--accent); border-color: var(--accent);
+                           color: var(--on-accent, #fff); }
+
+  /* Self-check results */
+  .doc-row { display: flex; gap: 8px; align-items: baseline; padding: 3px 0;
+             font-size: 12px; }
+  .doc-tag { flex: 0 0 auto; width: 46px; text-align: center; border-radius: 3px;
+             font-size: 10px; font-weight: 700; padding: 1px 0; }
+  .doc-ok   { background: var(--ok);   color: var(--on-ok, #fff); }
+  .doc-warn { background: var(--warn); color: var(--on-warn, #000); }
+  .doc-fail { background: var(--err);  color: var(--on-err, #fff); }
+  .doc-section { margin-top: 10px; color: var(--muted); font-size: 11px;
+                 text-transform: uppercase; letter-spacing: .06em; }
+
   .swatch-row { flex-wrap: nowrap; }
   input.swatch { width: 42px; min-width: 42px; height: 30px; padding: 2px;
                  cursor: pointer; }
@@ -2392,18 +2643,58 @@ PAGE_TEMPLATE = r"""<!doctype html>
   Schedule: <code id="schedDisplay">—</code>
 </div>
 
-<div class="tabs">
-  <button data-tab="run" class="active">Run</button>
-  <button data-tab="exclusions">Exclusions</button>
-  <button data-tab="schedule">Schedule</button>
-  <button data-tab="notify">Notifications</button>
-  <button data-tab="config">Configuration</button>
-  <button data-tab="logs">Logs &amp; Reports</button>
-  <button data-tab="maint">Maintenance</button>
+<div id="offline" class="unsaved hidden">
+  Lost contact with the panel — retrying. The Proxmox API restarts during a host
+  upgrade, so this is expected mid-run.
 </div>
 
-<!-- RUN -->
-<section id="tab-run">
+<div class="tabs" role="tablist" aria-label="Sections">
+  <button data-tab="run" class="active" role="tab" aria-selected="true"
+          aria-controls="tab-run" id="tabbtn-run">Overview</button>
+  <button data-tab="settings" role="tab" aria-selected="false"
+          aria-controls="tab-settings" id="tabbtn-settings" tabindex="-1">Settings</button>
+  <button data-tab="logs" role="tab" aria-selected="false"
+          aria-controls="tab-logs" id="tabbtn-logs" tabindex="-1">Logs &amp; Reports</button>
+  <button data-tab="maint" role="tab" aria-selected="false"
+          aria-controls="tab-maint" id="tabbtn-maint" tabindex="-1">Maintenance</button>
+</div>
+
+<!-- OVERVIEW -->
+<section id="tab-run" role="tabpanel" aria-labelledby="tabbtn-run">
+  <!-- The question people open this panel to answer is "did the thing I set up
+       two months ago actually work?" — not "let me start a run". So that goes
+       first, and the buttons go underneath it. -->
+  <div class="card" id="summaryCard">
+    <h2>Status</h2>
+    <div class="summary-grid">
+      <div>
+        <div class="sum-label">Last run</div>
+        <div class="sum-value" id="sumWhen">—</div>
+        <div class="hint" id="sumWhenExact" style="margin:0"></div>
+      </div>
+      <div>
+        <div class="sum-label">Outcome</div>
+        <div class="sum-value"><span id="sumResult" class="pill idle">—</span></div>
+        <div class="hint" id="sumScope" style="margin:0"></div>
+      </div>
+      <div>
+        <div class="sum-label">Updated</div>
+        <div class="sum-value" id="sumCounts">—</div>
+        <div class="hint" id="sumCountsDetail" style="margin:0"></div>
+      </div>
+      <div>
+        <div class="sum-label">Next scheduled</div>
+        <div class="sum-value" id="sumNext">—</div>
+        <div class="hint" id="sumNextCron" style="margin:0"></div>
+      </div>
+    </div>
+    <div id="sumAttention" class="note hidden"></div>
+    <div id="sumNever" class="note hidden">
+      No run has completed yet. Use <strong>Dry run</strong> below to check the
+      setup without changing anything, or wait for the schedule.
+    </div>
+  </div>
+
   <div class="card">
     <h2>Run an update</h2>
     <div class="row">
@@ -2420,10 +2711,25 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div id="runProgress" class="progress"><div></div></div>
   </div>
   <div class="card">
-    <h2>Live output <span id="liveTag" class="pill run hidden">live</span></h2>
+    <h2>Live output <span id="liveTag" class="pill run hidden">live</span>
+      <span id="logSource" class="hint" style="margin:0"></span></h2>
     <pre id="logView">No run started from this page yet.</pre>
   </div>
 </section>
+
+<!-- SETTINGS: four screens that are all "set this up once", grouped so the
+     top-level navigation stays about what you do rather than what you configure. -->
+<section id="tab-settings" class="hidden" role="tabpanel" aria-labelledby="tabbtn-settings">
+<div class="tabs subtabs" role="tablist" aria-label="Settings sections">
+  <button data-tab="exclusions" class="active" role="tab" aria-selected="true"
+          aria-controls="tab-exclusions">Exclusions</button>
+  <button data-tab="schedule" role="tab" aria-selected="false"
+          aria-controls="tab-schedule" tabindex="-1">Schedule</button>
+  <button data-tab="notify" role="tab" aria-selected="false"
+          aria-controls="tab-notify" tabindex="-1">Notifications</button>
+  <button data-tab="config" role="tab" aria-selected="false"
+          aria-controls="tab-config" tabindex="-1">Configuration</button>
+</div>
 
 <!-- EXCLUSIONS -->
 <section id="tab-exclusions" class="hidden">
@@ -2661,8 +2967,10 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
 </section>
 
+</section>
+
 <!-- LOGS -->
-<section id="tab-logs" class="hidden">
+<section id="tab-logs" class="hidden" role="tabpanel" aria-labelledby="tabbtn-logs">
   <div id="unsaved-logs" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Log storage</h2>
@@ -2688,16 +2996,28 @@ PAGE_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="card">
     <h2>Past reports</h2>
-    <div class="table-wrap"><table><tbody id="logList"></tbody></table></div>
+    <div class="row" style="margin-bottom:10px">
+      <a id="btnDownloadAll" class="btnlink"
+         href="/api/log/download?name=all"
+         download="proxmox-autoupdate-logs.tar.gz">Download all as .tar.gz</a>
+      <span class="hint" style="margin:0">Useful for attaching to a bug report.</span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th class="wrap">Log</th><th>When</th><th>Size</th><th></th></tr></thead>
+      <tbody id="logList"></tbody>
+    </table></div>
   </div>
   <div class="card">
-    <h2>Selected log</h2>
+    <h2>Selected log <span id="logFileName" class="hint" style="margin:0"></span></h2>
+    <div class="row" style="margin-bottom:8px">
+      <a id="btnDownloadOne" class="btnlink hidden" href="#" download>Download this log</a>
+    </div>
     <pre id="logFile">Select a log above.</pre>
   </div>
 </section>
 
 <!-- MAINTENANCE -->
-<section id="tab-maint" class="hidden">
+<section id="tab-maint" class="hidden" role="tabpanel" aria-labelledby="tabbtn-maint">
   <div id="unsaved-maint" class="unsaved hidden">You have unsaved changes on this tab.</div>
   <div class="card">
     <h2>Version</h2>
@@ -2716,6 +3036,43 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div id="verMsg" class="msg"></div>
     <div class="hint">Checking only reads the published version — it never
       installs anything on its own. Updating is always a deliberate action.</div>
+  </div>
+
+  <div class="card">
+    <h2>Proxmox subscription notice</h2>
+    <p class="hint" style="margin-top:0">
+      Proxmox shows a <strong>No valid subscription</strong> dialog at every
+      login on nodes without a subscription key. This hides that dialog and
+      re-hides it automatically after a <code>proxmox-widget-toolkit</code>
+      upgrade replaces the file.
+    </p>
+    <div class="note" style="margin-bottom:10px">
+      This changes one dialog and nothing else. It does not create or alter a
+      subscription, does not change which repositories the node can reach, and
+      does not touch <code>/etc/subscription</code> — <code>pvesubscription
+      get</code> reports exactly what it did before. If you run Proxmox
+      commercially, please buy a subscription; it funds the thing this tool
+      updates.
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="chkNag" style="width:auto">
+      <span>Hide the "No valid subscription" dialog</span>
+    </label>
+    <div id="nagMsg" class="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Self-check</h2>
+    <p class="hint" style="margin-top:0">
+      Checks everything a scheduled run depends on — Proxmox detected, the
+      cluster filesystem answering, dependencies, repositories, cron, disk
+      space, guest agents. Reads only; changes nothing.
+    </p>
+    <div class="row">
+      <button id="btnDoctor">Run self-check</button>
+    </div>
+    <div id="doctorMsg" class="msg"></div>
+    <div id="doctorOut" class="hidden" style="margin-top:10px"></div>
   </div>
 
   <div class="card">
@@ -2773,41 +3130,101 @@ PAGE_TEMPLATE = r"""<!doctype html>
 <script>
 const CSRF = "{{CSRF}}";
 
+// Every setting belongs to exactly one screen.
+//
+// This list used to repeat the five Mailgun fields that Notifications owns,
+// EXCLUDE_IDS which Exclusions owns as checkboxes, and REBOOT_TIME which
+// Schedule owns. That was not merely redundant: saving this form posts every
+// field in it, so ticking exclusions on one tab and then saving Configuration
+// wrote back the stale text value and silently reverted them.
+//
+// What is left here is the set of settings with no dedicated screen of their
+// own — including three added in 4.0.0 that had no UI at all.
 const FIELDS = [
-  ["MAILGUN_API_KEY",        "Mailgun API key",          "password"],
-  ["MAILGUN_DOMAIN",         "Mailgun domain",           "text"],
-  ["MAILGUN_REGION",         "Mailgun region",           "select", ["EU", "US"]],
-  ["SENDER_EMAIL",           "Sender email",             "text"],
-  ["RECIPIENT_EMAIL",        "Recipient email",          "text"],
-  ["EXCLUDE_IDS",            "Excluded VM/CT IDs",       "text"],
-  ["WINDOWS_UPDATE_TIMEOUT", "Windows timeout (s)",      "number"],
-  ["LINUX_UPDATE_TIMEOUT",   "Linux timeout (s)",        "number"],
-  ["APT_LOCK_TIMEOUT",       "APT lock wait (s)",        "number"],
-  ["START_STOPPED_LXC",      "Start stopped LXC",        "select", ["true", "false"]],
-  ["START_STOPPED_LINUX_VMS","Start stopped Linux VMs",  "select", ["true", "false"]],
-  ["START_STOPPED_WINDOWS",  "Start stopped Windows VMs","select", ["true", "false"]],
-  ["SNAPSHOT_BEFORE_UPDATE", "Snapshot before update",   "select", ["true", "false"]],
-  ["SNAPSHOT_KEEP",          "Snapshots to keep",        "number"],
-  ["REBOOT_TIME",            "Reboot time (HH:MM)",      "text"],
+  ["WINDOWS_UPDATE_TIMEOUT",  "Windows update timeout (s)",   "number",
+   "How long a Windows guest gets to install updates. Cumulative updates often need more than an hour."],
+  ["WINDOWS_SHUTDOWN_TIMEOUT","Windows shutdown wait (s)",    "number",
+   "How long to wait for a Windows guest to shut down. It is never forced off — a guest still servicing updates is left running."],
+  ["LINUX_UPDATE_TIMEOUT",    "Linux update timeout (s)",     "number",
+   "How long a container or Linux VM gets to finish its upgrade."],
+  ["LINUX_SHUTDOWN_TIMEOUT",  "Linux shutdown wait (s)",      "number",
+   "How long a started Linux guest gets to shut down before it is forced off."],
+  ["APT_LOCK_TIMEOUT",        "APT lock wait (s)",            "number",
+   "How long apt waits for the dpkg lock inside a guest. Ubuntu's unattended-upgrades holds it regularly."],
+  ["AGENT_ERROR_GRACE",       "Guest agent grace (s)",        "number",
+   "How long guest-agent errors are tolerated mid-update. A guest upgrading its own agent restarts it."],
+  ["START_STOPPED_LXC",       "Start stopped containers",     "select", ["true", "false"]],
+  ["START_STOPPED_LINUX_VMS", "Start stopped Linux VMs",      "select", ["true", "false"]],
+  ["START_STOPPED_WINDOWS",   "Start stopped Windows VMs",    "select", ["true", "false"]],
+  ["SNAPSHOT_BEFORE_UPDATE",  "Snapshot before update",       "select", ["true", "false"],
+   "Needs snapshot-capable storage (ZFS, LVM-thin, qcow2)."],
+  ["SNAPSHOT_KEEP",           "Snapshots to keep",            "number"],
+  ["PAU_TZ",                  "Timezone",                     "text",
+   "Leave empty to use this host's own timezone. Affects timestamps and the reboot time."],
 ];
 
 {{JS}}
 
 
 // --- tabs ---
-document.querySelectorAll(".tabs button").forEach((btn) => {
-  btn.onclick = () => {
-    document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    ["run", "exclusions", "schedule", "notify", "config", "logs", "maint"].forEach((name) => {
-      $("tab-" + name).classList.toggle("hidden", name !== btn.dataset.tab);
-    });
-    if (btn.dataset.tab === "logs") { loadLogList(); loadLogCfg(); }
-    if (btn.dataset.tab === "exclusions") loadGuests();
-    if (btn.dataset.tab === "notify") loadNotify();
-    if (btn.dataset.tab === "maint") loadMaint();
-  };
-});
+// Top-level navigation. Four sections rather than seven: Exclusions, Schedule,
+// Notifications and Configuration are all "set this up once", so they live
+// together under Settings, while Overview and Logs are the day-to-day.
+const TOP_TABS = ["run", "settings", "logs", "maint"];
+const SUB_TABS = ["exclusions", "schedule", "notify", "config"];
+
+function loadFor(name) {
+  if (name === "logs")       { loadLogList(); loadLogCfg(); }
+  if (name === "exclusions") { loadGuests(); }
+  if (name === "notify")     { loadNotify(); }
+  if (name === "config")     { loadConfig(); }
+  if (name === "maint")      { loadMaint(); }
+}
+
+function selectTop(name) {
+  document.querySelectorAll(".tabs:not(.subtabs) button").forEach((b) => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.tabIndex = on ? 0 : -1;
+  });
+  TOP_TABS.forEach((t) => $("tab-" + t).classList.toggle("hidden", t !== name));
+  loadFor(name);
+  if (name === "settings") { loadFor(currentSub); }
+}
+
+let currentSub = "exclusions";
+function selectSub(name) {
+  currentSub = name;
+  document.querySelectorAll(".subtabs button").forEach((b) => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.tabIndex = on ? 0 : -1;
+  });
+  SUB_TABS.forEach((t) => $("tab-" + t).classList.toggle("hidden", t !== name));
+  loadFor(name);
+}
+
+// Arrow-key navigation, which is what a tablist is expected to do and what
+// these were missing entirely — they were styled buttons with no roles.
+function wireTablist(selector, onSelect) {
+  const buttons = Array.from(document.querySelectorAll(selector));
+  buttons.forEach((btn, i) => {
+    btn.onclick = () => onSelect(btn.dataset.tab);
+    btn.onkeydown = (ev) => {
+      let next = null;
+      if (ev.key === "ArrowRight") { next = buttons[(i + 1) % buttons.length]; }
+      if (ev.key === "ArrowLeft")  { next = buttons[(i - 1 + buttons.length) % buttons.length]; }
+      if (ev.key === "Home")       { next = buttons[0]; }
+      if (ev.key === "End")        { next = buttons[buttons.length - 1]; }
+      if (next) { ev.preventDefault(); next.focus(); onSelect(next.dataset.tab); }
+    };
+  });
+}
+
+wireTablist(".tabs:not(.subtabs) button", selectTop);
+wireTablist(".subtabs button", selectSub);
 
 // --- notifications ---
 const METHOD_IDS = {email: "m_email", discord: "m_discord",
@@ -3093,6 +3510,7 @@ async function loadMaint() {
   try {
     const cfg = (await api("/api/config")).config;
     $("confirmUpdates").checked = cfg.CONFIRM_UPDATES !== "false";
+    $("chkNag").checked = cfg.SUPPRESS_SUBSCRIPTION_NOTICE === "true";
   } catch (e) { /* leave the default */ }
   try {
     const v = await api("/api/self/version");
@@ -3343,11 +3761,42 @@ async function poll() {
     if (activeLog) await pumpLog();
     if (wasRunning && !st.running) await pumpLog();
     wasRunning = st.running;
+    $("offline").classList.add("hidden");
   } catch (e) {
+    // Say the panel lost contact, rather than leaving a page that has silently
+    // stopped updating and looks identical to one that is simply idle. The API
+    // answers 503 while pve-manager restarts during a host upgrade, which is
+    // exactly when someone is most likely to be watching.
+    $("offline").classList.remove("hidden");
     const pill = $("statusPill");
     pill.className = "pill err";
-    pill.textContent = e.message;
+    pill.textContent = "reconnecting…";
+    pill.title = e.message;
   }
+}
+
+// The live pane only ever showed runs started from this page, so the scheduled
+// Friday-night run — the one that matters — left it saying "No run started from
+// this page yet". Fall back to the newest log on disk.
+async function showLastRunLog() {
+  if (activeLog) { return; }
+  try {
+    const data = await api("/api/logs");
+    const newest = (data.logs || [])[0];
+    if (!newest) { return; }
+    const view = $("logView");
+    if (view.textContent && view.textContent.indexOf("No run started") !== 0) { return; }
+    let offset = 0, text = "";
+    for (;;) {
+      const d = await api("/api/log?name=" + encodeURIComponent(newest.name) + "&offset=" + offset);
+      text += d.data; offset = d.offset;
+      if (d.eof || text.length > 400000) { break; }
+    }
+    if (!activeLog) {
+      view.textContent = text || "(empty)";
+      $("logSource").textContent = "showing " + newest.name + " · " + relTime(newest.mtime * 1000);
+    }
+  } catch (e) { /* leave the placeholder */ }
 }
 
 async function pumpLog() {
@@ -3407,16 +3856,22 @@ $("btnSaveSched").onclick = async () => {
 function buildConfigForm(cfg, sensitive) {
   const form = $("configForm");
   form.innerHTML = "";
-  FIELDS.forEach(([key, label, type, options]) => {
+  FIELDS.forEach(([key, label, type, optionsOrHint, maybeHint]) => {
+    // The fourth element is the option list for a select and the help text for
+    // anything else; a select can carry help text in the fifth.
+    const isSelect = type === "select";
+    const options = isSelect ? optionsOrHint : null;
+    const help = isSelect ? maybeHint : optionsOrHint;
+
     const wrap = document.createElement("div");
     const lab = document.createElement("label");
     lab.textContent = label; lab.htmlFor = "cfg_" + key;
     wrap.appendChild(lab);
 
     let input;
-    if (type === "select") {
+    if (isSelect) {
       input = document.createElement("select");
-      options.forEach((opt) => {
+      (options || []).forEach((opt) => {
         const o = document.createElement("option");
         o.value = o.textContent = opt;
         input.appendChild(o);
@@ -3429,6 +3884,17 @@ function buildConfigForm(cfg, sensitive) {
     input.dataset.key = key;
     input.value = sensitive.includes(key) && cfg[key] ? "********" : (cfg[key] || "");
     wrap.appendChild(input);
+
+    // Say what a setting does next to it. Several of these are timeouts whose
+    // consequences are not guessable from the name.
+    if (help) {
+      const h = document.createElement("div");
+      h.className = "hint";
+      h.textContent = help;
+      h.id = "hint_" + key;
+      input.setAttribute("aria-describedby", h.id);
+      wrap.appendChild(h);
+    }
     form.appendChild(wrap);
   });
 }
@@ -3565,13 +4031,37 @@ async function loadLogList() {
     const data = await api("/api/logs");
     const tbody = $("logList");
     tbody.innerHTML = "";
+    if (!data.logs.length) {
+      tbody.innerHTML = "<tr><td colspan='4'>No logs yet. They appear here after the first run.</td></tr>";
+      return;
+    }
     data.logs.forEach((entry) => {
       const tr = document.createElement("tr");
-      const when = new Date(entry.mtime * 1000).toLocaleString();
-      const kb = (entry.size / 1024).toFixed(1) + " KB";
-      tr.innerHTML = '<td><a href="#">' + entry.name + "</a></td><td>" + when +
-                     "</td><td>" + kb + "</td>";
-      tr.querySelector("a").onclick = (ev) => { ev.preventDefault(); showLog(entry.name); };
+      // Build with DOM nodes rather than innerHTML: the name comes off the
+      // filesystem, and it is about to become a link and a download URL.
+      const nameCell = document.createElement("td");
+      nameCell.className = "wrap";
+      const link = document.createElement("a");
+      link.href = "#"; link.textContent = entry.name;
+      link.onclick = (ev) => { ev.preventDefault(); showLog(entry.name); };
+      nameCell.appendChild(link);
+
+      const whenCell = document.createElement("td");
+      whenCell.textContent = relTime(entry.mtime * 1000);
+      whenCell.title = new Date(entry.mtime * 1000).toLocaleString();
+
+      const sizeCell = document.createElement("td");
+      sizeCell.textContent = humanSize(entry.size);
+
+      const dlCell = document.createElement("td");
+      const dl = document.createElement("a");
+      dl.href = "/api/log/download?name=" + encodeURIComponent(entry.name);
+      dl.textContent = "Download";
+      dl.setAttribute("download", entry.name);
+      dl.title = "Save " + entry.name + " to this computer";
+      dlCell.appendChild(dl);
+
+      tr.append(nameCell, whenCell, sizeCell, dlCell);
       tbody.appendChild(tr);
     });
   } catch (e) { $("logList").innerHTML = "<tr><td>" + e.message + "</td></tr>"; }
@@ -3579,6 +4069,11 @@ async function loadLogList() {
 
 async function showLog(name) {
   $("logFile").textContent = "Loading…";
+  $("logFileName").textContent = name;
+  const dl = $("btnDownloadOne");
+  dl.href = "/api/log/download?name=" + encodeURIComponent(name);
+  dl.setAttribute("download", name);
+  dl.classList.remove("hidden");
   let offset = 0, text = "";
   try {
     for (;;) {
@@ -3610,11 +4105,134 @@ async function describeChannels() {
   } catch (e) { /* leave it blank rather than guess */ }
 }
 
+// --- overview summary ---
+// Everything here already exists server-side; it was just spread across two
+// other tabs. /api/state carries the last run and the repeat-offender list,
+// /api/status carries the schedule.
+const CRON_WORDS = {
+  "0 23 * * 5": "Fridays at 23:00",
+  "0 3 * * *":  "every day at 03:00",
+  "0 3 * * 0":  "Sundays at 03:00",
+  "0 3 1 * *":  "the 1st of each month at 03:00",
+};
+
+async function loadSummary() {
+  try {
+    const st = await api("/api/state");
+    const run = st.last_run || {};
+    const never = !run.finished;
+    $("sumNever").classList.toggle("hidden", !never);
+
+    $("sumWhen").textContent = never ? "never" : relTime(run.finished);
+    $("sumWhenExact").textContent = never ? "" : new Date(run.finished).toLocaleString();
+
+    const pill = $("sumResult");
+    const result = (run.result || "").toString();
+    const dry = result.indexOf("dryrun") !== -1;
+    if (never)                          { pill.className = "pill idle"; pill.textContent = "—"; }
+    else if (result.indexOf("error") === 0) { pill.className = "pill err"; pill.textContent = "errors"; }
+    else                                { pill.className = "pill ok";  pill.textContent = "clean"; }
+    $("sumScope").textContent =
+      never ? "" : ((run.scope && run.scope !== "all" ? "only " + run.scope : "full sweep") +
+                    (dry ? " · dry run" : ""));
+
+    const c = run.counts || {};
+    const guests = (c.lxc_updated || 0) + (c.vm_updated || 0);
+    const errs = (c.lxc_errors || 0) + (c.vm_errors || 0);
+    $("sumCounts").textContent = never ? "—" :
+      (guests + " guest" + (guests === 1 ? "" : "s") +
+       ", " + (c.host_packages || 0) + " host pkg" + ((c.host_packages || 0) === 1 ? "" : "s"));
+    $("sumCountsDetail").textContent = never ? "" :
+      (errs ? errs + " error" + (errs === 1 ? "" : "s") : "no errors") +
+      ((c.mid_update || 0) ? " · " + c.mid_update + " left mid-update" : "");
+
+    // Anything that needs a human. Repeat offenders come straight from the
+    // state file's per-guest failure streaks.
+    const att = $("sumAttention");
+    const notes = [];
+    if (st.repeat_offenders) { notes.push("Failing repeatedly: " + st.repeat_offenders); }
+    if ((c.mid_update || 0) > 0) {
+      notes.push(c.mid_update + " guest(s) were left mid-update, so no host reboot was scheduled.");
+    }
+    if (notes.length) { att.textContent = notes.join(" "); att.classList.remove("hidden"); }
+    else { att.classList.add("hidden"); }
+  } catch (e) { /* the header pill already reports connectivity */ }
+
+  try {
+    const status = await api("/api/status");
+    const cron = (status.schedule || "").trim();
+    $("sumNext").textContent = cron ? (CRON_WORDS[cron] || "on schedule") : "not scheduled";
+    $("sumNextCron").textContent = cron || "no crontab entry";
+  } catch (e) { /* as above */ }
+}
+
+// --- self-check ---
+async function runDoctor() {
+  const btn = $("btnDoctor"), out = $("doctorOut");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Checking…';
+  out.classList.remove("hidden");
+  out.innerHTML = "<div class='hint'>Running checks — this reads state only and changes nothing.</div>";
+  try {
+    const r = await post("/api/self/doctor", {});
+    if (r.error) { out.innerHTML = ""; msg($("doctorMsg"), r.error, false); return; }
+    out.innerHTML = "";
+    let section = null;
+    r.rows.forEach((row) => {
+      if (row.section !== section) {
+        section = row.section;
+        const h = document.createElement("div");
+        h.className = "doc-section"; h.textContent = section;
+        out.appendChild(h);
+      }
+      const line = document.createElement("div");
+      line.className = "doc-row";
+      const tag = document.createElement("span");
+      tag.className = "doc-tag " + (row.level === "FAIL" ? "doc-fail" :
+                                    row.level === "warn" ? "doc-warn" : "doc-ok");
+      tag.textContent = row.level === "FAIL" ? "FAIL" : row.level.toUpperCase();
+      const txt = document.createElement("span");
+      txt.textContent = row.text;
+      line.append(tag, txt);
+      out.appendChild(line);
+    });
+    if (r.failures) {
+      msg($("doctorMsg"), r.failures + " problem(s) will stop this working, " +
+                          r.warnings + " warning(s).", false);
+    } else {
+      msg($("doctorMsg"), r.warnings ? ("No blocking problems, " + r.warnings + " warning(s).")
+                                     : "Everything checks out.", true);
+    }
+  } catch (e) { msg($("doctorMsg"), e.message, false); }
+  finally { btn.disabled = false; btn.textContent = "Run self-check"; }
+}
+
+$("btnDoctor").onclick = runDoctor;
+
+$("chkNag").onchange = async () => {
+  const want = $("chkNag").checked;
+  $("chkNag").disabled = true;
+  try {
+    const r = await post("/api/subscription-notice", {suppress: want});
+    msg($("nagMsg"), r.note ||
+        (want ? "Dialog hidden. Hard-refresh the Proxmox UI (Ctrl+Shift+R) to see the change."
+              : "Dialog restored. Hard-refresh the Proxmox UI (Ctrl+Shift+R)."), true);
+  } catch (e) {
+    // Put the box back where it was: the setting did not take.
+    $("chkNag").checked = !want;
+    msg($("nagMsg"), e.message, false);
+  } finally { $("chkNag").disabled = false; }
+};
+
 watchForChanges();
 loadConfig();
 describeChannels();
+loadSummary();
 poll();
+showLastRunLog();
 setInterval(poll, 2000);
+// The summary is cheap but not free, and none of it changes second to second.
+setInterval(loadSummary, 30000);
 </script>
 </body>
 </html>

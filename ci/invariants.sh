@@ -84,14 +84,17 @@ echo "== config key parity =="
 # Settings that are deliberately consumed by the panel or the installer rather
 # than by the update script: the schedule lives in the crontab, and the
 # confirmation prompt is a UI behaviour.
-PANEL_ONLY="UPDATE_SCHEDULE_CRON CONFIRM_UPDATES"
+PANEL_ONLY="UPDATE_SCHEDULE_CRON CONFIRM_UPDATES SUPPRESS_SUBSCRIPTION_NOTICE"
 
 PANEL_KEYS=$(sed -n '/^EDITABLE_KEYS = {/,/^}/p' webui/pve-autoupdate-ui \
              | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u)
 PARITY_OK=1
 for key in ${PANEL_KEYS}; do
     case " ${PANEL_ONLY} " in *" ${key} "*) continue ;; esac
-    if ! grep -qE "^\s*${key}=" update-everything.sh; then
+    # Either assigned with a default (KEY="${KEY:-x}") or simply referenced
+    # (${KEY:-}). Only checking for an assignment missed the second form.
+    if ! grep -qE "^\s*${key}=" update-everything.sh \
+       && ! grep -qE "\\\$\{${key}[:}]" update-everything.sh; then
         fail "${key} is editable in the panel but never read by update-everything.sh"
         PARITY_OK=0
     fi
