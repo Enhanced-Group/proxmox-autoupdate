@@ -12,23 +12,29 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.3.1 — 2026-08-11
+
+### Changed
+
+- **Switching tabs with unsaved changes no longer discards them silently.**
+  Nothing was posted and returning re-read the saved values, so an edit could
+  vanish without a word. Navigation is now blocked while a section has unsaved
+  changes, and you are taken to the save button with the warning banner
+  flashing.
+
+  Every banner also carries a **Discard them** link, because being unable to
+  leave a form you have changed your mind about would be worse than losing the
+  edit. Re-selecting the tab you are already on is not treated as navigation.
+
+- The save button that briefly lived in the header is gone. Each section keeps
+  its save next to the form it applies to, which is where you look for it.
+
 ## 4.3.0 — 2026-08-11
 
 ### Added
 
-- **A sticky header, with Save in it.** The title, status, schedule and tabs
-  stay put while the page scrolls, and the header carries a save button on the
-  right that applies to whichever section is open. The per-card save buttons sit
-  at very different scroll depths depending on the section, so finding one meant
-  hunting for it.
-
-  The header button does not implement saving — it finds the save control for
-  the current section and clicks it, so each save keeps exactly one
-  implementation and the two cannot drift apart. It names what it will save
-  ("Save exclusions", "Save configuration"), greys out on sections that have
-  nothing to save rather than disappearing, and marks itself when there are
-  unsaved changes. On narrow screens it stops being sticky, where a fixed header
-  would eat most of the viewport.
+- **A sticky header.** The title, status, schedule and tabs stay put while the
+  page scrolls, so navigation is reachable from anywhere on a long page.
 
 ## 4.2.2 — 2026-08-11
 

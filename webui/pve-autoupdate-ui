@@ -2434,8 +2434,6 @@ function paintDirty(section, on) {
     const anySub = ["exclusions", "schedule", "notify", "config"].some((s) => dirty.has(s));
     settingsBtn.classList.toggle("dirty", anySub);
   }
-  // Keep the header's save button in step with the dirty state.
-  if (typeof syncBarSave === "function") { syncBarSave(); }
 }
 
 /* Any input inside a tab marks that tab dirty. Registered once, on the
@@ -2597,7 +2595,6 @@ SHARED_CSS = r"""  :root {
   .topbar .tabs { margin-bottom: 0; }
   /* Nothing to save is a disabled button, not a missing one — a control that
      appears and disappears is harder to aim at than one that greys out. */
-  #barSave:disabled { opacity: .45; }
   @media (max-width: 600px) {
     .topbar { position: static; margin: 0 0 14px; padding: 0 0 10px; }
   }
@@ -2682,6 +2679,19 @@ SHARED_CSS = r"""  :root {
     border-radius: 4px; padding: 7px 10px; margin-bottom: 12px; font-size: 12px;
   }
   .unsaved::before { content: "⚠"; color: var(--warn); }
+  /* The way out of the navigation guard. Styled as a link rather than a button
+     so it never competes with Save for attention. */
+  button.linkish { background: none; border: 0; padding: 0 0 0 4px;
+                   color: var(--muted); text-decoration: underline;
+                   cursor: pointer; font: inherit; }
+  button.linkish:hover { color: var(--text); }
+  /* Flashes when navigation is blocked, including when the banner was already
+     on screen and would otherwise not visibly change. */
+  @keyframes attention {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,179,0,0); }
+    30%      { box-shadow: 0 0 0 3px rgba(255,179,0,.55); }
+  }
+  .unsaved.attention { animation: attention .9s ease-out 2; }
   /* Utility class, so it has to beat anything that sets display — .msg.show
      and .pill are both more specific than a bare class selector, which left
      elements marked hidden still on screen. */
@@ -2822,10 +2832,6 @@ PAGE_TEMPLATE = r"""<!doctype html>
         Schedule: <code id="schedDisplay">—</code>
       </div>
     </div>
-    <div class="topbar-actions">
-      <span id="barSaveHint" class="hint" style="margin:0"></span>
-      <button id="barSave" class="primary" disabled>Save</button>
-    </div>
   </div>
 
   <div class="tabs" role="tablist" aria-label="Sections">
@@ -2920,7 +2926,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- EXCLUSIONS -->
 <section id="tab-exclusions" class="hidden">
-  <div id="unsaved-exclusions" class="unsaved hidden">You have unsaved changes on this tab.</div>
+  <div id="unsaved-exclusions" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="exclusions">Discard them</button></div>
   <div class="card">
     <h2>Guests excluded from scheduled updates</h2>
     <div class="hint" style="margin-bottom:10px">
@@ -2947,7 +2953,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- SCHEDULE -->
 <section id="tab-schedule" class="hidden">
-  <div id="unsaved-schedule" class="unsaved hidden">You have unsaved changes on this tab.</div>
+  <div id="unsaved-schedule" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="schedule">Discard them</button></div>
   <div class="card">
     <h2>Update schedule</h2>
     <div class="grid">
@@ -2982,7 +2988,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- NOTIFICATIONS -->
 <section id="tab-notify" class="hidden">
-  <div id="unsaved-notify" class="unsaved hidden">You have unsaved changes on this tab.</div>
+  <div id="unsaved-notify" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="notify">Discard them</button></div>
   <div class="card">
     <h2>Channels</h2>
     <div class="hint" style="margin-bottom:10px">
@@ -3197,7 +3203,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- CONFIG -->
 <section id="tab-config" class="hidden">
-  <div id="unsaved-config" class="unsaved hidden">You have unsaved changes on this tab.</div>
+  <div id="unsaved-config" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="config">Discard them</button></div>
   <div class="card">
     <h2>Configuration</h2>
     <div id="configForm" class="grid"></div>
@@ -3265,7 +3271,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- LOGS -->
 <section id="tab-logs" class="hidden" role="tabpanel" aria-labelledby="tabbtn-logs">
-  <div id="unsaved-logs" class="unsaved hidden">You have unsaved changes on this tab.</div>
+  <div id="unsaved-logs" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="logs">Discard them</button></div>
   <div class="card">
     <h2>Log storage</h2>
     <div class="grid">
@@ -3312,7 +3318,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
 
 <!-- MAINTENANCE -->
 <section id="tab-maint" class="hidden" role="tabpanel" aria-labelledby="tabbtn-maint">
-  <div id="unsaved-maint" class="unsaved hidden">You have unsaved changes on this tab.</div>
+  <div id="unsaved-maint" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="maint">Discard them</button></div>
   <div class="card">
     <h2>Version</h2>
     <div class="row">
@@ -3488,6 +3494,7 @@ function loadFor(name) {
 }
 
 function selectTop(name) {
+  if (name !== activeTopTab() && !mayLeaveSection()) { return; }
   document.querySelectorAll(".tabs:not(.subtabs) button").forEach((b) => {
     const on = b.dataset.tab === name;
     b.classList.toggle("active", on);
@@ -3504,11 +3511,11 @@ function selectTop(name) {
   } else {
     loadFor(name);
   }
-  syncBarSave();
 }
 
 let currentSub = "exclusions";
 function selectSub(name) {
+  if (name !== currentSub && !mayLeaveSection()) { return; }
   currentSub = name;
   document.querySelectorAll(".subtabs button").forEach((b) => {
     const on = b.dataset.tab === name;
@@ -3518,7 +3525,6 @@ function selectSub(name) {
   });
   SUB_TABS.forEach((t) => $("tab-" + t).classList.toggle("hidden", t !== name));
   loadFor(name);
-  syncBarSave();
 }
 
 // Arrow-key navigation, which is what a tablist is expected to do and what
@@ -3541,52 +3547,66 @@ function wireTablist(selector, onSelect) {
 wireTablist(".tabs:not(.subtabs) button", selectTop);
 wireTablist(".subtabs button", selectSub);
 
-// --- the save button in the sticky header ---
+// --- unsaved-change guard ---
 //
-// It does not implement saving. It finds the save control for whichever
-// section is open and clicks it, so every save keeps exactly one
-// implementation and this cannot drift away from what the in-page button does.
-const SECTION_SAVE = {
-  exclusions: {btn: "btnSaveExcl",   label: "Save exclusions"},
-  schedule:   {btn: "btnSaveSched",  label: "Save schedule"},
-  notify:     {btn: "btnSaveNotify", label: "Save notifications"},
-  config:     {btn: "btnSaveConfig", label: "Save configuration"},
-  logs:       {btn: "btnSaveLogCfg", label: "Save log settings"},
+// Leaving a tab with edits on it silently discarded them: nothing was posted,
+// and coming back re-read the saved values. Rather than a save button that
+// follows you around, navigation is blocked while a section is dirty and you
+// are taken to the control that resolves it.
+//
+// There is always a way out — being unable to leave a form you have changed
+// your mind about would be worse than losing the edit.
+const SECTION_SAVE_BTN = {
+  exclusions: "btnSaveExcl",
+  schedule:   "btnSaveSched",
+  notify:     "btnSaveNotify",
+  config:     "btnSaveConfig",
+  logs:       "btnSaveLogCfg",
+  maint:      "btnSaveConfirm",
 };
 
-function activeSection() {
+function activeTopTab() {
   const top = document.querySelector('.tabs:not(.subtabs) button.active');
-  const name = top ? top.dataset.tab : "run";
+  return top ? top.dataset.tab : "run";
+}
+
+function activeSection() {
+  const name = activeTopTab();
   return name === "settings" ? currentSub : name;
 }
 
-function syncBarSave() {
+// True when it is safe to navigate. When it is not, point at what needs doing.
+function mayLeaveSection() {
   const section = activeSection();
-  const target = SECTION_SAVE[section];
-  const btn = $("barSave");
-  const hint = $("barSaveHint");
+  if (!dirty.has(section)) { return true; }
 
-  if (!target || !$(target.btn)) {
-    btn.disabled = true;
-    btn.textContent = "Save";
-    btn.classList.remove("needs-save");
-    hint.textContent = "";
-    return;
+  const banner = $("unsaved-" + section);
+  const btn = $(SECTION_SAVE_BTN[section]);
+  if (banner) {
+    banner.classList.remove("hidden");
+    banner.scrollIntoView({behavior: "smooth", block: "nearest"});
+    // Re-trigger the attention animation even if the class is already on.
+    banner.classList.remove("attention");
+    void banner.offsetWidth;
+    banner.classList.add("attention");
   }
-  btn.textContent = target.label;
-  btn.disabled = false;
-  const isDirty = dirty.has(section);
-  btn.classList.toggle("needs-save", isDirty);
-  hint.textContent = isDirty ? "unsaved changes" : "";
+  if (btn) {
+    btn.classList.add("needs-save");
+    btn.focus({preventScroll: true});
+    btn.scrollIntoView({behavior: "smooth", block: "center"});
+  }
+  return false;
 }
 
-$("barSave").onclick = () => {
-  const target = SECTION_SAVE[activeSection()];
-  const real = target && $(target.btn);
-  if (real && !real.disabled) { real.click(); }
-};
-
-syncBarSave();
+// Discard: reload the section from what is actually saved, which is also the
+// escape hatch out of the guard above.
+function discardSection(section) {
+  markClean(section);
+  loadFor(section);
+}
+document.querySelectorAll(".unsaved [data-discard]").forEach((el) => {
+  el.onclick = () => discardSection(el.dataset.discard);
+});
 
 // --- notifications ---
 const METHOD_IDS = {email: "m_email", discord: "m_discord", slack: "m_slack",
