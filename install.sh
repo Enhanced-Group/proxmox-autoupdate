@@ -8,10 +8,51 @@ set -euo pipefail
 TARGET_PATH="/usr/local/bin/update-everything.sh"
 CONFIG_FILE="/etc/proxmox-autoupdate.conf"
 LOG_DIR="/var/log/proxmox-autoupdate"
-# Branch to fetch from when running via `curl | bash`. Override to test a branch
-# before merging:  curl -sSL .../<branch>/install.sh | PAU_BRANCH=<branch> bash
-PAU_BRANCH="${PAU_BRANCH:-main}"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/Enhanced-Group/proxmox-autoupdate/${PAU_BRANCH}"
+STATE_DIR="/var/lib/proxmox-autoupdate"
+REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
+
+# Which revision to install.
+#
+# This used to be hardcoded to `main`, and the panel's "Install update" button
+# ran it unattended as root. That made every push to main immediately live on
+# every installation — an unreviewed commit, or a half-finished one, went
+# straight into a root cron job everywhere. Installs now track *released tags*
+# by default.
+#
+#   PAU_CHANNEL=release   (default) install the latest published release
+#   PAU_CHANNEL=main                track main, for development
+#   PAU_REF=v4.0.0                  pin an exact tag, branch or commit
+#
+# PAU_BRANCH is still honoured so existing documentation and scripts keep
+# working.
+PAU_FALLBACK_REF="v4.0.0"
+PAU_CHANNEL="${PAU_CHANNEL:-release}"
+PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
+
+# Ask GitHub for the newest published release. Deliberately tolerant: no jq (it
+# may not be installed yet), short timeout, and any failure falls back to the
+# tag baked in above rather than silently reaching for main.
+resolve_ref() {
+    if [ -n "${PAU_REF}" ]; then
+        echo "${PAU_REF}"
+        return
+    fi
+    if [ "${PAU_CHANNEL}" = "main" ]; then
+        echo "main"
+        return
+    fi
+    local tag=""
+    tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
+          | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    if [ -n "${tag}" ]; then
+        echo "${tag}"
+    else
+        echo "${PAU_FALLBACK_REF}"
+    fi
+}
+
+PAU_RESOLVED_REF="$(resolve_ref)"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/${REPO_SLUG}/${PAU_RESOLVED_REF}"
 GITHUB_RAW_URL="${GITHUB_RAW_BASE}/update-everything.sh"
 
 # Web control panel
@@ -31,6 +72,34 @@ C_DIM='\033[2m'
 C_NC='\033[0m'
 
 print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
+
+# Say where the report actually went, rather than pointing at an email address
+# that may be empty and a channel that may not be configured. This used to
+# unconditionally print "Check  for the report email" even when the user had
+# chosen to set up no notifications at all.
+report_delivery_hint() {
+    if [ -z "${NOTIFY_METHODS}" ] || [ "${NOTIFY_METHODS}" = "none" ]; then
+        echo -e "  ${C_DIM}No notification channel is configured, so no report was sent.${C_NC}"
+        echo -e "  ${C_DIM}The full output is above, and in ${LOG_DIR}/.${C_NC}"
+        return
+    fi
+    if [ "${NOTIFY_ON_FAILURE_ONLY}" = "true" ]; then
+        echo -e "  ${C_DIM}Notifications are set to failures only, so a clean run sends nothing.${C_NC}"
+        return
+    fi
+    case ",${NOTIFY_METHODS}," in
+        *,email,*) print_ok "Check ${C_BOLD}${RECIPIENT_EMAIL}${C_NC} for the report email" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
+        *,discord,*) print_ok "A report was sent to Discord" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
+        *,slack,*) print_ok "A report was sent to Slack" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
+        *,webhook,*) print_ok "A report was posted to the configured webhook" ;;
+    esac
+}
 print_fail()   { echo -e "  ${C_RED}✗${C_NC} $1"; }
 print_action() { echo -e "  ${C_CYAN}▶${C_NC} $1"; }
 
@@ -67,12 +136,22 @@ for ARG in "$@"; do
     esac
 done
 
-# In unattended mode every prompt must return immediately with the default, so
-# point /dev/tty reads at an always-EOF source rather than a terminal.
+# Prompts read from fd 3 rather than stdin, because stdin is the script itself
+# under `curl | bash`. In unattended mode every prompt must return immediately
+# with the default, so point fd 3 at an always-EOF source.
+#
+# HAVE_TTY records whether we actually got a terminal. Without one — `ssh host
+# 'curl … | bash'` with no -t, Ansible, cloud-init, cron — /dev/tty fails with
+# ENXIO, every read returns EOF immediately, and bash does not even print the
+# prompt, so the transcript shows only success ticks while defaults are silently
+# taken. Anything with side effects has to check this, not just UNATTENDED.
+HAVE_TTY=false
 if [ "${UNATTENDED}" = true ]; then
     exec 3</dev/null
+elif exec 3</dev/tty 2>/dev/null; then
+    HAVE_TTY=true
 else
-    exec 3</dev/tty || exec 3</dev/null
+    exec 3</dev/null
 fi
 
 echo ""
@@ -89,6 +168,48 @@ if [ "$(id -u)" -ne 0 ]; then
     echo ""
     print_fail "This installer must be run as ${C_BOLD}root${C_NC}."
     exit 1
+fi
+
+# 0a. Is this actually a Proxmox VE host?
+#
+# There was no check at all, so installing on plain Debian, on a Proxmox Backup
+# Server, or — a common mistake — inside a container on the host rather than on
+# the host itself, printed every success tick and finished with "Deployment
+# successful". The scheduled run then found no guests and reported a clean sweep
+# of nothing, forever.
+if [ "${PAU_SKIP_PVE_CHECK:-false}" != "true" ]; then
+    if ! command -v pveversion >/dev/null 2>&1 || [ ! -d /etc/pve ]; then
+        echo ""
+        print_fail "This does not look like a Proxmox VE host."
+        print_fail "Both ${C_BOLD}pveversion${C_NC} and ${C_BOLD}/etc/pve${C_NC} are required."
+        echo ""
+        echo -e "  Run this on the Proxmox host itself — not inside a VM or container,"
+        echo -e "  and not on a Proxmox Backup Server."
+        echo -e "  ${C_DIM}Set PAU_SKIP_PVE_CHECK=true to override.${C_NC}"
+        echo ""
+        exit 1
+    fi
+    print_ok "Proxmox VE detected: ${C_DIM}$(pveversion 2>/dev/null | head -1)${C_NC}"
+fi
+
+# 0b. Refuse to install from a world-writable working directory.
+#
+# fetch_asset and the update-script step both prefer a local file over the
+# download, so `cd /tmp; curl … | bash` would copy an attacker-planted
+# ./update-everything.sh into /usr/local/bin, chmod it +x, install it into
+# root's crontab and run it. Only trust local files when the directory is ours.
+LOCAL_SOURCE_OK=true
+_CWD_OWNER="$(stat -c '%u' . 2>/dev/null || echo 65534)"
+_CWD_MODE="$(stat -c '%a' . 2>/dev/null || echo 777)"
+# Last octal digit carries the "other" bits; the write bit is 2, so 2/3/6/7 all
+# mean any user can drop a file here.
+case "${_CWD_MODE}" in
+    *[2367]) LOCAL_SOURCE_OK=false ;;
+esac
+[ "${_CWD_OWNER}" != "0" ] && LOCAL_SOURCE_OK=false
+if [ "${LOCAL_SOURCE_OK}" != true ]; then
+    print_action "Working directory is world-writable or not root-owned"
+    print_action "Ignoring local files and fetching everything from GitHub"
 fi
 
 # 1. Load any previously saved configuration
@@ -110,6 +231,8 @@ PREV_SNAPSHOT=""
 PREV_SNAPSHOT_KEEP=""
 PREV_WEBUI=""
 PREV_WEBUI_PORT=""
+PREV_DRY_RUN=""
+PREV_LOG_DIR=""
 PREV_NOTIFY_METHODS=""
 PREV_FAIL_ONLY=""
 PREV_DISCORD=""
@@ -154,6 +277,14 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
     PREV_USER_ID="${DISCORD_USER_ID:-}"
     PREV_CONFIRM="${CONFIRM_UPDATES:-}"
+    # These two were not carried across, and the config below emits literals for
+    # them. So a re-install — including the unattended one the panel's "Install
+    # update" button runs — silently flipped a node that was deliberately in
+    # dry-run mode back to live dist-upgrades with reboot scheduling, and threw
+    # away a custom log directory, after which cron redirected into the old
+    # directory while the script logged to the default one.
+    PREV_DRY_RUN="${DRY_RUN:-}"
+    PREV_LOG_DIR="${LOG_DIR:-}"
 
     # Installs predating NOTIFY_METHODS had Mailgun and nothing else.
     if [ -z "${PREV_NOTIFY_METHODS}" ] && [ -n "${MAILGUN_API_KEY:-}" ]; then
@@ -182,6 +313,10 @@ for DEP in jq python3; do
         exit 1
     fi
 done
+
+# Honour an existing custom log directory for the cron redirect and mkdir below,
+# so the two never end up pointing at different places.
+LOG_DIR="${PREV_LOG_DIR:-${LOG_DIR}}"
 
 echo ""
 echo -e "${C_BOLD}── Notifications ───────────────────────────────────────────${C_NC}"
@@ -597,6 +732,10 @@ echo ""
 echo -e "${C_BOLD}── Deploying ───────────────────────────────────────────────${C_NC}"
 echo ""
 print_action "Saving configuration to ${C_DIM}${CONFIG_FILE}${C_NC}..."
+# Create the file with restrictive permissions *before* writing credentials into
+# it. Writing first and chmod'ing afterwards left the Mailgun key, Discord bot
+# token and webhook URLs world-readable for the duration.
+install -m 600 -o root -g root /dev/null "${CONFIG_FILE}"
 cat > "${CONFIG_FILE}" <<CONF
 # Proxmox Auto-Update — Configuration
 # Generated by installer on $(date '+%d/%m/%Y %H:%M:%S')
@@ -663,7 +802,10 @@ SNAPSHOT_KEEP="${SNAPSHOT_KEEP}"
 # Report what would be updated without changing anything ("true" or "false").
 # Leave this false for the scheduled run — use 'update-everything.sh --dry-run'
 # when you want a one-off preview.
-DRY_RUN="false"
+DRY_RUN="${PREV_DRY_RUN:-false}"
+
+# Where run logs are written.
+LOG_DIR="${PREV_LOG_DIR:-/var/log/proxmox-autoupdate}"
 
 # Web control panel (toolbar button in the Proxmox UI)
 ENABLE_WEB_UI="${ENABLE_WEB_UI}"
@@ -695,13 +837,14 @@ print_ok "Config saved ${C_DIM}(chmod 600, root-only)${C_NC}"
 # executable in place of a working one.
 fetch_asset() {
     local rel="$1" dest="$2"
-    if [ -f "${rel}" ]; then
+    if [ "${LOCAL_SOURCE_OK}" = true ] && [ -f "${rel}" ]; then
         cp -f "${rel}" "${dest}"
         return 0
     fi
     local tmp
     tmp=$(mktemp) || return 1
-    if curl -fsSL "${GITHUB_RAW_BASE}/${rel}" -o "${tmp}" && [ -s "${tmp}" ]; then
+    if curl -fsSL --retry 3 --retry-delay 2 -m 120 "${GITHUB_RAW_BASE}/${rel}" -o "${tmp}" \
+       && [ -s "${tmp}" ]; then
         mv -f "${tmp}" "${dest}"
         return 0
     fi
@@ -710,16 +853,63 @@ fetch_asset() {
     return 1
 }
 
+# Does a downloaded file actually look like the thing we asked for?
+#
+# curl without --fail exits 0 on a 404, 403, 502 or a captive-portal
+# interstitial and writes the response body to the destination, so the installer
+# happily made an HTML error page executable, put it in root's crontab, and
+# reported success. Every scheduled run then died on line 1 with a syntax error
+# into a log nobody reads. --fail closes most of that; these checks close the
+# rest, including a proxy that returns 200 with the wrong content.
+verify_script() {
+    local path="$1" needle="$2" what="$3"
+    if [ ! -s "${path}" ]; then
+        print_fail "${what} is empty"
+        return 1
+    fi
+    if ! head -1 "${path}" | grep -q '^#!'; then
+        print_fail "${what} is not a script (no #! line) — a proxy or portal probably replaced it"
+        print_fail "  ${C_DIM}head -3 ${path}${C_NC}"
+        return 1
+    fi
+    if ! grep -q "${needle}" "${path}"; then
+        print_fail "${what} does not contain '${needle}' — wrong or truncated file"
+        return 1
+    fi
+    if ! bash -n "${path}" 2>/dev/null; then
+        print_fail "${what} is not valid shell — the download was corrupted"
+        return 1
+    fi
+    return 0
+}
+
 # 4. Fetch the update script
-print_action "Fetching update script..."
-if [ -f "update-everything.sh" ]; then
-    cp -f update-everything.sh "${TARGET_PATH}"
-    print_ok "Copied from local file"
+print_action "Fetching update script (${PAU_RESOLVED_REF})..."
+STAGED_MAIN="$(mktemp)"
+if [ "${LOCAL_SOURCE_OK}" = true ] && [ -f "update-everything.sh" ]; then
+    cp -f update-everything.sh "${STAGED_MAIN}"
+    MAIN_SOURCE="local file"
+elif curl -fsSL --retry 3 --retry-delay 2 -m 120 "${GITHUB_RAW_URL}" -o "${STAGED_MAIN}"; then
+    MAIN_SOURCE="GitHub (${PAU_RESOLVED_REF})"
 else
-    curl -sSL "${GITHUB_RAW_URL}" -o "${TARGET_PATH}"
-    print_ok "Downloaded from GitHub"
+    rm -f "${STAGED_MAIN}"
+    print_fail "Could not download update-everything.sh from ${GITHUB_RAW_URL}"
+    print_fail "Check network access to raw.githubusercontent.com and try again."
+    exit 1
 fi
-chmod +x "${TARGET_PATH}"
+
+if ! verify_script "${STAGED_MAIN}" '^PAU_VERSION=' "The downloaded update script"; then
+    rm -f "${STAGED_MAIN}"
+    print_fail "Refusing to install it. Nothing has been changed."
+    exit 1
+fi
+
+# Only now replace the live script, and do it atomically so a crash here cannot
+# leave a half-written updater in root's crontab.
+install -m 700 -o root -g root "${STAGED_MAIN}" "${TARGET_PATH}.new"
+mv -f "${TARGET_PATH}.new" "${TARGET_PATH}"
+rm -f "${STAGED_MAIN}"
+print_ok "Installed from ${MAIN_SOURCE} ${C_DIM}(verified)${C_NC}"
 
 # 4a. Changelog, so the panel can show it even without network access
 mkdir -p /usr/local/share/proxmox-autoupdate
@@ -736,6 +926,8 @@ mkdir -p "${LOG_DIR}"
 print_ok "Log directory: ${C_DIM}${LOG_DIR}/${C_NC}"
 
 
+WEBUI_SKIP_ALL=false
+
 if [ "${ENABLE_WEB_UI}" = "true" ]; then
     print_action "Installing web control panel..."
 
@@ -745,33 +937,105 @@ if [ "${ENABLE_WEB_UI}" = "true" ]; then
         exit 1
     fi
 
+    # Stage every panel file before installing any of them.
+    #
+    # These used to be fetched straight over their live destinations, and a
+    # single failure set ENABLE_WEB_UI=false — which fell through to the
+    # *teardown* branch below, un-patching pvemanagerlib.js and deleting the
+    # unit, apt hook, binary and patcher, while printing "Web control panel
+    # removed". So one transient GitHub blip during an unattended self-update
+    # uninstalled the very panel that had requested the update, leaving the
+    # config on disk still saying ENABLE_WEB_UI="true".
+    UI_STAGE="$(mktemp -d)"
     UI_FETCH_OK=true
-    fetch_asset "webui/pve-autoupdate-ui" "${UI_BIN}"              || UI_FETCH_OK=false
-    fetch_asset "webui/patch-webui.sh" "${UI_PATCHER}"             || UI_FETCH_OK=false
-    fetch_asset "webui/pve-autoupdate-ui.service" "${UI_SERVICE}"  || UI_FETCH_OK=false
-    fetch_asset "webui/99-proxmox-autoupdate-webui" "${UI_APT_HOOK}" || UI_FETCH_OK=false
-    if [ "${UI_FETCH_OK}" != true ]; then
-        print_fail "Web control panel files could not be installed — skipping it."
+    fetch_asset "webui/pve-autoupdate-ui"            "${UI_STAGE}/ui"      || UI_FETCH_OK=false
+    fetch_asset "webui/patch-webui.sh"               "${UI_STAGE}/patch"   || UI_FETCH_OK=false
+    fetch_asset "webui/pve-autoupdate-ui.service"    "${UI_STAGE}/service" || UI_FETCH_OK=false
+    fetch_asset "webui/99-proxmox-autoupdate-webui"  "${UI_STAGE}/hook"    || UI_FETCH_OK=false
+
+    if [ "${UI_FETCH_OK}" = true ]; then
+        verify_script "${UI_STAGE}/patch" 'BEGIN proxmox-autoupdate button' "The panel patcher" \
+            || UI_FETCH_OK=false
+        if [ -s "${UI_STAGE}/ui" ] && head -1 "${UI_STAGE}/ui" | grep -q '^#!'; then
+            python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" \
+                "${UI_STAGE}/ui" >/dev/null 2>&1 || {
+                print_fail "The downloaded control panel is not valid Python"
+                UI_FETCH_OK=false
+            }
+        else
+            print_fail "The downloaded control panel is not a script"
+            UI_FETCH_OK=false
+        fi
+    fi
+
+    if [ "${UI_FETCH_OK}" = true ]; then
+        install -m 755 -o root -g root "${UI_STAGE}/ui"      "${UI_BIN}"
+        install -m 755 -o root -g root "${UI_STAGE}/patch"   "${UI_PATCHER}"
+        install -m 644 -o root -g root "${UI_STAGE}/service" "${UI_SERVICE}"
+        install -m 644 -o root -g root "${UI_STAGE}/hook"    "${UI_APT_HOOK}"
+    else
+        print_fail "Web control panel files could not be installed."
         print_fail "The scheduled updates themselves are unaffected."
+        if [ -x "${UI_BIN}" ]; then
+            # Something is already installed and working. Leave it exactly as it
+            # is rather than tearing it down over a failed download.
+            print_action "Keeping the existing panel installation unchanged."
+            WEBUI_SKIP_ALL=true
+        else
+            ENABLE_WEB_UI="false"
+        fi
+    fi
+    rm -rf "${UI_STAGE}"
+fi
+
+if [ "${WEBUI_SKIP_ALL}" = true ]; then
+    : # A download failed but a working panel is already installed. Leave it be.
+elif [ "${ENABLE_WEB_UI}" = "true" ]; then
+    # Port settings go in a drop-in, not into the unit itself.
+    #
+    # The unit is refetched on every install and self-update, so editing it in
+    # place threw away any operator customisation — most importantly
+    # Environment=PAU_UI_ADDR=127.0.0.1, which is how you stop the panel
+    # listening on every interface. A drop-in survives the unit being replaced.
+    mkdir -p "${UI_SERVICE}.d"
+    cat > "${UI_SERVICE}.d/10-port.conf" <<DROPIN
+# Managed by the proxmox-autoupdate installer. Safe to edit; it is not
+# overwritten unless you change the port during a re-install.
+[Service]
+Environment=PAU_UI_PORT=${WEB_UI_PORT}
+DROPIN
+    chmod 644 "${UI_SERVICE}.d/10-port.conf"
+
+    # Is the port actually free? Nothing checked, and because the unit is
+    # Type=simple, `systemctl restart` returns 0 as soon as the process forks —
+    # before it tries to bind. So a collision printed "Service running on port
+    # 8007" while the unit crash-looped every 5 seconds. Proxmox Backup Server
+    # owns 8007, and co-installing it on the PVE host is a documented setup.
+    PORT_OWNER=""
+    if command -v ss >/dev/null 2>&1; then
+        PORT_OWNER=$(ss -lntpH "( sport = :${WEB_UI_PORT} )" 2>/dev/null | head -1 || true)
+    fi
+    if [ -n "${PORT_OWNER}" ] && ! systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
+        print_fail "Port ${WEB_UI_PORT} is already in use by something else:"
+        echo -e "      ${C_DIM}${PORT_OWNER}${C_NC}"
+        if [ "${WEB_UI_PORT}" = "8007" ]; then
+            print_fail "Port 8007 belongs to Proxmox Backup Server. Choose another port."
+        fi
+        print_fail "Re-run the installer and pick a free port."
         ENABLE_WEB_UI="false"
     fi
 fi
 
-if [ "${ENABLE_WEB_UI}" = "true" ]; then
-    chmod +x "${UI_BIN}" "${UI_PATCHER}"
-    chmod 644 "${UI_SERVICE}" "${UI_APT_HOOK}"
-
-    # The port lives in the unit file's environment, not the shell config, so the
-    # service picks it up without sourcing a root-only file.
-    if ! grep -q "^Environment=PAU_UI_PORT=" "${UI_SERVICE}"; then
-        sed -i "/^\[Service\]/a Environment=PAU_UI_PORT=${WEB_UI_PORT}" "${UI_SERVICE}"
-    else
-        sed -i "s|^Environment=PAU_UI_PORT=.*|Environment=PAU_UI_PORT=${WEB_UI_PORT}|" "${UI_SERVICE}"
-    fi
-
+if [ "${WEBUI_SKIP_ALL}" = true ]; then
+    : # unchanged
+elif [ "${ENABLE_WEB_UI}" = "true" ]; then
     systemctl daemon-reload
     systemctl enable pve-autoupdate-ui.service >/dev/null 2>&1 || true
-    if systemctl restart pve-autoupdate-ui.service; then
+    systemctl restart pve-autoupdate-ui.service >/dev/null 2>&1 || true
+    # Type=simple means restart returns before the bind, so ask again in a
+    # moment whether the process is actually still alive.
+    sleep 2
+    if systemctl is-active --quiet pve-autoupdate-ui.service; then
         print_ok "Service running on port ${WEB_UI_PORT}"
     else
         print_fail "Service failed to start — check: journalctl -u pve-autoupdate-ui -n 50"
@@ -826,11 +1090,27 @@ else
     # Cleanly tear down a previously enabled panel.
     if [ -f "${UI_SERVICE}" ] || [ -x "${UI_PATCHER}" ]; then
         print_action "Removing previously installed web control panel..."
-        [ -x "${UI_PATCHER}" ] && "${UI_PATCHER}" remove >/dev/null 2>&1 || true
+        # Take the button out of pvemanagerlib.js *before* deleting the tool
+        # that knows how to do it, and only delete that tool if it succeeded.
+        # Otherwise a failed un-patch left the button wired into the Proxmox UI
+        # permanently, pointing at a service that no longer exists.
+        UNPATCH_OK=true
+        if [ -x "${UI_PATCHER}" ]; then
+            "${UI_PATCHER}" remove --quiet >/dev/null 2>&1 || UNPATCH_OK=false
+        fi
         systemctl disable --now pve-autoupdate-ui.service >/dev/null 2>&1 || true
-        rm -f "${UI_SERVICE}" "${UI_APT_HOOK}" "${UI_BIN}" "${UI_PATCHER}"
-        systemctl daemon-reload
-        print_ok "Web control panel removed"
+        rm -f "${UI_SERVICE}" "${UI_APT_HOOK}" "${UI_BIN}"
+        rm -rf "${UI_SERVICE}.d"
+        if [ "${UNPATCH_OK}" = true ]; then
+            rm -f "${UI_PATCHER}"
+            systemctl daemon-reload
+            print_ok "Web control panel removed"
+        else
+            systemctl daemon-reload
+            print_fail "Could not remove the toolbar button from the Proxmox UI."
+            print_fail "Keeping ${UI_PATCHER} so you can retry:"
+            print_fail "  ${UI_PATCHER} remove"
+        fi
     fi
 fi
 
@@ -840,16 +1120,46 @@ CRON_MARKER="# proxmox-autoupdate"
 CRON_JOB="${UPDATE_SCHEDULE_CRON} ${TARGET_PATH} >> ${LOG_DIR}/cron.log 2>&1"
 
 CRON_TMP=$(mktemp)
+CRON_ERR=$(mktemp)
 crontab -l 2>/dev/null | grep -v "${TARGET_PATH}" | grep -v "${CRON_MARKER}" > "${CRON_TMP}" || true
 echo "${CRON_MARKER}" >> "${CRON_TMP}"
 echo "${CRON_JOB}" >> "${CRON_TMP}"
-if ! crontab "${CRON_TMP}" 2>/tmp/cron_err.log; then
+if ! crontab "${CRON_TMP}" 2>"${CRON_ERR}"; then
     print_fail "Invalid cron schedule! crontab rejected it:"
-    sed 's/^/    /' /tmp/cron_err.log
-    rm -f "${CRON_TMP}" /tmp/cron_err.log
+    sed 's/^/    /' "${CRON_ERR}"
+    rm -f "${CRON_TMP}" "${CRON_ERR}"
     exit 1
 fi
-rm -f "${CRON_TMP}" /tmp/cron_err.log
+rm -f "${CRON_TMP}" "${CRON_ERR}"
+
+# A crontab entry is useless without something to run it. Nothing checked, so an
+# install on a node with no cron daemon reported success and then never ran.
+if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1 \
+   || systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet cronie 2>/dev/null; then
+    print_ok "Cron daemon is running"
+else
+    print_fail "No cron daemon is running — the schedule will never fire."
+    print_fail "Fix it with:  systemctl enable --now cron"
+fi
+
+# Rotate our own logs.
+#
+# The retention pruner in update-everything.sh is `find -name '*.log' -mtime +N`,
+# which can never match cron.log: the name matches, but the file is appended to
+# on every run so its mtime is always current. Without this it grows forever.
+cat > /etc/logrotate.d/proxmox-autoupdate <<LOGROTATE
+${LOG_DIR}/cron.log {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE
+chmod 644 /etc/logrotate.d/proxmox-autoupdate
+print_ok "Log rotation configured ${C_DIM}(/etc/logrotate.d/proxmox-autoupdate)${C_NC}"
 
 # Verify crontab entry was written successfully
 if INSTALLED_CRON=$(crontab -l 2>/dev/null | grep "${TARGET_PATH}"); then
@@ -911,16 +1221,25 @@ fi
 echo ""
 
 # 8. Interactive Test Run Option
-# Both run modes send the report email, so either one verifies that the Mailgun
-# credentials, region and recipient are actually working end to end.
+# If a notification channel is configured, either run mode also exercises it end
+# to end.
 #
-# Never offered unattended. The prompt reads EOF there, and the "Enter for 1"
-# default would silently start a full dry run of every guest as part of a
-# self-update — which is both surprising and takes the update lockfile, making
-# the panel report a scheduled run in progress.
-if [ "${UNATTENDED}" = true ]; then
+# Only offered when there is a real terminal to answer. This guard used to test
+# UNATTENDED alone, but the prompt also reads EOF whenever there is no
+# controlling terminal — `ssh host 'curl … | bash'` without -t, Ansible,
+# cloud-init, cron — and the "Enter for 1" default then silently started a
+# sweep of every guest, took the update lockfile, and blocked for a long time,
+# with none of the prompts even printed.
+if [ "${UNATTENDED}" = true ] || [ "${HAVE_TTY}" != true ]; then
     echo ""
-    print_ok "Install complete ${C_DIM}(no test run — unattended)${C_NC}"
+    if [ "${UNATTENDED}" = true ]; then
+        print_ok "Install complete ${C_DIM}(no test run — unattended)${C_NC}"
+    else
+        print_ok "Install complete ${C_DIM}(no test run — no terminal to prompt on)${C_NC}"
+        echo ""
+        echo -e "  Check the installation with:  ${C_BOLD}${TARGET_PATH} --doctor${C_NC}"
+        echo -e "  Preview a run with:           ${C_BOLD}${TARGET_PATH} --dry-run${C_NC}"
+    fi
     echo ""
     exit 0
 fi
@@ -967,7 +1286,7 @@ case "${RUN_MODE}" in
         echo ""
         if [ "${RUN_RC}" -eq 0 ]; then
             print_ok "Dry run complete — nothing was installed or rebooted"
-            print_ok "Check ${C_BOLD}${RECIPIENT_EMAIL}${C_NC} for the report email"
+            report_delivery_hint
         else
             print_fail "Dry run exited with code ${RUN_RC} — see ${LOG_DIR}/"
         fi
@@ -990,7 +1309,7 @@ case "${RUN_MODE}" in
         echo ""
         if [ "${RUN_RC}" -eq 0 ]; then
             print_ok "Full run complete"
-            print_ok "Check ${C_BOLD}${RECIPIENT_EMAIL}${C_NC} for the report email"
+            report_delivery_hint
         else
             print_fail "Run exited with code ${RUN_RC} — see ${LOG_DIR}/"
         fi

@@ -114,7 +114,17 @@ echo -e "  ${C_DIM}yourself with 'qm delsnapshot' / 'pct delsnapshot' if you wan
 echo ""
 
 if [ "${ASSUME_YES}" != true ]; then
-    read -rp "  Proceed? (y/N): " CONFIRM < /dev/tty
+    # CONFIRM must be initialised: without a controlling terminal the read fails
+    # outright, and `set -u` then turned the test below into a fatal
+    # "CONFIRM: unbound variable" instead of a clean cancellation.
+    CONFIRM=""
+    if ! read -rp "  Proceed? (y/N): " CONFIRM < /dev/tty 2>/dev/null; then
+        echo ""
+        print_skip "No terminal to confirm on — nothing was changed."
+        echo -e "  ${C_DIM}Re-run with --yes to uninstall non-interactively.${C_NC}"
+        echo ""
+        exit 0
+    fi
     if ! [[ "${CONFIRM}" =~ ^[Yy]$ ]]; then
         echo ""
         print_skip "Cancelled — nothing was changed."
@@ -171,9 +181,20 @@ else
 fi
 
 REMOVED_FILES=0
-for FILE in "${UI_SERVICE}" "${UI_APT_HOOK}" "${UI_BIN}" "${UI_PATCHER}"; do
+# The last three were created by install.sh but never removed here, so after a
+# "complete" uninstall the pve-autoupdate-uninstall command stayed on PATH
+# forever and the systemd drop-in directory was orphaned.
+for FILE in "${UI_SERVICE}" "${UI_APT_HOOK}" "${UI_BIN}" "${UI_PATCHER}" \
+            "/usr/local/bin/pve-autoupdate-uninstall" \
+            "/etc/logrotate.d/proxmox-autoupdate"; do
     if [ -e "${FILE}" ]; then
         rm -f "${FILE}"
+        REMOVED_FILES=$((REMOVED_FILES + 1))
+    fi
+done
+for DIR in "${UI_SERVICE}.d" "/usr/local/share/proxmox-autoupdate"; do
+    if [ -d "${DIR}" ]; then
+        rm -rf "${DIR}"
         REMOVED_FILES=$((REMOVED_FILES + 1))
     fi
 done
@@ -212,7 +233,10 @@ if [ -d "${STATE_DIR}" ]; then
     print_ok "Removed ${STATE_DIR}"
 fi
 
-rm -f "${LOCKFILE}" 2>/dev/null || true
+# Deliberately not removing the lockfile. If a run is still going, unlinking it
+# lets the next invocation create a fresh inode and take its own flock, so two
+# runs end up driving pct and qm at once. It is a zero-byte file; leaving it is
+# harmless.
 
 # --- 7. Config and logs, only with --purge ---
 if [ "${PURGE}" = true ]; then
@@ -230,7 +254,11 @@ else
 fi
 
 # --- 8. Cancel any reboot this tool scheduled ---
-if shutdown -c 2>/dev/null; then
+# Only if one is actually pending. A bare `shutdown -c` cancels whatever is
+# queued regardless of who queued it, and on systemd it exits 0 with nothing
+# scheduled, so the "Cancelled a pending scheduled reboot" line printed on
+# essentially every uninstall whether or not anything had been cancelled.
+if [ -e /run/systemd/shutdown/scheduled ] && shutdown -c 2>/dev/null; then
     print_ok "Cancelled a pending scheduled reboot"
 fi
 
