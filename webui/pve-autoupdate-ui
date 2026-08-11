@@ -3459,8 +3459,15 @@ function selectTop(name) {
     b.tabIndex = on ? 0 : -1;
   });
   TOP_TABS.forEach((t) => $("tab-" + t).classList.toggle("hidden", t !== name));
-  loadFor(name);
-  if (name === "settings") { loadFor(currentSub); }
+  if (name === "settings") {
+    // Show the sub-section as well as its container. Loading the data without
+    // unhiding the section left Settings looking empty on first open — the
+    // content was there, behind `hidden`, until a sub-tab click revealed it.
+    // selectSub does both, so go through it rather than repeating half of it.
+    selectSub(currentSub);
+  } else {
+    loadFor(name);
+  }
 }
 
 let currentSub = "exclusions";

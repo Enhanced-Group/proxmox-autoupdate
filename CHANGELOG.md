@@ -12,6 +12,16 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.2.2 — 2026-08-11
+
+### Fixed
+
+- **The Settings tab opened empty.** Clicking it showed the container and
+  fetched the data but never unhid the sub-section inside it, so the content
+  sat behind `hidden` until a sub-tab click revealed it — which is why clicking
+  away and back appeared to fix it. Introduced in 4.1.0 with the tab
+  consolidation.
+
 ## 4.2.1 — 2026-08-11
 
 ### Fixed
