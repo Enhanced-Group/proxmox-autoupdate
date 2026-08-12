@@ -12,6 +12,42 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.6.0 — 2026-08-12
+
+### Fixed
+
+- **Discord rate limits were not handled at all.** Discord allows roughly five
+  requests per two seconds per webhook and answers 429 with a `retry_after`
+  saying exactly how long to wait. None of the three call sites read it: a 429
+  was reported as a generic HTTP failure and the message was simply lost.
+  Sending a multi-part log made that likely rather than theoretical, since
+  every part is another request. All Discord traffic now goes through one
+  helper that honours `retry_after`, retries up to four times, clamps the wait
+  to 30s so a long limit cannot stall a run, and falls back to 2s when the
+  value is missing or malformed.
+- **Attachments were uploaded even when the message had failed.** A webhook
+  returning 401 was followed by several megabytes of log going the same way,
+  producing more failures and no report. Attachments now only follow a message
+  that landed.
+- The panel's notification form serialised checkboxes as `"on"`, which is not a
+  value the script or the validators accept — it would have silently rejected
+  the new attachment toggle. Checkboxes now read and write `true`/`false`.
+
+### Added
+
+- **The HTML report can be attached to Discord**, alongside the plain log
+  (`DISCORD_ATTACH_REPORT`, on by default). It is the same report the email
+  channel sends, with the per-guest package lists formatted — Discord offers it
+  as a download rather than rendering it inline. Unlike the log it is never
+  split when oversized, because half an HTML document renders as whatever the
+  browser can salvage and silently drops the rest; it is skipped with a reason
+  instead.
+- `DISCORD_MAX_UPLOAD` is configurable. Discord's ceiling depends on the
+  server's boost tier and the free-tier figure has changed more than once, so
+  it is no longer a constant you have to edit the script to change. A 413 from
+  Discord is now reported as "too large" with the setting to adjust, rather
+  than a bare HTTP code.
+
 ## 4.5.6 — 2026-08-12
 
 ### Fixed

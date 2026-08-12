@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.5.6"
+PAU_VERSION="4.6.0"
 
 set -u
 set -o pipefail
@@ -2276,10 +2276,21 @@ notify_email_mailgun() {
 
 # Discord truncates hard: 2000 characters of content, 4096 in an embed. A real
 # run's log is far bigger than that, so the summary goes in the embed and the
-# log itself is attached as a file. Discord's upload ceiling is 10 MB on a free
-# server; 8 MB leaves room for the multipart overhead, and anything larger is
-# split across several messages rather than silently dropped.
-DISCORD_MAX_UPLOAD=$((8 * 1024 * 1024))
+# files are attached.
+#
+# The upload ceiling depends on the server's boost tier and Discord has changed
+# the free-tier figure more than once, so this is configurable rather than a
+# constant someone has to edit the script to change. The default leaves room
+# for multipart overhead under the smallest tier. Anything larger is split
+# across several messages rather than silently dropped.
+DISCORD_MAX_UPLOAD="${DISCORD_MAX_UPLOAD:-$((8 * 1024 * 1024))}"
+
+# Attach the HTML report as well as the plain log ("true" or "false").
+#
+# Discord will not render it inline — it arrives as a file you download and
+# open — but it is the same report the email channel sends, with the per-guest
+# package lists formatted, which the plain text summary cannot show.
+DISCORD_ATTACH_REPORT="${DISCORD_ATTACH_REPORT:-true}"
 
 # Discord can be reached two ways:
 #   webhook  — post straight to a channel URL, no auth header
@@ -2385,6 +2396,74 @@ discord_cfg() {
     fi
 }
 
+# Perform a Discord request, honouring rate limits.
+#
+# Discord allows roughly five requests per two seconds per webhook and answers
+# 429 with a `retry_after` telling you exactly how long to wait. None of that
+# was handled: a 429 was reported as a generic HTTP failure and the message was
+# simply lost. Sending a multi-part log made it likely rather than theoretical,
+# because every part is another request.
+#
+# Sets DISCORD_HTTP and leaves the response body in DISCORD_BODY.
+DISCORD_HTTP=""
+DISCORD_BODY=""
+discord_request() {
+    local attempt=0 max_attempts=4 wait
+    DISCORD_BODY=$(mktemp)
+    while :; do
+        attempt=$((attempt + 1))
+        DISCORD_HTTP=$(discord_cfg | curl -s --config - --max-time 180 \
+            -o "${DISCORD_BODY}" -w "%{http_code}" "$@" 2>/dev/null) || DISCORD_HTTP="000"
+
+        [ "${DISCORD_HTTP}" = "429" ] || break
+        [ "${attempt}" -ge "${max_attempts}" ] && break
+
+        # retry_after is seconds, fractional, in the JSON body. Clamp it: a long
+        # rate limit should not stall the whole run, and a malformed value must
+        # not turn into an unbounded sleep.
+        wait=$(jq -r '.retry_after // empty' "${DISCORD_BODY}" 2>/dev/null || true)
+        case "${wait}" in
+            ''|*[!0-9.]*) wait="2" ;;
+        esac
+        awk -v w="${wait}" 'BEGIN { exit !(w > 30) }' && wait="30"
+        print_warn "Discord rate limited — waiting ${wait}s (attempt ${attempt}/${max_attempts})"
+        sleep "${wait}"
+    done
+    return 0
+}
+
+# Attach the HTML report.
+#
+# Unlike the log this is never split: half an HTML document is not a document,
+# and a browser shown one renders whatever it can and silently drops the rest —
+# worse than not sending it. Over the limit it is skipped with a reason.
+discord_attach_report() {
+    [ "${DISCORD_ATTACH_REPORT}" = "true" ] || return 0
+    [ -s "${HTML_FILE}" ] || return 0
+
+    local size
+    size=$(wc -c < "${HTML_FILE}" 2>/dev/null || echo 0)
+    if [ "${size}" -gt "${DISCORD_MAX_UPLOAD}" ]; then
+        print_warn "Discord: HTML report is ${size} bytes, over the ${DISCORD_MAX_UPLOAD} limit — not attached"
+        print_warn "  The summary above still covers it; raise DISCORD_MAX_UPLOAD if your server allows it."
+        return 0
+    fi
+
+    local named
+    named="$(dirname "${HTML_FILE}")/proxmox-update-report-$(date +%Y%m%d-%H%M%S).html"
+    cp -f "${HTML_FILE}" "${named}" 2>/dev/null || return 0
+
+    discord_request \
+        -F "payload_json={\"content\":\"Full report\"}" \
+        -F "files[0]=@${named};type=text/html"
+    case "${DISCORD_HTTP}" in
+        200|204) print_ok "Discord report attached" ;;
+        413)     print_warn "Discord rejected the report as too large (${size} bytes)" ;;
+        *)       print_warn "Discord report upload returned HTTP ${DISCORD_HTTP}" ;;
+    esac
+    rm -f "${DISCORD_BODY}" "${named}"
+}
+
 discord_attach_log() {
     [ "${KEEP_LOGS}" = "true" ] || return 0
     [ -s "${LOG_FILE}" ] || return 0
@@ -2402,15 +2481,16 @@ discord_attach_log() {
     size=$(wc -c < "${flat}" 2>/dev/null || echo 0)
 
     if [ "${size}" -le "${DISCORD_MAX_UPLOAD}" ]; then
-        local code
-        code=$(discord_cfg | curl -s --config - --max-time 180 \
-            -o /dev/null -w "%{http_code}" \
+        discord_request \
             -F "payload_json={\"content\":\"Full log\"}" \
-            -F "files[0]=@${flat};type=text/plain" 2>/dev/null) || code="000"
-        case "${code}" in
+            -F "files[0]=@${flat};type=text/plain"
+        case "${DISCORD_HTTP}" in
             200|204) print_ok "Discord log attached" ;;
-            *)       print_warn "Discord log upload returned HTTP ${code}" ;;
+            413)     print_warn "Discord rejected the log as too large (${size} bytes)."
+                     print_warn "  Lower DISCORD_MAX_UPLOAD so it is split into smaller parts." ;;
+            *)       print_warn "Discord log upload returned HTTP ${DISCORD_HTTP}" ;;
         esac
+        rm -f "${DISCORD_BODY}"
         rm -rf "${workdir}"
         return 0
     fi
@@ -2434,16 +2514,18 @@ discord_attach_log() {
         index=$((index + 1))
         local named="${workdir}/$(basename "${LOG_FILE}" .log).part${index}of${total}.log"
         mv "${part}" "${named}"
-        local code
-        code=$(discord_cfg | curl -s --config - --max-time 180 \
-            -o /dev/null -w "%{http_code}" \
+        discord_request \
             -F "payload_json={\"content\":\"Full log — part ${index} of ${total}\"}" \
-            -F "files[0]=@${named};type=text/plain" 2>/dev/null) || code="000"
-        case "${code}" in
+            -F "files[0]=@${named};type=text/plain"
+        case "${DISCORD_HTTP}" in
             200|204) ;;
-            *) failed=$((failed + 1)) ;;
+            *) failed=$((failed + 1))
+               print_warn "  part ${index}/${total} returned HTTP ${DISCORD_HTTP}" ;;
         esac
-        sleep 1   # stay clear of Discord's webhook rate limit
+        rm -f "${DISCORD_BODY}"
+        # Pace the remaining parts. discord_request backs off when Discord says
+        # 429; this keeps us under the limit rather than relying on hitting it.
+        [ "${index}" -lt "${total}" ] && sleep 1
     done <<< "${parts}"
 
     if [ "${failed}" -eq 0 ]; then
@@ -2472,12 +2554,10 @@ notify_discord() {
         return 0
     fi
 
-    local body_file code
-    body_file=$(mktemp)
-    code=$(discord_cfg | curl -s --config - --max-time 30 \
-        -o "${body_file}" -w "%{http_code}" \
+    discord_request \
         -H "Content-Type: application/json" \
-        -X POST --data-binary "${payload}" 2>/dev/null) || code="000"
+        -X POST --data-binary "${payload}"
+    local body_file="${DISCORD_BODY}" code="${DISCORD_HTTP}"
 
     if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
         print_ok "${label} notified"
@@ -2495,7 +2575,13 @@ notify_discord() {
     fi
     rm -f "${body_file}"
 
-    discord_attach_log "${DISCORD_TARGET_URL}"
+    # Only attach when the message itself landed. Uploading a 5 MB log to a
+    # webhook that just returned 401 achieves nothing except three more
+    # failures in the console.
+    if [ "${code}" -ge 200 ] 2>/dev/null && [ "${code}" -lt 300 ] 2>/dev/null; then
+        discord_attach_report
+        discord_attach_log "${DISCORD_TARGET_URL}"
+    fi
 }
 
 notify_slack() {

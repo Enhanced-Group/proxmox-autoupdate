@@ -132,6 +132,8 @@ KEY_DEFAULTS = {
     "NOTIFY_ON_FAILURE_ONLY": "false",
     "CONFIRM_UPDATES": "true",
     "SUPPRESS_SUBSCRIPTION_NOTICE": "false",
+    "DISCORD_ATTACH_REPORT": "true",
+    "DISCORD_MAX_UPLOAD": "8388608",
     "UPDATE_SCHEDULE_CRON": "0 23 * * 5",
 }
 
@@ -243,6 +245,8 @@ EDITABLE_KEYS = {
     "RECIPIENT_EMAIL": _v_optional_email,
     "DISCORD_WEBHOOK_URL": _v_url,
     "DISCORD_BOT_TOKEN": _v_optional,
+    "DISCORD_ATTACH_REPORT": _v_bool,
+    "DISCORD_MAX_UPLOAD": _v_int,
     "DISCORD_USER_ID": lambda v: v == "" or v.isdigit(),
     "SLACK_WEBHOOK_URL": _v_url,
     "GENERIC_WEBHOOK_URL": _v_url,
@@ -3130,6 +3134,27 @@ PAGE_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <div class="card" id="cardDiscordFiles">
+    <h2>Discord attachments</h2>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="cfg2_DISCORD_ATTACH_REPORT" data-key="DISCORD_ATTACH_REPORT"
+             data-bool="1" style="width:auto">
+      <span>Attach the HTML report as well as the log</span>
+    </label>
+    <div class="hint">
+      Discord shows it as a file to download rather than rendering it, but it is
+      the same report the email channel sends, with the per-guest package lists
+      formatted.
+    </div>
+    <label for="cfg2_DISCORD_MAX_UPLOAD" style="margin-top:10px">Maximum attachment size (bytes)</label>
+    <input type="number" id="cfg2_DISCORD_MAX_UPLOAD" data-key="DISCORD_MAX_UPLOAD">
+    <div class="hint">
+      Discord's ceiling depends on the server's boost tier. Logs larger than
+      this are split across several messages; the HTML report is skipped rather
+      than split, because half a document is not a document.
+    </div>
+  </div>
+
   <div class="card" id="cardSlack">
     <h2>Slack</h2>
     <label for="cfg2_SLACK_WEBHOOK_URL">Webhook URL</label>
@@ -3657,6 +3682,9 @@ async function loadNotify() {
     $("failOnly").checked = cfg.NOTIFY_ON_FAILURE_ONLY === "true";
     document.querySelectorAll("#tab-notify [data-key]").forEach((el) => {
       const k = el.dataset.key;
+      // Checkboxes are ticked, not assigned a value — setting .value on one
+      // leaves it visually unticked whatever the setting actually says.
+      if (el.type === "checkbox") { el.checked = cfg[k] === "true"; return; }
       el.value = sensitive.includes(k) && cfg[k] ? "********" : (cfg[k] || "");
     });
     syncNotifyCards();
@@ -3671,7 +3699,12 @@ function collectNotify() {
     NOTIFY_ON_FAILURE_ONLY: $("failOnly").checked ? "true" : "false",
   };
   document.querySelectorAll("#tab-notify [data-key]").forEach((el) => {
-    cfg[el.dataset.key] = el.value;
+    // A checkbox's .value is "on" regardless of whether it is ticked, which
+    // would save "on" into a setting the script reads as a boolean and the
+    // validator rejects outright.
+    cfg[el.dataset.key] = el.type === "checkbox"
+      ? (el.checked ? "true" : "false")
+      : el.value;
   });
   return cfg;
 }
