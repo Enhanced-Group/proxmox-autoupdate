@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.4.1"
+PAU_VERSION="4.4.2"
 
 set -u
 set -o pipefail
@@ -1121,6 +1121,9 @@ done
 
 # Summary counters
 LXC_UPDATED=0
+# A dry run finds pending packages; it does not update anything. Counting both
+# in one variable made a dry run report "8 updated" when nothing was touched.
+LXC_PENDING=0
 LXC_CURRENT=0
 LXC_STARTED=0
 LXC_ERRORS=0
@@ -1128,6 +1131,7 @@ LXC_SKIPPED=0
 LXC_EXCLUDED=0
 
 VM_UPDATED=0
+VM_PENDING=0
 VM_CURRENT=0
 VM_STARTED=0
 VM_ERRORS=0
@@ -1815,8 +1819,15 @@ state_write() {
     [ "${DRY_RUN}" = "true" ] && result="${result}-dryrun"
 
     local counts
+    # A dry run records what is pending, not what was installed, so the panel's
+    # history does not show counts for work that never happened.
+    local rec_lxc="${LXC_UPDATED}" rec_vm="${VM_UPDATED}"
+    if [ "${DRY_RUN}" = "true" ]; then
+        rec_lxc="${LXC_PENDING}"
+        rec_vm="${VM_PENDING}"
+    fi
     counts=$(printf '{"lxc_updated":%d,"lxc_errors":%d,"vm_updated":%d,"vm_errors":%d,"host_packages":%d,"mid_update":%d}' \
-        "${LXC_UPDATED}" "${LXC_ERRORS}" "${VM_UPDATED}" "${VM_ERRORS}" \
+        "${rec_lxc}" "${LXC_ERRORS}" "${rec_vm}" "${VM_ERRORS}" \
         "${HOST_PKG_COUNT}" "${GUESTS_MID_UPDATE}")
 
     printf '%s' "${FAILED_THIS_RUN}" | python3 -c "${STATE_HELPER}" \
@@ -1882,8 +1893,13 @@ build_text_summary() {
     printf '%s\n\n' "${status_line}"
     printf 'Host: %s\n' "${HOST_NAME}"
     printf 'PVE:  %s\n\n' "${PVE_VERSION_AFTER:-unknown}"
-    printf 'LXC:  %s updated, %s current, %s errors\n' "${LXC_UPDATED}" "${LXC_CURRENT}" "${LXC_ERRORS}"
-    printf 'VMs:  %s updated, %s current, %s errors\n' "${VM_UPDATED}" "${VM_CURRENT}" "${VM_ERRORS}"
+    if [ "${DRY_RUN}" = "true" ]; then
+        printf 'LXC:  %s with updates pending, %s current, %s errors\n' "${LXC_PENDING}" "${LXC_CURRENT}" "${LXC_ERRORS}"
+        printf 'VMs:  %s with updates pending, %s current, %s errors\n' "${VM_PENDING}" "${VM_CURRENT}" "${VM_ERRORS}"
+    else
+        printf 'LXC:  %s updated, %s current, %s errors\n' "${LXC_UPDATED}" "${LXC_CURRENT}" "${LXC_ERRORS}"
+        printf 'VMs:  %s updated, %s current, %s errors\n' "${VM_UPDATED}" "${VM_CURRENT}" "${VM_ERRORS}"
+    fi
     printf 'Host: %s packages\n' "${HOST_PKG_COUNT}"
     if [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
         printf '\n%s guest(s) left running mid-update — check them.\n' "${GUESTS_MID_UPDATE}"
@@ -2948,7 +2964,7 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
         *)
             if [ "${PKG_COUNT}" -gt 0 ] && [ "${DRY_RUN}" = "true" ]; then
                 print_ok "LXC ${CTID} (${CT_NAME}) — ${C_BOLD}${PKG_COUNT} packages pending${C_NC} ${C_DIM}[dry run]${C_NC}${local_suffix}"
-                LXC_UPDATED=$((LXC_UPDATED + 1))
+                LXC_PENDING=$((LXC_PENDING + 1))
                 LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) would be upgraded:")</td></tr>"
             elif [ "${PKG_COUNT}" -gt 0 ]; then
                 print_ok "LXC ${CTID} (${CT_NAME}) — ${C_BOLD}${PKG_COUNT} packages updated${C_NC}${local_suffix}"
@@ -3210,6 +3226,7 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
             WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^DRYRUN://')
             WIN_NAMES=$(echo "${WIN_OUTPUT}" | tail -n +2)
             print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${WIN_COUNT} Windows updates pending${C_NC} ${C_DIM}[dry run]${C_NC}${local_suffix}"
+            VM_PENDING=$((VM_PENDING + 1))
             VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td><strong>${WIN_COUNT} update(s) would be installed:</strong><ul class='pkg-list'>$(html_list "${WIN_NAMES}")</ul></td></tr>"
         elif echo "${WIN_OUTPUT}" | grep -q "^UPDATED:"; then
             WIN_COUNT=$(echo "${WIN_OUTPUT}" | head -1 | sed 's/^UPDATED://')
@@ -3315,7 +3332,7 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
             *)
                 if [ "${PKG_COUNT}" -gt 0 ] && [ "${DRY_RUN}" = "true" ]; then
                     print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${PKG_COUNT} packages pending${C_NC} ${C_DIM}[dry run]${C_NC}${local_suffix}"
-                    VM_UPDATED=$((VM_UPDATED + 1))
+                    VM_PENDING=$((VM_PENDING + 1))
                     VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Pending</span></td><td>$(guest_summary_html "${PKG_COUNT} package(s) would be upgraded:")</td></tr>"
                 elif [ "${PKG_COUNT}" -gt 0 ]; then
                     print_ok "VM ${VMID} (${VM_NAME}) — ${C_BOLD}${PKG_COUNT} packages updated${C_NC}${local_suffix}"
@@ -3712,8 +3729,13 @@ section_header "Summary"
 TOTAL_UPDATED=$((LXC_UPDATED + VM_UPDATED))
 TOTAL_ERRORS=$((LXC_ERRORS + VM_ERRORS))
 
-echo -e "  ${C_CYAN}LXC:${C_NC}  ${C_GREEN}${LXC_UPDATED} updated${C_NC}, ${LXC_CURRENT} current, ${LXC_STARTED} started+stopped, ${LXC_ERRORS} errors, ${LXC_EXCLUDED} excluded"
-echo -e "  ${C_CYAN}VMs:${C_NC}  ${C_GREEN}${VM_UPDATED} updated${C_NC} (${VM_WIN_UPDATED} Windows), ${VM_CURRENT} current, ${VM_STARTED} started+stopped, ${VM_ERRORS} errors, ${VM_WIN_TIMEOUT} timeouts"
+if [ "${DRY_RUN}" = "true" ]; then
+    echo -e "  ${C_CYAN}LXC:${C_NC}  ${C_YELLOW}${LXC_PENDING} with updates pending${C_NC}, ${LXC_CURRENT} current, ${LXC_ERRORS} errors, ${LXC_EXCLUDED} excluded"
+    echo -e "  ${C_CYAN}VMs:${C_NC}  ${C_YELLOW}${VM_PENDING} with updates pending${C_NC}, ${VM_CURRENT} current, ${VM_ERRORS} errors"
+else
+    echo -e "  ${C_CYAN}LXC:${C_NC}  ${C_GREEN}${LXC_UPDATED} updated${C_NC}, ${LXC_CURRENT} current, ${LXC_STARTED} started+stopped, ${LXC_ERRORS} errors, ${LXC_EXCLUDED} excluded"
+    echo -e "  ${C_CYAN}VMs:${C_NC}  ${C_GREEN}${VM_UPDATED} updated${C_NC} (${VM_WIN_UPDATED} Windows), ${VM_CURRENT} current, ${VM_STARTED} started+stopped, ${VM_ERRORS} errors, ${VM_WIN_TIMEOUT} timeouts"
+fi
 echo -e "  ${C_CYAN}Host:${C_NC} ${C_GREEN}${HOST_PKG_COUNT} packages${C_NC}"
 
 if [ "${SNAPSHOTS_TAKEN}" -gt 0 ]; then

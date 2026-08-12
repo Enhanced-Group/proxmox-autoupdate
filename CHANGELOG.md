@@ -12,6 +12,17 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.4.2 — 2026-08-12
+
+### Fixed
+
+- **A dry run reported guests as "updated".** The dry-run branch incremented the
+  same counter as a real install, so a run that changed nothing finished with
+  "LXC: 8 updated" — the one number someone reads to find out what happened.
+  Dry runs now count separately and the summary says "8 with updates pending",
+  in the console, in notifications, and in the run history the panel shows.
+  Found on the first real dry run against a live host.
+
 ## 4.4.1 — 2026-08-12
 
 ### Fixed
