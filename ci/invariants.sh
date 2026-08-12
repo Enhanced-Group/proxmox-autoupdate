@@ -52,8 +52,13 @@ else
     fi
     # The panel's own list, plus the two the markers' comment implies but which
     # sat outside them until this was written.
+    # Herestrings, not pipes. `producer | grep -q` is a trap under
+    # `set -o pipefail`: grep exits on its first match, the producer takes
+    # SIGPIPE, and the pipeline reports failure even though the match
+    # succeeded. Timing-dependent, so it passed for weeks and then began
+    # failing once this block grew past a few hundred lines.
     for fn in ${REQUIRED} build_text_summary notify_all; do
-        if echo "${SLICE}" | grep -qE "^${fn}\(\)"; then
+        if grep -qE "^${fn}\(\)" <<<"${SLICE}"; then
             ok "${fn}() is inside the notifier block"
         else
             fail "${fn}() is NOT inside the notifier block — the panel's test-notification button will break"
@@ -256,8 +261,8 @@ if GUEST=$(APT_LOCK_TIMEOUT=600 DRY_RUN=false bash -c '
     # Strip comments before looking for bashisms. Scanning the raw text meant
     # prose tripped the check — a comment containing the word "local" failed the
     # build with "contains bashisms" while dash parsed the script perfectly.
-    if printf '%s' "${GUEST}" | sed 's/[[:space:]]*#.*$//' \
-       | grep -qE '\[\[|<<<|\blocal\b|\bdeclare\b'; then
+    if grep -qE '\[\[|<<<|\blocal\b|\bdeclare\b' \
+         <<<"$(sed 's/[[:space:]]*#.*$//' <<<"${GUEST}")"; then
         fail "generated guest script contains bashisms"
     else
         ok "no bashisms in the generated guest script"
@@ -274,7 +279,7 @@ echo "== distro coverage =="
 if [ -n "${GUEST}" ]; then
     COVER_OK=1
     for PM in apt-get dnf yum apk zypper pacman; do
-        if printf '%s' "${GUEST}" | grep -q "command -v ${PM}"; then
+        if grep -q "command -v ${PM}" <<<"${GUEST}"; then
             ok "${PM} branch present"
         else
             fail "${PM} is advertised but has no branch in the guest script"
@@ -283,7 +288,7 @@ if [ -n "${GUEST}" ]; then
     done
     [ "${COVER_OK}" -eq 1 ] && ok "all six package managers handled"
     # A runtime present but unmanaged must be reported, not silently ignored.
-    if printf '%s' "${GUEST}" | grep -q '__CONTAINERS__'; then
+    if grep -q '__CONTAINERS__' <<<"${GUEST}"; then
         ok "container runtimes are detected and reported"
     else
         fail "guest script no longer reports container runtimes"

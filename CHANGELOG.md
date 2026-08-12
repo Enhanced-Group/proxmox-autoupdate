@@ -12,6 +12,20 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.1 — 2026-08-12
+
+### Fixed
+
+- **CI failed at random.** `ci/invariants.sh` runs under `set -o pipefail` and
+  tested for things with `producer | grep -q`. `grep -q` exits on its first
+  match, the producer takes SIGPIPE, and the pipeline reports failure — so a
+  *successful* match was reported as a failed check. It is timing-dependent, so
+  it passed for weeks and then began failing once the notifier block grew past
+  a few hundred lines, claiming `notify_email()` had left that block when it
+  had not. Four checks were affected, including two added the same day.
+  Replaced with herestrings, which have no pipe to break: measured 20/20 false
+  failures before, 0/20 after.
+
 ## 4.5.0 — 2026-08-12
 
 ### Added
