@@ -12,6 +12,30 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.4.0 — 2026-08-12
+
+### Fixed
+
+- **Most of the installer's output was invisible.** Every explanatory line used
+  the ANSI *faint* attribute (`[2m`), which xterm.js — what the Proxmox web
+  shell is built on — renders at very low contrast on a dark background. In the
+  terminal most people install from, roughly a third of the installer simply
+  did not appear. It now uses bright black, a real colour that stays legible on
+  both dark and light themes.
+
+- **Colour is only emitted to a terminal.** Piping the installer to a file or
+  running it from Ansible produced a wall of raw escape sequences. `NO_COLOR`
+  is honoured.
+
+### Added
+
+- **Progress in the installer.** It downloads several files, may install
+  packages, patches the Proxmox UI and restarts a service, and did all of it in
+  silence — on a slow link it was indistinguishable from a hang. Steps are now
+  numbered, long operations run behind a spinner, and a failed step prints the
+  last few lines of what actually went wrong instead of only lacking a tick.
+  Without a terminal the spinner degrades to a plain line.
+
 ## 4.3.1 — 2026-08-11
 
 ### Changed

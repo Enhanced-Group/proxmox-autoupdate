@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v4.3.1"
+PAU_FALLBACK_REF="v4.4.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -76,16 +76,101 @@ UI_SERVICE="/etc/systemd/system/pve-autoupdate-ui.service"
 UI_APT_HOOK="/etc/apt/apt.conf.d/99-proxmox-autoupdate-webui"
 PVE_JS="/usr/share/pve-manager/js/pvemanagerlib.js"
 
-# --- ANSI Colors ---
-C_RED='\033[0;31m'
-C_GREEN='\033[0;32m'
-C_YELLOW='\033[0;33m'
-C_CYAN='\033[0;36m'
-C_BOLD='\033[1m'
-C_DIM='\033[2m'
-C_NC='\033[0m'
+# --- Output ------------------------------------------------------------------
+#
+# Colour only when stdout is a terminal that can render it. Piping the installer
+# into a file, or running it from Ansible, previously produced a wall of raw
+# escape sequences.
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED='\033[0;31m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_CYAN='\033[0;36m'
+    C_BOLD='\033[1m'
+    # Bright black, not the "faint" attribute.
+    #
+    # This was \033[2m, and it is the main reason the installer looked
+    # half-empty: xterm.js — which is what the Proxmox web shell uses — renders
+    # faint text at very low contrast on a dark background, so every
+    # explanatory line in this script was effectively invisible in the terminal
+    # most people run it from. Bright black is a real colour and stays legible
+    # on both dark and light themes.
+    C_DIM='\033[90m'
+    C_NC='\033[0m'
+    HAS_TTY_OUT=true
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_DIM='' C_NC=''
+    HAS_TTY_OUT=false
+fi
 
 print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
+
+# --- Progress ----------------------------------------------------------------
+#
+# The installer downloads several files, can install packages, patches the
+# Proxmox UI and restarts a service — and did all of it in silence. On a slow
+# link the whole thing looked hung, and there was no way to tell how far
+# through it was. Steps are numbered, and anything that can take more than a
+# moment runs behind a spinner that degrades to a plain line without a
+# terminal.
+STEP_TOTAL=9
+STEP_NOW=0
+_SPIN_PID=""
+
+step() {
+    STEP_NOW=$((STEP_NOW + 1))
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}[${STEP_NOW}/${STEP_TOTAL}]${C_NC} ${C_BOLD}$1${C_NC}"
+}
+
+spin_start() {
+    local msg="$1"
+    if [ "${HAS_TTY_OUT}" != true ]; then
+        echo -e "  ${C_CYAN}▶${C_NC} ${msg}"
+        return 0
+    fi
+    (
+        trap 'exit 0' TERM
+        local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+        while :; do
+            printf "\r  \033[0;36m%s\033[0m %s" "${frames:$i:1}" "${msg}"
+            i=$(( (i + 1) % ${#frames} ))
+            sleep 0.08
+        done
+    ) 2>/dev/null &
+    _SPIN_PID=$!
+}
+
+spin_stop() {
+    [ -n "${_SPIN_PID}" ] || return 0
+    kill "${_SPIN_PID}" 2>/dev/null || true
+    wait "${_SPIN_PID}" 2>/dev/null || true
+    _SPIN_PID=""
+    [ "${HAS_TTY_OUT}" = true ] && printf "\r\033[K"
+    return 0
+}
+
+# Run a command behind a spinner and report the outcome. Returns the command's
+# own status, so a caller can still decide what a failure means; on failure the
+# last few lines of its output are shown, which is what was missing when these
+# ran silently and only their absence of a tick told you anything.
+run_step() {
+    local msg="$1"; shift
+    spin_start "${msg}"
+    local out rc=0
+    out=$("$@" 2>&1) || rc=$?
+    spin_stop
+    if [ "${rc}" -eq 0 ]; then
+        print_ok "${msg}"
+    else
+        print_fail "${msg} ${C_DIM}(exit ${rc})${C_NC}"
+        [ -n "${out}" ] && echo "${out}" | tail -n 4 | sed "s/^/      ${C_DIM}/;s/\$/${C_NC}/"
+    fi
+    return "${rc}"
+}
+
+# Never leave a spinner spinning if the script aborts.
+trap 'spin_stop' EXIT INT TERM
 
 # Say where the report actually went, rather than pointing at an email address
 # that may be empty and a channel that may not be configured. This used to
@@ -312,7 +397,7 @@ fi
 #   python3 — builds webhook payloads and merges run history, and runs the web
 #             control panel.
 echo ""
-print_action "Checking dependencies..."
+step "Checking dependencies"
 for DEP in jq python3; do
     if command -v "${DEP}" >/dev/null 2>&1; then
         print_ok "${DEP} present"
@@ -745,7 +830,8 @@ print_ok "Scheduled reboot time: ${REBOOT_TIME}"
 echo ""
 echo -e "${C_BOLD}── Deploying ───────────────────────────────────────────────${C_NC}"
 echo ""
-print_action "Saving configuration to ${C_DIM}${CONFIG_FILE}${C_NC}..."
+step "Saving configuration"
+print_action "Writing ${C_DIM}${CONFIG_FILE}${C_NC}"
 # Create the file with restrictive permissions *before* writing credentials into
 # it. Writing first and chmod'ing afterwards left the Mailgun key, Discord bot
 # token and webhook URLs world-readable for the duration.
@@ -898,14 +984,18 @@ verify_script() {
 }
 
 # 4. Fetch the update script
-print_action "Fetching update script (${PAU_RESOLVED_REF})..."
+step "Installing the update script"
 STAGED_MAIN="$(mktemp)"
 if [ "${LOCAL_SOURCE_OK}" = true ] && [ -f "update-everything.sh" ]; then
     cp -f update-everything.sh "${STAGED_MAIN}"
     MAIN_SOURCE="local file"
-elif curl -fsSL --retry 3 --retry-delay 2 -m 120 "${GITHUB_RAW_URL}" -o "${STAGED_MAIN}"; then
+elif spin_start "Downloading from GitHub (${PAU_RESOLVED_REF})" \
+     && curl -fsSL --retry 3 --retry-delay 2 -m 120 "${GITHUB_RAW_URL}" -o "${STAGED_MAIN}" \
+     && spin_stop; then
     MAIN_SOURCE="GitHub (${PAU_RESOLVED_REF})"
+    print_ok "Downloaded from GitHub ${C_DIM}(${PAU_RESOLVED_REF})${C_NC}"
 else
+    spin_stop
     rm -f "${STAGED_MAIN}"
     print_fail "Could not download update-everything.sh from ${GITHUB_RAW_URL}"
     print_fail "Check network access to raw.githubusercontent.com and try again."
@@ -936,6 +1026,7 @@ if fetch_asset "uninstall.sh" "/usr/local/bin/pve-autoupdate-uninstall"; then
 fi
 
 # 5. Create log directory
+step "Preparing the log directory"
 mkdir -p "${LOG_DIR}"
 print_ok "Log directory: ${C_DIM}${LOG_DIR}/${C_NC}"
 
@@ -943,7 +1034,7 @@ print_ok "Log directory: ${C_DIM}${LOG_DIR}/${C_NC}"
 WEBUI_SKIP_ALL=false
 
 if [ "${ENABLE_WEB_UI}" = "true" ]; then
-    print_action "Installing web control panel..."
+    step "Installing the web control panel"
 
     if ! command -v python3 >/dev/null 2>&1; then
         print_fail "python3 not found — required by the control panel."
@@ -1129,7 +1220,7 @@ else
 fi
 
 # 6. Idempotent Cron Configuration
-print_action "Configuring cron schedule..."
+step "Configuring the schedule"
 CRON_MARKER="# proxmox-autoupdate"
 CRON_JOB="${UPDATE_SCHEDULE_CRON} ${TARGET_PATH} >> ${LOG_DIR}/cron.log 2>&1"
 
