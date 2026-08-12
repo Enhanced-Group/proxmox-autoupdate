@@ -1016,18 +1016,28 @@ def latest_release_ref():
     with _release_lock:
         if _release_cache["ref"] and now - _release_cache["at"] < 300:
             return _release_cache["ref"]
-    ref = _github_json_tag(LATEST_RELEASE_API, lambda d: d.get("tag_name"))
-    if not ref:
-        # No published Release. A plain git tag is still a perfectly good
-        # release marker, and requiring the maintainer to also click "publish
-        # release" on GitHub is a footgun: without this fallback, tagging but
-        # not publishing leaves every installation reporting that it cannot
-        # determine the latest version.
-        #
-        # Pick the highest version rather than the first tag returned. GitHub
-        # does not promise this endpoint is ordered newest-first, and trusting
-        # the order could resolve to an older tag and install *backwards*.
-        ref = _github_json_tag(TAGS_API, _highest_version_tag)
+    # Take whichever is *newer* of the latest published Release and the highest
+    # git tag — not the Release with the tags as a mere fallback.
+    #
+    # GitHub's /releases/latest only knows about published Release objects. A
+    # maintainer who tags and pushes without also clicking "publish release"
+    # leaves it pointing at an older version, and every installation then sits
+    # on "up to date" forever while newer tags exist. That is not hypothetical:
+    # it happened here between v4.4.0 and v4.5.3, six tags with no Release, and
+    # every panel reported 4.4.0 as current.
+    #
+    # Tags are compared by version, never by the order GitHub returns them,
+    # so this cannot resolve backwards.
+    release_ref = _github_json_tag(LATEST_RELEASE_API, lambda d: d.get("tag_name"))
+    tag_ref = _github_json_tag(TAGS_API, _highest_version_tag)
+
+    ref = release_ref or tag_ref
+    if release_ref and tag_ref and release_ref != tag_ref:
+        try:
+            if _version_tuple(tag_ref.lstrip("v")) > _version_tuple(release_ref.lstrip("v")):
+                ref = tag_ref
+        except (TypeError, ValueError):
+            pass          # unparseable version: keep the published Release
     if ref:
         with _release_lock:
             _release_cache["ref"] = ref

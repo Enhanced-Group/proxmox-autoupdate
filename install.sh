@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v4.5.3"
+PAU_FALLBACK_REF="v4.5.4"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -44,19 +44,26 @@ resolve_ref() {
     local tag=""
     tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
           | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    # Fall back to git tags when no Release has been published — a tag on its
-    # own is a perfectly good release marker, and requiring the extra "publish
-    # release" step would otherwise break every install.
+    # Take whichever is newer of the published Release and the highest git tag.
     #
-    # Pick the highest version rather than the first one returned: GitHub does
-    # not promise the tags endpoint is ordered newest-first, and trusting the
-    # order here could resolve to an older tag and quietly install *backwards*.
+    # /releases/latest only knows about published Release objects, so tagging
+    # without also publishing leaves it pointing at an older version and every
+    # install silently gets that instead of the newest. Comparing the two, and
+    # comparing tags by version rather than by the order GitHub returns them,
+    # means neither a missing Release nor an odd ordering can install backwards.
+    local newest_tag=""
+    newest_tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/tags?per_page=100" 2>/dev/null \
+          | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+          | sed -n 's/.*"\([^"]*\)"$/\1/p' \
+          | grep -E '^v?[0-9]+(\.[0-9]+)*$' \
+          | sort -V | tail -1)
     if [ -z "${tag}" ]; then
-        tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/tags?per_page=100" 2>/dev/null \
-              | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
-              | sed -n 's/.*"\([^"]*\)"$/\1/p' \
-              | grep -E '^v?[0-9]+(\.[0-9]+)*$' \
-              | sort -V | tail -1)
+        tag="${newest_tag}"
+    elif [ -n "${newest_tag}" ] && [ "${tag}" != "${newest_tag}" ]; then
+        # sort -V puts the higher version last; if that is the tag, prefer it.
+        if [ "$(printf '%s\n%s\n' "${tag}" "${newest_tag}" | sort -V | tail -1)" = "${newest_tag}" ]; then
+            tag="${newest_tag}"
+        fi
     fi
     if echo "${tag}" | grep -qE '^[A-Za-z0-9._/-]{1,64}$'; then
         echo "${tag}"

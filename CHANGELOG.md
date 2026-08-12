@@ -12,6 +12,24 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.4 — 2026-08-12
+
+### Fixed
+
+- **Update checks could sit on an old version indefinitely.** The panel and the
+  installer asked GitHub for `/releases/latest`, which only knows about
+  *published Release objects*, and fell back to git tags only when that
+  returned nothing at all. So a maintainer who tags and pushes without also
+  publishing a Release leaves every installation reporting "up to date" against
+  a version that is not the newest — which is exactly what happened here
+  between v4.4.0 and v4.5.3: six tags, no Releases, and every panel reporting
+  4.4.0 as current.
+
+  Both now take whichever is *newer* of the published Release and the highest
+  git tag, comparing by version rather than by the order GitHub returns things.
+  A missing Release, a deleted tag, or an odd ordering can no longer make an
+  update check resolve backwards or stall.
+
 ## 4.5.3 — 2026-08-12
 
 ### Changed
