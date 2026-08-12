@@ -172,6 +172,40 @@ run_step() {
 # Never leave a spinner spinning if the script aborts.
 trap 'spin_stop' EXIT INT TERM
 
+# Prompt for a value that must not end up empty, falling back to whatever is
+# already configured.
+#
+# Bounded deliberately. The previous `while [ -z "$X" ]; do read ...; done`
+# loops relied entirely on a human eventually typing something: with fd 3 on
+# /dev/null every read returns instantly and empty, so anything that reached
+# them without a terminal would spin forever printing an error. They are not
+# currently reachable that way — an empty channel selection short-circuits
+# earlier — but that is one edit away from being untrue, and a hung installer
+# is a miserable failure mode.
+ask_required() {
+    local var="$1" label="$2" prev="$3" attempts=0 answer=""
+    while [ "${attempts}" -lt 5 ]; do
+        attempts=$((attempts + 1))
+        if [ -n "${prev}" ]; then
+            read -rp "  ${label} [Enter to keep existing]: " answer <&3 || true
+        else
+            read -rp "  ${label}: " answer <&3 || true
+        fi
+        answer="${answer:-${prev}}"
+        if [ -n "${answer}" ]; then
+            printf -v "${var}" '%s' "${answer}"
+            return 0
+        fi
+        if [ "${HAVE_TTY}" != true ]; then
+            print_fail "${label} is required and there is no terminal to ask on."
+            return 1
+        fi
+        print_fail "${label} is required."
+    done
+    print_fail "No value given for ${label} after ${attempts} attempts — giving up."
+    return 1
+}
+
 # Say where the report actually went, rather than pointing at an email address
 # that may be empty and a channel that may not be configured. This used to
 # unconditionally print "Check  for the report email" even when the user had
@@ -332,6 +366,11 @@ PREV_WEBUI=""
 PREV_WEBUI_PORT=""
 PREV_DRY_RUN=""
 PREV_LOG_DIR=""
+PREV_TRANSPORT=""
+PREV_SMTP_HOST=""
+PREV_SMTP_PORT=""
+PREV_SMTP_USER=""
+PREV_SMTP_PASSWORD=""
 PREV_NOTIFY_METHODS=""
 PREV_FAIL_ONLY=""
 PREV_DISCORD=""
@@ -384,6 +423,11 @@ if [ -f "${CONFIG_FILE}" ]; then
     # directory while the script logged to the default one.
     PREV_DRY_RUN="${DRY_RUN:-}"
     PREV_LOG_DIR="${LOG_DIR:-}"
+    PREV_TRANSPORT="${EMAIL_TRANSPORT:-}"
+    PREV_SMTP_HOST="${SMTP_HOST:-}"
+    PREV_SMTP_PORT="${SMTP_PORT:-}"
+    PREV_SMTP_USER="${SMTP_USER:-}"
+    PREV_SMTP_PASSWORD="${SMTP_PASSWORD:-}"
 
     # Installs predating NOTIFY_METHODS had Mailgun and nothing else.
     if [ -z "${PREV_NOTIFY_METHODS}" ] && [ -n "${MAILGUN_API_KEY:-}" ]; then
@@ -444,6 +488,12 @@ read -rp "  Select [Enter to keep current]: " INPUT_METHODS <&3 || true
 MAILGUN_API_KEY="${PREV_KEY}"
 MAILGUN_DOMAIN="${PREV_DOMAIN}"
 MAILGUN_REGION="${PREV_REGION:-EU}"
+EMAIL_TRANSPORT="${PREV_TRANSPORT}"
+SMTP_HOST="${PREV_SMTP_HOST}"
+SMTP_PORT="${PREV_SMTP_PORT:-587}"
+SMTP_USER="${PREV_SMTP_USER}"
+SMTP_PASSWORD="${PREV_SMTP_PASSWORD}"
+SMTP_SECURITY="starttls"
 SENDER_EMAIL="${PREV_SENDER}"
 RECIPIENT_EMAIL="${PREV_RECIPIENT}"
 DISCORD_WEBHOOK_URL="${PREV_DISCORD}"
@@ -474,34 +524,49 @@ else
     # --- Per-channel details, asked only for the channels chosen ---
     if echo ",${NOTIFY_METHODS}," | grep -q ",email,"; then
         echo ""
-        echo -e "  ${C_BOLD}Mailgun${C_NC}"
-        while [ -z "${MAILGUN_API_KEY}" ]; do
-            if [ -n "${PREV_KEY}" ]; then
-                read -rp "  API key [Enter to keep existing]: " I <&3 || true
-            else
-                read -rp "  API key: " I <&3 || true
+        echo -e "  ${C_BOLD}Email${C_NC}"
+        # SMTP was added to the updater and the panel in 4.2.0 but never to the
+        # installer, which still assumed email meant Mailgun. A fresh install
+        # was therefore forced through Mailgun prompts it could not skip, even
+        # for someone who only wanted to use their own mail server.
+        echo -e "  ${C_DIM}1) SMTP server — any mail server, relay or app password${C_NC}"
+        echo -e "  ${C_DIM}2) Mailgun API${C_NC}"
+        DEFAULT_TRANSPORT="1"
+        [ "${PREV_TRANSPORT}" = "mailgun" ] && DEFAULT_TRANSPORT="2"
+        [ -z "${PREV_TRANSPORT}" ] && [ -n "${PREV_KEY}" ] && DEFAULT_TRANSPORT="2"
+        read -rp "  Send via [${DEFAULT_TRANSPORT}]: " I <&3 || true
+        case "${I:-${DEFAULT_TRANSPORT}}" in
+            2) EMAIL_TRANSPORT="mailgun" ;;
+            *) EMAIL_TRANSPORT="smtp" ;;
+        esac
+
+        if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
+            ask_required MAILGUN_API_KEY "API key" "${PREV_KEY}"
+            ask_required MAILGUN_DOMAIN "Domain (e.g. mg.example.com)" "${PREV_DOMAIN}"
+            read -rp "  Region — 1 for EU, 2 for US [${MAILGUN_REGION}]: " I <&3 || true
+            case "${I}" in 1) MAILGUN_REGION="EU" ;; 2) MAILGUN_REGION="US" ;; esac
+        else
+            ask_required SMTP_HOST "SMTP host (e.g. smtp.example.com)" "${PREV_SMTP_HOST}"
+            read -rp "  Port [${PREV_SMTP_PORT:-587}]: " I <&3 || true
+            SMTP_PORT="${I:-${PREV_SMTP_PORT:-587}}"
+            echo -e "  ${C_DIM}1) STARTTLS (587)   2) SSL/TLS (465)   3) none — local relay${C_NC}"
+            read -rp "  Encryption [1]: " I <&3 || true
+            case "${I:-1}" in 2) SMTP_SECURITY="ssl" ;; 3) SMTP_SECURITY="none" ;; *) SMTP_SECURITY="starttls" ;; esac
+            read -rp "  Username [${PREV_SMTP_USER}] (blank for none): " I <&3 || true
+            SMTP_USER="${I:-${PREV_SMTP_USER}}"
+            if [ -n "${SMTP_USER}" ]; then
+                read -rsp "  Password [Enter to keep existing]: " I <&3 || true; echo ""
+                SMTP_PASSWORD="${I:-${PREV_SMTP_PASSWORD}}"
             fi
-            MAILGUN_API_KEY="${I:-${PREV_KEY}}"
-            [ -z "${MAILGUN_API_KEY}" ] && print_fail "Required for email."
-        done
-        while [ -z "${MAILGUN_DOMAIN}" ]; do
-            read -rp "  Domain (e.g. mg.example.com) [${PREV_DOMAIN}]: " I <&3 || true
-            MAILGUN_DOMAIN="${I:-${PREV_DOMAIN}}"
-            [ -z "${MAILGUN_DOMAIN}" ] && print_fail "Required for email."
-        done
-        read -rp "  Region — 1 for EU, 2 for US [${MAILGUN_REGION}]: " I <&3 || true
-        case "${I}" in 1) MAILGUN_REGION="EU" ;; 2) MAILGUN_REGION="US" ;; esac
-        while [ -z "${SENDER_EMAIL}" ]; do
-            read -rp "  Sender address [${PREV_SENDER}]: " I <&3 || true
-            SENDER_EMAIL="${I:-${PREV_SENDER}}"
-            [ -z "${SENDER_EMAIL}" ] && print_fail "Required for email."
-        done
-        while [ -z "${RECIPIENT_EMAIL}" ]; do
-            read -rp "  Recipient address [${PREV_RECIPIENT}]: " I <&3 || true
-            RECIPIENT_EMAIL="${I:-${PREV_RECIPIENT}}"
-            [ -z "${RECIPIENT_EMAIL}" ] && print_fail "Required for email."
-        done
-        print_ok "Email configured (${MAILGUN_REGION} → ${RECIPIENT_EMAIL})"
+        fi
+
+        ask_required SENDER_EMAIL "From address" "${PREV_SENDER}"
+        ask_required RECIPIENT_EMAIL "To address" "${PREV_RECIPIENT}"
+        if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
+            print_ok "Email via Mailgun (${MAILGUN_REGION} → ${RECIPIENT_EMAIL})"
+        else
+            print_ok "Email via SMTP (${SMTP_HOST}:${SMTP_PORT} → ${RECIPIENT_EMAIL})"
+        fi
     fi
 
     if echo ",${NOTIFY_METHODS}," | grep -q ",discord,"; then
@@ -594,11 +659,21 @@ echo ""
 # --- Exclude IDs ---
 EXCLUDE_IDS=""
 if [ -n "${PREV_EXCLUDE}" ]; then
-    read -rp "  Exclude VM/CT IDs from updates [Enter for ${PREV_EXCLUDE}]: " INPUT_EXCLUDE <&3 || true
+    read -rp "  Exclude VM/CT IDs [Enter keeps ${PREV_EXCLUDE}, 'none' clears]: " INPUT_EXCLUDE <&3 || true
 else
     read -rp "  Exclude VM/CT IDs (comma-separated, or blank for none): " INPUT_EXCLUDE <&3 || true
 fi
-EXCLUDE_IDS="${INPUT_EXCLUDE:-${PREV_EXCLUDE}}"
+# `:-` treats an empty answer as "unset", so pressing Enter to clear the list
+# silently reinstated the previous one and there was no way to empty it from
+# the installer at all. `-` distinguishes "not answered" from "answered with
+# nothing", and the sentinel gives an explicit way to say none.
+if [ -z "${INPUT_EXCLUDE+set}" ]; then
+    EXCLUDE_IDS="${PREV_EXCLUDE}"
+elif [ "${INPUT_EXCLUDE}" = "none" ] || [ "${INPUT_EXCLUDE}" = "-" ]; then
+    EXCLUDE_IDS=""
+else
+    EXCLUDE_IDS="${INPUT_EXCLUDE:-${PREV_EXCLUDE}}"
+fi
 if [ -n "${EXCLUDE_IDS}" ]; then
     print_ok "Excluding: ${EXCLUDE_IDS}"
 else
@@ -1253,7 +1328,7 @@ fi
 # which can never match cron.log: the name matches, but the file is appended to
 # on every run so its mtime is always current. Without this it grows forever.
 cat > /etc/logrotate.d/proxmox-autoupdate <<LOGROTATE
-${LOG_DIR}/cron.log {
+"${LOG_DIR}"/cron.log {
     weekly
     rotate 8
     missingok

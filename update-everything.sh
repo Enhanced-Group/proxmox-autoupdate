@@ -1369,7 +1369,10 @@ export UCF_FORCE_CONFOLD=1
 
 APT_OPTS="-o DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT} -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 DRY_RUN="${DRY_RUN}"
-WORK_LOG=\$(mktemp 2>/dev/null || echo /tmp/.pau_log)
+# A fixed fallback path is a hazard in a container: any local user can
+# pre-create it, and this runs as root. $$ makes it unpredictable, and the
+# umask keeps it private if mktemp is genuinely missing.
+WORK_LOG=\$(mktemp 2>/dev/null || { umask 077; echo "/tmp/.pau_log.\$\$"; })
 
 emit_log() { tail -n 20 "\${WORK_LOG}" 2>/dev/null | sed 's/^/__LOG__ /' || true; }
 
@@ -2669,7 +2672,9 @@ ${ps_script}"
 
     # Encode for PowerShell -EncodedCommand (UTF-16LE base64)
     local encoded_cmd=""
-    encoded_cmd=$(echo "${ps_script}" | iconv -t UTF-16LE 2>/dev/null | base64 -w 0 2>/dev/null) || {
+    # printf, not echo: echo appends a newline that becomes part of the
+    # base64 payload PowerShell decodes.
+    encoded_cmd=$(printf '%s' "${ps_script}" | iconv -t UTF-16LE 2>/dev/null | base64 -w 0 2>/dev/null) || {
         echo "ENCODE_FAILED"
         return
     }

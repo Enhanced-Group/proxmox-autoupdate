@@ -253,7 +253,11 @@ if GUEST=$(APT_LOCK_TIMEOUT=600 DRY_RUN=false bash -c '
     else
         fail "generated guest script is NOT valid POSIX sh — Alpine and Debian guests will fail"
     fi
-    if printf '%s' "${GUEST}" | grep -qE '\[\[|<<<|\blocal\b|\bdeclare\b'; then
+    # Strip comments before looking for bashisms. Scanning the raw text meant
+    # prose tripped the check — a comment containing the word "local" failed the
+    # build with "contains bashisms" while dash parsed the script perfectly.
+    if printf '%s' "${GUEST}" | sed 's/[[:space:]]*#.*$//' \
+       | grep -qE '\[\[|<<<|\blocal\b|\bdeclare\b'; then
         fail "generated guest script contains bashisms"
     else
         ok "no bashisms in the generated guest script"
