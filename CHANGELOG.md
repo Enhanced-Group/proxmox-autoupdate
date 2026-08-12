@@ -12,6 +12,17 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.6 — 2026-08-12
+
+### Fixed
+
+- **Two "reload now" prompts after a self-update.** The panel offered a reload,
+  and so did the toolbar patch running in the Proxmox page — two dialogs for
+  one event, on the normal path where the panel is opened from the toolbar
+  button. The panel now stays quiet when it is embedded, since reloading the
+  parent page reloads the frame with it; opened standalone in its own tab there
+  is no toolbar, so it still offers the reload itself.
+
 ## 4.5.5 — 2026-08-12
 
 ### Fixed

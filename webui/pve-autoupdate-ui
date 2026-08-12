@@ -3775,6 +3775,11 @@ let maintPoll = null;
    previous version's JavaScript — but it is a normal end-of-update step, not a
    warning, so it reads as one. */
 async function offerReload(version) {
+  // Embedded in the Proxmox UI, the toolbar patch already offers this — and
+  // reloading the parent page reloads this frame with it, so prompting here
+  // too produced two dialogs for one event. Standalone in its own tab there is
+  // no toolbar, so this is the only offer and must still happen.
+  if (window.self !== window.top) { return; }
   const go = await dialog({
     title: "Updated to " + version,
     okText: "Reload now",
