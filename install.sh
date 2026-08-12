@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v4.5.4"
+PAU_FALLBACK_REF="v4.5.5"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 

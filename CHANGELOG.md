@@ -12,6 +12,17 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.5 — 2026-08-12
+
+### Fixed
+
+- **"Check for updates" answered from a five-minute-old cache.** The resolved
+  release reference is cached for 300 seconds to keep background status polls
+  off the GitHub API, but the button shared that cache — so pressing it minutes
+  after a new version was published still reported "up to date", and pressing
+  it again changed nothing. An explicit check now bypasses the cache and
+  refreshes it; background polls still use it.
+
 ## 4.5.4 — 2026-08-12
 
 ### Fixed

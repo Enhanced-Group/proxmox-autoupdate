@@ -1008,14 +1008,20 @@ _release_cache = {"ref": None, "at": 0.0}
 _release_lock = threading.Lock()
 
 
-def latest_release_ref():
+def latest_release_ref(force=False):
     """The newest published release tag, or None if it cannot be determined."""
     if UPDATE_CHANNEL == "main":
         return "main"
     now = time.monotonic()
-    with _release_lock:
-        if _release_cache["ref"] and now - _release_cache["at"] < 300:
-            return _release_cache["ref"]
+    # A person clicking "Check for updates" is asking a question now, and must
+    # not be answered from a five-minute-old cache — that is how a panel ends up
+    # insisting it is current minutes after a new version goes out. The cache
+    # exists to keep background status polls off the GitHub API, not to make an
+    # explicit check lie.
+    if not force:
+        with _release_lock:
+            if _release_cache["ref"] and now - _release_cache["at"] < 300:
+                return _release_cache["ref"]
     # Take whichever is *newer* of the latest published Release and the highest
     # git tag — not the Release with the tags as a mere fallback.
     #
@@ -1169,7 +1175,7 @@ def fetch_changelog():
             return "", "Could not reach GitHub: %s" % exc
 
 
-def check_for_updates():
+def check_for_updates(force=False):
     """Read-only version check against the published update script.
 
     Deliberately only *reports*. Applying is a separate, explicitly confirmed
@@ -1177,7 +1183,7 @@ def check_for_updates():
     silently onto a node that merely looked.
     """
     current = installed_version()
-    ref = latest_release_ref()
+    ref = latest_release_ref(force=force)
     if not ref:
         return {"current": current, "latest": None,
                 "error": "Could not determine the latest release from GitHub. "
@@ -2043,7 +2049,8 @@ class Handler(BaseHTTPRequestHandler):
             removed = purge_logs()
             self._json(200, {"removed": removed})
         elif path == "/api/self/check":
-            self._json(200, check_for_updates())
+            # An explicit check bypasses the cache; the background poll does not.
+            self._json(200, check_for_updates(force=True))
         elif path == "/api/self/doctor":
             self._json(200, run_doctor())
         elif path == "/api/subscription-notice":
