@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.4.0"
+PAU_VERSION="4.4.1"
 
 set -u
 set -o pipefail
@@ -442,18 +442,58 @@ run_doctor() {
     fi
 
     _d_head "Guests"
+    # Report on containers as well as VMs, and always say something.
+    #
+    # This previously only emitted a line per *running* VM, so on a host whose
+    # VMs were all stopped the section produced nothing at all — and the panel,
+    # which drops empty sections, showed no Guests heading whatsoever. "Nothing
+    # to check" and "the check did not run" looked identical. Containers were
+    # not mentioned at all, which on a typical host is most of the fleet.
+    local ct_run=0 ct_stop=0 ct_tmpl=0
+    if pct list >/dev/null 2>&1; then
+        local cid cstate
+        while read -r cid cstate _; do
+            [ -z "${cid}" ] && continue
+            case "${cstate}" in
+                running) ct_run=$((ct_run + 1)) ;;
+                *)       ct_stop=$((ct_stop + 1)) ;;
+            esac
+            [ "$(config_field pct "${cid}" template)" = "1" ] && ct_tmpl=$((ct_tmpl + 1))
+        done < <(pct list 2>/dev/null | awk 'NR>1 {print $1, $2}')
+        _d_ok "containers: ${ct_run} running, ${ct_stop} stopped${ct_tmpl:+, ${ct_tmpl} template(s) skipped}"
+        if [ "${ct_stop}" -gt 0 ] && [ "$(cfg_read START_STOPPED_LXC)" = "false" ]; then
+            _d_warn "  ${ct_stop} stopped container(s) will be skipped (START_STOPPED_LXC=false)"
+        fi
+    fi
+
+    local vm_run=0 vm_stop=0 vm_agent_ok=0 vm_agent_bad=0
     if qm list >/dev/null 2>&1; then
         local vid vstate vname
         while read -r vid vname vstate _; do
             [ -z "${vid}" ] && continue
             if [ "${vstate}" = "running" ]; then
+                vm_run=$((vm_run + 1))
                 if qm agent "${vid}" ping >/dev/null 2>&1; then
-                    _d_ok "VM ${vid} (${vname}): guest agent responding"
+                    vm_agent_ok=$((vm_agent_ok + 1))
                 else
+                    vm_agent_bad=$((vm_agent_bad + 1))
                     _d_warn "VM ${vid} (${vname}): running but the guest agent is not responding — it cannot be updated"
                 fi
+            else
+                vm_stop=$((vm_stop + 1))
             fi
         done < <(qm list 2>/dev/null | awk 'NR>1 {print $1, $2, $3}')
+        _d_ok "VMs: ${vm_run} running, ${vm_stop} stopped"
+        if [ "${vm_run}" -gt 0 ]; then
+            if [ "${vm_agent_bad}" -eq 0 ]; then
+                _d_ok "  all ${vm_agent_ok} running VM(s) have a responding guest agent"
+            fi
+        else
+            _d_ok "  no running VMs, so no guest agents to check"
+        fi
+        if [ "${vm_stop}" -gt 0 ] && [ "$(cfg_read START_STOPPED_LINUX_VMS)" = "false" ]; then
+            _d_warn "  ${vm_stop} stopped VM(s) will be skipped (START_STOPPED_LINUX_VMS=false)"
+        fi
     fi
 
     echo ""

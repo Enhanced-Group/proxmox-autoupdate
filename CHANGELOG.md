@@ -12,6 +12,22 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.4.1 — 2026-08-12
+
+### Fixed
+
+- **The self-check said nothing about containers, and nothing at all when no VM
+  was running.** Its Guests section only emitted a line per *running VM*, so on
+  a host whose VMs are all stopped it produced no output — and because the
+  panel drops empty sections, the Guests heading vanished entirely. "Nothing to
+  check" and "the check did not run" looked identical.
+
+  It now reports running and stopped counts for both containers and VMs, always
+  says something, and warns when stopped guests will be skipped because
+  `START_STOPPED_LXC` or `START_STOPPED_LINUX_VMS` is false. Found by running
+  `--doctor` on a real host with 15 containers and 5 stopped VMs, where it
+  reported on none of them.
+
 ## 4.4.0 — 2026-08-12
 
 ### Fixed
