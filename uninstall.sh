@@ -29,8 +29,16 @@ BEGIN_MARKER="/* ==== BEGIN proxmox-autoupdate button ==== */"
 END_MARKER="/* ==== END proxmox-autoupdate button ==== */"
 SENTINEL="PVE.StdWorkspace"
 
-C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
-C_CYAN='\033[0;36m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_NC='\033[0m'
+# Colour only when stdout is a terminal that can show it, and bright black
+# rather than the faint attribute — xterm.js, which the Proxmox web shell is
+# built on, renders faint text at very low contrast on a dark background, so
+# the "will keep" detail lines were near-invisible exactly where they matter.
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
+    C_CYAN='\033[0;36m'; C_BOLD='\033[1m'; C_DIM='\033[90m'; C_NC='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_DIM='' C_NC=''
+fi
 
 print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
 print_fail()   { echo -e "  ${C_RED}✗${C_NC} $1"; }
@@ -96,13 +104,21 @@ echo -e "  ${TARGET_PATH}"
 echo -e "  the cron entry"
 echo -e "  the web control panel (service, patcher, apt hook)"
 echo -e "  the Auto-Update button and tabs from the Proxmox UI"
+echo -e "  the uninstaller itself"
+if [ "${PURGE}" = true ]; then
+    echo -e "  ${C_YELLOW}${CONFIG_FILE}${C_NC} ${C_DIM}(your credentials and settings)${C_NC}"
+    echo -e "  ${C_YELLOW}${LOG_DIR}/${C_NC} ${C_DIM}(every past update report)${C_NC}"
+    echo -e "  ${C_YELLOW}${STATE_DIR}/${C_NC} ${C_DIM}(run history)${C_NC}"
+fi
 echo ""
 echo -e "${C_BOLD}── Will keep ───────────────────────────────────────────────${C_NC}"
 echo ""
 if [ "${PURGE}" = true ]; then
+    # These are deleted by --purge. Listing them here said the opposite of what
+    # was about to happen: "Will keep — nothing, --purge was given" followed by
+    # the two files it was about to delete. They belong in the remove list, and
+    # they are printed there now.
     echo -e "  ${C_YELLOW}nothing — --purge was given${C_NC}"
-    echo -e "  ${C_DIM}${CONFIG_FILE} (contains your Mailgun API key)${C_NC}"
-    echo -e "  ${C_DIM}${LOG_DIR}/${C_NC}"
 else
     echo -e "  ${CONFIG_FILE} ${C_DIM}(your Mailgun credentials and settings)${C_NC}"
     echo -e "  ${LOG_DIR}/ ${C_DIM}(past update reports)${C_NC}"

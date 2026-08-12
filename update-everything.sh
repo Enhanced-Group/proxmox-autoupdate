@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.6.3"
+PAU_VERSION="4.7.0"
 
 set -u
 set -o pipefail
@@ -464,6 +464,50 @@ run_doctor() {
         if [ "${ct_stop}" -gt 0 ] && [ "$(cfg_read START_STOPPED_LXC)" = "false" ]; then
             _d_warn "  ${ct_stop} stopped container(s) will be skipped (START_STOPPED_LXC=false)"
         fi
+
+        # Can each running container actually reach anything?
+        #
+        # A guest that cannot resolve or connect takes the full apt timeout on
+        # every run and then reports whatever apt's exit code happened to be.
+        # Finding out why means bisecting DNS against connectivity by hand, so
+        # this does that split here and names the cause.
+        #
+        # Every probe is time-boxed. A diagnostic that hangs is worse than no
+        # diagnostic.
+        local cid cname
+        while read -r cid cname; do
+            [ -z "${cid}" ] && continue
+            [ "$(config_field pct "${cid}" template)" = "1" ] && continue
+            [ "$(pct status "${cid}" 2>/dev/null | awk '{print $2}')" = "running" ] || continue
+
+            if pct exec "${cid}" -- timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 \
+               || pct exec "${cid}" -- timeout 5 getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+                continue                    # resolves; nothing to report
+            fi
+
+            _d_warn "LXC ${cid} (${cname}): cannot resolve its package mirrors — updates will time out"
+
+            # Name the cause rather than leaving it as "network broken". This
+            # exact shape — a default-deny INPUT chain with no rules in it —
+            # is what ufw leaves behind when it fails to start inside an
+            # unprivileged container, and it silently firewalls the guest off
+            # from the world while looking perfectly configured.
+            local ipt
+            ipt=$(pct exec "${cid}" -- timeout 5 iptables -S INPUT 2>/dev/null || true)
+            if echo "${ipt}" | grep -q '^-P INPUT DROP' \
+               && ! echo "${ipt}" | grep -qi 'ESTABLISHED'; then
+                _d_warn "  its INPUT chain is default-DROP with no rules, so replies never come back"
+                if pct exec "${cid}" -- timeout 5 sh -c 'command -v ufw' >/dev/null 2>&1; then
+                    _d_warn "  ufw is installed; it cannot load its rules in an unprivileged container"
+                    _d_warn "  → pct exec ${cid} -- systemctl disable --now ufw && pct exec ${cid} -- iptables -P INPUT ACCEPT"
+                    _d_warn "  → filter with the Proxmox firewall instead, which runs outside the container"
+                else
+                    _d_warn "  → pct exec ${cid} -- iptables -P INPUT ACCEPT   (then make it persistent)"
+                fi
+            else
+                _d_warn "  check its gateway, DNS servers and any firewall inside it"
+            fi
+        done < <(pct list 2>/dev/null | awk 'NR>1 {print $1, $3}')
     fi
 
     local vm_run=0 vm_stop=0 vm_agent_ok=0 vm_agent_bad=0
@@ -587,7 +631,11 @@ if [ "${INTERACTIVE}" = true ]; then
     C_BLUE='\033[0;34m'
     C_CYAN='\033[0;36m'
     C_BOLD='\033[1m'
-    C_DIM='\033[2m'
+    # Bright black, not the faint attribute (\033[2m). xterm.js — which the
+    # Proxmox web shell is built on — renders faint text at very low contrast on
+    # a dark background, so every hint and detail line was close to invisible in
+    # the terminal most of this output is actually read from.
+    C_DIM='\033[90m'
     C_NC='\033[0m'
 else
     C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_CYAN='' C_BOLD='' C_DIM='' C_NC=''

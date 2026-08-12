@@ -12,6 +12,42 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.7.0 — 2026-08-12
+
+### Fixed
+
+- **Only the installer got the readable-colour fix in 4.4.0.** The uninstaller,
+  the update script and the web-UI patcher were all still using the ANSI faint
+  attribute, which xterm.js — the Proxmox web shell — renders at very low
+  contrast. So every hint and detail line in the tool people actually run
+  weekly, and in the uninstaller's "will keep" list, stayed close to invisible.
+  All four now use bright black, and the uninstaller only emits colour to a
+  real terminal.
+- **The installer counted to six out of nine.** `STEP_TOTAL` said 9 while six
+  `step()` calls existed, and the interactive sections used a different heading
+  style entirely — so it showed `[1/9]`, then three unnumbered sections, then
+  `[2/9]`, and never reached the total. One scheme now covers all ten phases,
+  the web-panel step announces itself even when skipped so the count stays
+  honest, and CI checks the declared total against the number of calls.
+- **The uninstaller listed files under "Will keep" that `--purge` deletes.**
+  With `--purge` it printed "nothing — --purge was given" and then named the
+  config file and log directory underneath, which is the opposite of what was
+  about to happen. Those now appear in the removal list, where they belong.
+- The removal list also names the uninstaller itself and the run-history
+  directory, both of which it removes and neither of which it mentioned.
+
+### Added
+
+- **The installer says which version it is installing**, before it installs it.
+  It never mentioned one, so there was no way to tell what you were getting.
+- **`--doctor` checks whether each running container can reach its package
+  mirrors**, and names the cause when it cannot. It separates a DNS failure
+  from a connectivity failure, and recognises the specific case where a
+  default-deny INPUT chain with no rules is silently firewalling a container off
+  from the world — which is what ufw leaves behind when it fails to start inside
+  an unprivileged container, while still reporting itself as active. Every probe
+  is time-boxed; a diagnostic that hangs is worse than none.
+
 ## 4.6.3 — 2026-08-12
 
 ### Fixed

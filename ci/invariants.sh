@@ -241,6 +241,30 @@ PYCHECK
 [ $? -eq 0 ] || FAILED=1
 fi
 
+# --- 3d. The installer's step counter is honest ------------------------------
+# STEP_TOTAL said 9 while only six step() calls existed, so the installer
+# counted to six out of nine and stopped. A progress counter that never reaches
+# its total reads as a run that died.
+echo "== installer step count =="
+DECLARED=$(grep -m1 '^STEP_TOTAL=' install.sh | cut -d= -f2)
+ACTUAL=$(grep -c '^[[:space:]]*step "' install.sh)
+if [ "${DECLARED}" = "${ACTUAL}" ]; then
+    ok "STEP_TOTAL ${DECLARED} matches ${ACTUAL} step() calls"
+else
+    fail "STEP_TOTAL is ${DECLARED} but there are ${ACTUAL} step() calls"
+fi
+
+# --- 3e. No faint text -------------------------------------------------------
+# \033[2m is rendered at very low contrast by xterm.js, which is what the
+# Proxmox web shell uses — it made roughly a third of the installer invisible
+# in the terminal most people run it from.
+echo "== no faint-attribute colour =="
+if grep -qs "C_DIM='\\\\033\[2m'" install.sh uninstall.sh update-everything.sh webui/patch-webui.sh; then
+    fail "a script still sets C_DIM to the faint attribute (\\033[2m); use \\033[90m"
+else
+    ok "no script uses the faint attribute for dim text"
+fi
+
 # --- 4. No CR bytes ----------------------------------------------------------
 # A CRLF in a shebang makes the kernel look for an interpreter literally named
 # "bash\r". .gitattributes normalises this, but a file added without a matching

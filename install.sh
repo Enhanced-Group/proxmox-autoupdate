@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v4.6.3"
+PAU_FALLBACK_REF="v4.7.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -111,6 +111,7 @@ else
 fi
 
 print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
+print_skip()   { echo -e "  ${C_DIM}⊘ $1${C_NC}"; }
 
 # --- Progress ----------------------------------------------------------------
 #
@@ -120,7 +121,7 @@ print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
 # through it was. Steps are numbered, and anything that can take more than a
 # moment runs behind a spinner that degrades to a plain line without a
 # terminal.
-STEP_TOTAL=9
+STEP_TOTAL=10
 STEP_NOW=0
 _SPIN_PID=""
 
@@ -298,6 +299,10 @@ echo ""
 print_box_top
 print_box_line "${C_BOLD}Proxmox Auto-Update — Installer${C_NC}" "Proxmox Auto-Update - Installer"
 print_box_bottom
+# Say which version this is going to install, before it installs it. The
+# installer previously never mentioned one, so there was no way to tell what
+# you were getting or to check afterwards that you got it.
+echo -e "  ${C_DIM}Installing ${PAU_RESOLVED_REF} from github.com/${REPO_SLUG}${C_NC}"
 if [ "${UNATTENDED}" = true ]; then
     echo ""
     print_action "Unattended mode — reusing the existing configuration"
@@ -469,7 +474,7 @@ done
 LOG_DIR="${PREV_LOG_DIR:-${LOG_DIR}}"
 
 echo ""
-echo -e "${C_BOLD}── Notifications ───────────────────────────────────────────${C_NC}"
+step "Notifications"
 echo ""
 echo -e "  ${C_DIM}Optional. Updates run on schedule whether or not a channel is set${C_NC}"
 echo -e "  ${C_DIM}up — without one they simply run quietly. You can add or change${C_NC}"
@@ -660,7 +665,7 @@ fi
 
 # --- Advanced Settings ---
 echo ""
-echo -e "${C_BOLD}── Advanced Settings ───────────────────────────────────────${C_NC}"
+step "Advanced settings"
 echo ""
 
 # --- Exclude IDs ---
@@ -875,7 +880,7 @@ done
 
 # --- Schedule & Reboot Settings ---
 echo ""
-echo -e "${C_BOLD}── Schedule & Reboot Timing ────────────────────────────────${C_NC}"
+step "Schedule and reboot timing"
 echo ""
 
 # --- Cron Schedule ---
@@ -910,7 +915,6 @@ print_ok "Scheduled reboot time: ${REBOOT_TIME}"
 
 # 3. Write credentials to a secure config file
 echo ""
-echo -e "${C_BOLD}── Deploying ───────────────────────────────────────────────${C_NC}"
 echo ""
 step "Saving configuration"
 print_action "Writing ${C_DIM}${CONFIG_FILE}${C_NC}"
@@ -1115,8 +1119,14 @@ print_ok "Log directory: ${C_DIM}${LOG_DIR}/${C_NC}"
 
 WEBUI_SKIP_ALL=false
 
+# Announced either way, so the step count stays honest. A run that silently
+# skips a numbered step looks like it lost one.
+step "Web control panel"
+if [ "${ENABLE_WEB_UI}" != "true" ]; then
+    print_skip "Not installing it — updates run from cron regardless"
+fi
+
 if [ "${ENABLE_WEB_UI}" = "true" ]; then
-    step "Installing the web control panel"
 
     if ! command -v python3 >/dev/null 2>&1; then
         print_fail "python3 not found — required by the control panel."
@@ -1431,7 +1441,7 @@ if [ "${UNATTENDED}" = true ] || [ "${HAVE_TTY}" != true ]; then
     exit 0
 fi
 
-echo -e "${C_BOLD}── Test Run ────────────────────────────────────────────────${C_NC}"
+step "Test run"
 echo ""
 echo -e "  ${C_BOLD}Run now to verify the setup?${C_NC}"
 echo -e "    ${C_CYAN}1)${C_NC} Dry run   ${C_DIM}— check everything and email the report,${C_NC}"
