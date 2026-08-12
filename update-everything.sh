@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.6.2"
+PAU_VERSION="4.6.3"
 
 set -u
 set -o pipefail
@@ -1453,11 +1453,35 @@ format_upgradable() {
     }'
 }
 
+# Report a container runtime if one is present.
+#
+# This runs *before* the package managers, not after. Every branch below ends
+# in `exit 0` — that is how the sentinel protocol works — so anything placed
+# after them is unreachable on every successful path, which is exactly what
+# happened: a Docker host with nothing to upgrade reported "already up to date"
+# and never mentioned its containers at all.
+#
+# The tool updates the guest's own packages and nothing inside its containers,
+# so on a Docker or Podman host "already up to date" is true of apt and silent
+# about the images actually running the services. Reporting it stops a green
+# tick implying something it does not mean. It deliberately does not pull or
+# restart anything: that needs compose files and restart ordering, and can take
+# a stack down in ways apt never will.
+#
+# Each probe is time-boxed. \`docker ps\` talks to a daemon that may be wedged
+# or starting, and this must never be the reason a guest update hangs.
+for RUNTIME in docker podman; do
+    command -v "\${RUNTIME}" >/dev/null 2>&1 || continue
+    RUNNING=\$(timeout 10 "\${RUNTIME}" ps -q 2>/dev/null | grep -c . || echo 0)
+    [ "\${RUNNING}" -gt 0 ] && echo "__CONTAINERS__ \${RUNTIME} \${RUNNING}"
+done
+
 if command -v apt-get >/dev/null 2>&1; then
     # The guest may have only just booted, so DNS and routing can lag behind the
     # guest agent coming up. Retry rather than reporting a hard failure.
     UPDATE_RC=1
     ATTEMPT=1
+    _T_START=\$(date +%s 2>/dev/null || echo 0)
     while [ \${ATTEMPT} -le 5 ]; do
         # Capture the status directly from apt-get. Assigning \$? on the line
         # after the closing \`fi\` read the exit status of the *if compound*
@@ -1471,6 +1495,16 @@ if command -v apt-get >/dev/null 2>&1; then
         ATTEMPT=\$((ATTEMPT + 1))
         [ \${ATTEMPT} -le 5 ] && sleep 5
     done
+    # Report how long the refresh took, and how many attempts it needed.
+    #
+    # Output only comes back when the exec finishes, so this cannot be shown
+    # live — but it is the difference between "that guest took twelve minutes"
+    # and "eleven and a half of those minutes were apt-get update", which is
+    # the part that identifies a slow mirror or a contended host.
+    _T_END=\$(date +%s 2>/dev/null || echo 0)
+    if [ "\${_T_START}" -gt 0 ] && [ "\${_T_END}" -ge "\${_T_START}" ]; then
+        echo "__TIMING__ refresh \$(( _T_END - _T_START )) \${ATTEMPT}"
+    fi
 
     if [ \${UPDATE_RC} -ne 0 ]; then
         echo "__RESULT__ FAIL"
@@ -1617,20 +1651,6 @@ else
     echo "__RESULT__ UNSUPPORTED"
     echo "__DETAIL__ no supported package manager found (looked for apt-get, dnf, yum, apk, zypper, pacman)"
 fi
-
-# Report a container runtime if one is present.
-#
-# The tool updates the guest's own packages and nothing inside its containers,
-# so on a Docker or Podman host "already up to date" is true of apt and silent
-# about the images actually running the services. Reporting it stops a green
-# tick implying something it does not mean. Deliberately does not pull or
-# restart anything: that needs compose files and restart ordering, and it can
-# take a stack down in ways apt never will.
-for RUNTIME in docker podman; do
-    command -v "\${RUNTIME}" >/dev/null 2>&1 || continue
-    RUNNING=\$("\${RUNTIME}" ps -q 2>/dev/null | grep -c . || echo 0)
-    [ "\${RUNNING}" -gt 0 ] && echo "__CONTAINERS__ \${RUNTIME} \${RUNNING}"
-done
 
 rm -f "\${WORK_LOG}" 2>/dev/null || true
 GUESTSCRIPT
@@ -2735,6 +2755,9 @@ parse_guest_result() {
     # "docker 14" / "podman 3" — a runtime present in the guest and how many
     # containers it is running. Reported, never touched.
     GU_CONTAINERS=$(echo "${raw}" | sed -n 's/^__CONTAINERS__ //p' | head -1 || true)
+    # "refresh 723 1" — seconds spent refreshing the package list, and how many
+    # attempts it needed.
+    GU_TIMING=$(echo "${raw}" | sed -n 's/^__TIMING__ //p' | head -1 || true)
 
     local result=""
     result=$(echo "${raw}" | sed -n 's/^__RESULT__ //p' | tail -1 || true)
@@ -2992,6 +3015,7 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
     CT_STATUS=$(pct status "${CTID}" | awk '{print $2}')
     CT_WAS_STOPPED=false
     GU_CONTAINERS=""
+    GU_TIMING=""
 
     # Check exclusion list
     if is_excluded "${CTID}"; then
@@ -3139,6 +3163,15 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
             ;;
     esac
 
+    # Where the time went, when there was enough of it to wonder about.
+    if [ -n "${GU_TIMING:-}" ]; then
+        _tsecs=$(echo "${GU_TIMING}" | awk '{print $2}')
+        _tries=$(echo "${GU_TIMING}" | awk '{print $3}')
+        if [ -n "${_tsecs}" ] && [ "${_tsecs}" -ge "${HEARTBEAT_SECS}" ] 2>/dev/null; then
+            print_warn "  package list refresh took $(fmt_duration "${_tsecs}")$([ "${_tries:-1}" -gt 1 ] 2>/dev/null && echo " over ${_tries} attempts")"
+        fi
+    fi
+
     # Say when a guest is running containers this tool does not manage.
     if [ -n "${GU_CONTAINERS:-}" ]; then
         print_warn "  $(container_note "${GU_CONTAINERS}")"
@@ -3191,6 +3224,7 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
     VM_STATUS=$(qm status "${VMID}" | awk '{print $2}')
     VM_WAS_STOPPED=false
     GU_CONTAINERS=""
+    GU_TIMING=""
     VM_OS_TYPE="linux"
 
     # Check exclusion list
@@ -3514,6 +3548,12 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
         esac
     fi
 
+    if [ -n "${GU_TIMING:-}" ]; then
+        _tsecs=$(echo "${GU_TIMING}" | awk '{print $2}')
+        if [ -n "${_tsecs}" ] && [ "${_tsecs}" -ge "${HEARTBEAT_SECS}" ] 2>/dev/null; then
+            print_warn "  package list refresh took $(fmt_duration "${_tsecs}")"
+        fi
+    fi
     if [ -n "${GU_CONTAINERS:-}" ]; then
         print_warn "  $(container_note "${GU_CONTAINERS}")"
     fi

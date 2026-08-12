@@ -12,6 +12,28 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.6.3 — 2026-08-12
+
+### Fixed
+
+- **Container detection never ran.** The Docker/Podman check added in 4.5.0 was
+  placed after the package-manager branches — every one of which ends in
+  `exit 0`, because that is how the sentinel protocol signals completion. It was
+  unreachable on every successful path, so a Docker host with nothing to upgrade
+  reported "already up to date" and said nothing about its containers, which is
+  precisely the case the check existed for. Moved ahead of the package managers,
+  and each probe is time-boxed so a wedged or starting daemon can never be the
+  reason a guest update hangs.
+
+### Added
+
+- **Guests report how long refreshing the package list took**, and how many
+  attempts it needed, whenever that exceeds the heartbeat interval. Output only
+  returns when the exec finishes so it cannot be shown live, but it is the
+  difference between "that guest took twelve minutes" and "eleven and a half of
+  those minutes were `apt-get update`" — which is what identifies a slow mirror
+  or a contended host rather than a problem with this tool.
+
 ## 4.6.2 — 2026-08-12
 
 ### Fixed
