@@ -220,7 +220,7 @@ if not bad:
 # Every editable setting must either accept an empty value or have a default.
 # Otherwise a key absent from someone's config file comes back empty, and since
 # the forms post every field they render, the whole form becomes unsaveable —
-# which is exactly what adding three settings in 4.2.0 did.
+# which is exactly what adding three settings in 1.2.0 did.
 keys = re.search(r"EDITABLE_KEYS = \{(.*?)\n\}", panel, re.S).group(1)
 editable = re.findall(r'"([A-Z_]+)":', keys)
 trap = [k for k in editable if k not in defaults]
@@ -252,6 +252,52 @@ if [ "${DECLARED}" = "${ACTUAL}" ]; then
     ok "STEP_TOTAL ${DECLARED} matches ${ACTUAL} step() calls"
 else
     fail "STEP_TOTAL is ${DECLARED} but there are ${ACTUAL} step() calls"
+fi
+
+# --- 3d-bis. The installer can reach every notification channel --------------
+# Teams, ntfy, Gotify and Telegram shipped in 1.2.0 and were still missing from
+# the installer's menu six releases later, so a fresh install could only reach
+# half the channels the tool supports. Worse, the prompts that did exist for
+# SMTP wrote nothing: the generated config had no SMTP_* keys at all, so email
+# was configured and then silently discarded.
+#
+# Both halves are checked here — offered in the menu, and persisted to the
+# config file — because either one alone still leaves a channel unusable.
+echo "== installer covers every channel =="
+METHODS=$(sed -n '/^VALID_METHODS = {/,/}/p' webui/pve-autoupdate-ui \
+          | grep -oE '"[a-z]+"' | tr -d '"' | sort -u)
+if [ -z "${METHODS}" ]; then
+    fail "could not read VALID_METHODS from the panel"
+else
+    MENU=$(sed -n '/NOTIFY_METHODS="\${NOTIFY_METHODS},/p' install.sh \
+           | sed -n 's/.*,\([a-z]*\)".*/\1/p' | sort -u)
+    MISSING=""
+    for m in ${METHODS}; do
+        grep -qx "${m}" <<<"${MENU}" || MISSING="${MISSING} ${m}"
+    done
+    if [ -n "${MISSING}" ]; then
+        fail "installer menu cannot select:${MISSING}"
+    else
+        ok "all $(echo "${METHODS}" | wc -w | tr -d ' ') channels are on the installer menu"
+    fi
+fi
+
+# Every channel credential the update script reads has to be written by the
+# installer, or answering its prompts achieves nothing.
+CONF_BLOCK=$(sed -n '/^cat > "${CONFIG_FILE}" <<CONF$/,/^CONF$/p' install.sh)
+CHANNEL_KEYS="EMAIL_TRANSPORT SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD
+SMTP_SECURITY MAILGUN_API_KEY MAILGUN_DOMAIN SENDER_EMAIL RECIPIENT_EMAIL
+DISCORD_WEBHOOK_URL DISCORD_BOT_TOKEN DISCORD_USER_ID SLACK_WEBHOOK_URL
+TEAMS_WEBHOOK_URL NTFY_URL NTFY_TOKEN GOTIFY_URL GOTIFY_TOKEN
+TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID GENERIC_WEBHOOK_URL"
+UNWRITTEN=""
+for k in ${CHANNEL_KEYS}; do
+    grep -q "^${k}=" <<<"${CONF_BLOCK}" || UNWRITTEN="${UNWRITTEN} ${k}"
+done
+if [ -n "${UNWRITTEN}" ]; then
+    fail "installer never writes:${UNWRITTEN}"
+else
+    ok "every channel credential reaches the config file"
 fi
 
 # --- 3e. No faint text -------------------------------------------------------

@@ -63,8 +63,20 @@ if [ -r "${CONFIG_FILE}" ]; then
     [ "${_nag}" = "true" ] && SUPPRESS_NAG="true"
 fi
 
-C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
-C_CYAN='\033[0;36m'; C_DIM='\033[90m'; C_NC='\033[0m'
+# Colour only when stdout is a terminal that can render it.
+#
+# This script is run far more often without one than with: the apt hook invokes
+# it after every pve-manager upgrade, and the installer runs it as part of a
+# captured step. Emitting escapes unconditionally put raw \033[0;31m sequences
+# into /var/log/apt/term.log and into the installer's own transcript.
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
+    # Bright black, not the faint attribute — xterm.js, which is what the
+    # Proxmox web shell uses, renders faint text at almost no contrast.
+    C_CYAN='\033[0;36m'; C_DIM='\033[90m'; C_NC='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_DIM='' C_NC=''
+fi
 ok()   { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
 fail() { echo -e "  ${C_RED}✗${C_NC} $1"; }
 warn() { echo -e "  ${C_YELLOW}⚠${C_NC} $1"; }
@@ -442,6 +454,14 @@ JSBLOCK_HEAD
        guest update: a self-update swaps out this very file, so every open
        Proxmox tab is left running stale JavaScript until it is reloaded. */
     var selfUpdateSeen = false;
+    /* The version that was installed when this tab loaded its copy of this
+       file. Any change means what is running here is the previous release's
+       code. Watching the version rather than the self-update unit is what makes
+       an `install.sh` run from the node's shell prompt as well — that unit only
+       runs for a panel-driven update, so a command-line upgrade used to finish
+       with every open tab silently stale. */
+    var bootVersion = null;
+    var reloadPrompted = false;
     /* True while the control panel is open in a window on this page. It prompts
        for its own reload, so this one must not also. */
     var panelWindowOpen = false;
@@ -452,6 +472,18 @@ JSBLOCK_HEAD
             if (!state || !btn.getEl || btn.destroyed) { return; }
             var el = btn.getEl();
             if (!el) { return; }
+
+            if (state.version) {
+                if (bootVersion === null) {
+                    bootVersion = state.version;
+                } else if (state.version !== bootVersion) {
+                    bootVersion = state.version;
+                    selfUpdateSeen = false;
+                    /* An open panel offers its own; two dialogs for one update
+                       is worse than one. */
+                    if (!panelWindowOpen) { promptReload(state.version); }
+                }
+            }
 
             var result = (state.last_run && state.last_run.result) || '';
             var updatingSelf = state.self_update === 'active' ||
@@ -505,6 +537,8 @@ JSBLOCK_HEAD
     }
 
     function promptReload(version) {
+        if (reloadPrompted) { return; }
+        reloadPrompted = true;
         Ext.Msg.show({
             title: 'Auto-Update updated',
             message:

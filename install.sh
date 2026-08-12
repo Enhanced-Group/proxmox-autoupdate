@@ -21,17 +21,32 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 #   PAU_CHANNEL=release   (default) install the latest published release
 #   PAU_CHANNEL=main                track main, for development
-#   PAU_REF=v4.0.0                  pin an exact tag, branch or commit
+#   PAU_REF=v1.0.0                  pin an exact tag, branch or commit
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v4.7.0"
+PAU_FALLBACK_REF="v1.8.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
 # Ask GitHub for the newest published release. Deliberately tolerant: no jq (it
 # may not be installed yet), short timeout, and any failure falls back to the
 # tag baked in above rather than silently reaching for main.
+# Tags from the retired numbering.
+#
+# This project released under a 2.x–4.x scheme before settling on the 1.x line.
+# Those tags are still on GitHub — the history is worth keeping — but they sort
+# numerically *above* every 1.x release, so "newest tag wins" would install the
+# retired code on every fresh machine, forever. They are filtered out by number
+# rather than deleted.
+#
+# If this ever legitimately reaches 2.0, this filter has to go with it.
+RETIRED_TAG_RE='^v?[234]\.'
+
+is_retired_tag() {
+    [ -n "$1" ] && echo "$1" | grep -qE "${RETIRED_TAG_RE}"
+}
+
 resolve_ref() {
     if [ -n "${PAU_REF}" ]; then
         echo "${PAU_REF}"
@@ -44,6 +59,7 @@ resolve_ref() {
     local tag=""
     tag=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
           | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    is_retired_tag "${tag}" && tag=""
     # Take whichever is newer of the published Release and the highest git tag.
     #
     # /releases/latest only knows about published Release objects, so tagging
@@ -56,6 +72,7 @@ resolve_ref() {
           | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
           | sed -n 's/.*"\([^"]*\)"$/\1/p' \
           | grep -E '^v?[0-9]+(\.[0-9]+)*$' \
+          | grep -vE "${RETIRED_TAG_RE}" \
           | sort -V | tail -1)
     if [ -z "${tag}" ]; then
         tag="${newest_tag}"
@@ -238,6 +255,18 @@ report_delivery_hint() {
         *,slack,*) print_ok "A report was sent to Slack" ;;
     esac
     case ",${NOTIFY_METHODS}," in
+        *,teams,*) print_ok "A report was sent to Microsoft Teams" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
+        *,ntfy,*) print_ok "A report was sent to ntfy" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
+        *,gotify,*) print_ok "A report was sent to Gotify" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
+        *,telegram,*) print_ok "A report was sent to Telegram" ;;
+    esac
+    case ",${NOTIFY_METHODS}," in
         *,webhook,*) print_ok "A report was posted to the configured webhook" ;;
     esac
 }
@@ -379,6 +408,13 @@ PREV_WEBUI_PORT=""
 PREV_DRY_RUN=""
 PREV_LOG_DIR=""
 PREV_TRANSPORT=""
+PREV_TEAMS=""
+PREV_NTFY_URL=""
+PREV_NTFY_TOKEN=""
+PREV_GOTIFY_URL=""
+PREV_GOTIFY_TOKEN=""
+PREV_TG_TOKEN=""
+PREV_TG_CHAT=""
 PREV_SMTP_HOST=""
 PREV_SMTP_PORT=""
 PREV_SMTP_USER=""
@@ -436,6 +472,13 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_DRY_RUN="${DRY_RUN:-}"
     PREV_LOG_DIR="${LOG_DIR:-}"
     PREV_TRANSPORT="${EMAIL_TRANSPORT:-}"
+    PREV_TEAMS="${TEAMS_WEBHOOK_URL:-}"
+    PREV_NTFY_URL="${NTFY_URL:-}"
+    PREV_NTFY_TOKEN="${NTFY_TOKEN:-}"
+    PREV_GOTIFY_URL="${GOTIFY_URL:-}"
+    PREV_GOTIFY_TOKEN="${GOTIFY_TOKEN:-}"
+    PREV_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+    PREV_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
     PREV_SMTP_HOST="${SMTP_HOST:-}"
     PREV_SMTP_PORT="${SMTP_PORT:-}"
     PREV_SMTP_USER="${SMTP_USER:-}"
@@ -489,10 +532,14 @@ if [ -n "${DEFAULT_METHODS}" ]; then
     echo -e "  ${C_DIM}Currently enabled: ${DEFAULT_METHODS}${C_NC}"
 fi
 echo -e "  ${C_CYAN}1)${C_NC} Skip for now  ${C_DIM}(updates still run; add a channel later)${C_NC}"
-echo -e "  ${C_CYAN}2)${C_NC} Email via Mailgun"
-echo -e "  ${C_CYAN}3)${C_NC} Discord webhook"
-echo -e "  ${C_CYAN}4)${C_NC} Slack / Teams webhook"
-echo -e "  ${C_CYAN}5)${C_NC} Generic webhook (JSON POST)"
+echo -e "  ${C_CYAN}2)${C_NC} Email  ${C_DIM}(any SMTP server, or the Mailgun API)${C_NC}"
+echo -e "  ${C_CYAN}3)${C_NC} Discord  ${C_DIM}(webhook, or a bot DM)${C_NC}"
+echo -e "  ${C_CYAN}4)${C_NC} Slack  ${C_DIM}(incoming webhook)${C_NC}"
+echo -e "  ${C_CYAN}5)${C_NC} Microsoft Teams  ${C_DIM}(separate — Teams cannot read Slack's format)${C_NC}"
+echo -e "  ${C_CYAN}6)${C_NC} ntfy  ${C_DIM}(self-hosted or ntfy.sh)${C_NC}"
+echo -e "  ${C_CYAN}7)${C_NC} Gotify"
+echo -e "  ${C_CYAN}8)${C_NC} Telegram  ${C_DIM}(bot)${C_NC}"
+echo -e "  ${C_CYAN}9)${C_NC} Generic webhook  ${C_DIM}(JSON POST)${C_NC}"
 echo ""
 echo -e "  ${C_DIM}Enter one or more numbers, e.g. \"3\" or \"2,3\".${C_NC}"
 read -rp "  Select [Enter to keep current]: " INPUT_METHODS <&3 || true
@@ -506,6 +553,13 @@ SMTP_PORT="${PREV_SMTP_PORT:-587}"
 SMTP_USER="${PREV_SMTP_USER}"
 SMTP_PASSWORD="${PREV_SMTP_PASSWORD}"
 SMTP_SECURITY="starttls"
+TEAMS_WEBHOOK_URL="${PREV_TEAMS}"
+NTFY_URL="${PREV_NTFY_URL}"
+NTFY_TOKEN="${PREV_NTFY_TOKEN}"
+GOTIFY_URL="${PREV_GOTIFY_URL}"
+GOTIFY_TOKEN="${PREV_GOTIFY_TOKEN}"
+TELEGRAM_BOT_TOKEN="${PREV_TG_TOKEN}"
+TELEGRAM_CHAT_ID="${PREV_TG_CHAT}"
 SENDER_EMAIL="${PREV_SENDER}"
 RECIPIENT_EMAIL="${PREV_RECIPIENT}"
 DISCORD_WEBHOOK_URL="${PREV_DISCORD}"
@@ -527,7 +581,11 @@ else
             2) NOTIFY_METHODS="${NOTIFY_METHODS},email" ;;
             3) NOTIFY_METHODS="${NOTIFY_METHODS},discord" ;;
             4) NOTIFY_METHODS="${NOTIFY_METHODS},slack" ;;
-            5) NOTIFY_METHODS="${NOTIFY_METHODS},webhook" ;;
+            5) NOTIFY_METHODS="${NOTIFY_METHODS},teams" ;;
+            6) NOTIFY_METHODS="${NOTIFY_METHODS},ntfy" ;;
+            7) NOTIFY_METHODS="${NOTIFY_METHODS},gotify" ;;
+            8) NOTIFY_METHODS="${NOTIFY_METHODS},telegram" ;;
+            9) NOTIFY_METHODS="${NOTIFY_METHODS},webhook" ;;
             *) print_fail "Ignoring unrecognised choice '${CHOICE}'" ;;
         esac
     done
@@ -537,7 +595,7 @@ else
     if echo ",${NOTIFY_METHODS}," | grep -q ",email,"; then
         echo ""
         echo -e "  ${C_BOLD}Email${C_NC}"
-        # SMTP was added to the updater and the panel in 4.2.0 but never to the
+        # SMTP was added to the updater and the panel in 1.2.0 but never to the
         # installer, which still assumed email meant Mailgun. A fresh install
         # was therefore forced through Mailgun prompts it could not skip, even
         # for someone who only wanted to use their own mail server.
@@ -616,21 +674,86 @@ else
 
     if echo ",${NOTIFY_METHODS}," | grep -q ",slack,"; then
         echo ""
-        echo -e "  ${C_BOLD}Slack / Teams${C_NC}"
+        echo -e "  ${C_BOLD}Slack${C_NC}"
         read -rp "  Webhook URL: " I <&3 || true
         SLACK_WEBHOOK_URL="${I:-${PREV_SLACK}}"
         if [ -n "${SLACK_WEBHOOK_URL}" ]; then
-            print_ok "Slack/Teams configured"
+            print_ok "Slack configured"
         else
-            print_fail "No URL given — dropping Slack/Teams."
+            print_fail "No URL given — dropping Slack."
             NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/slack//; s/,,/,/g; s/^,//; s/,$//')
+        fi
+    fi
+
+    if echo ",${NOTIFY_METHODS}," | grep -q ",teams,"; then
+        echo ""
+        echo -e "  ${C_BOLD}Microsoft Teams${C_NC}"
+        echo -e "  ${C_DIM}Works with a Power Automate \"when a Teams webhook request is${C_NC}"
+        echo -e "  ${C_DIM}received\" trigger, or a legacy Office 365 connector.${C_NC}"
+        read -rp "  Webhook URL: " I <&3 || true
+        TEAMS_WEBHOOK_URL="${I:-${PREV_TEAMS}}"
+        if [ -n "${TEAMS_WEBHOOK_URL}" ]; then
+            print_ok "Teams configured"
+        else
+            print_fail "No URL given — dropping Teams."
+            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/teams//; s/,,/,/g; s/^,//; s/,$//')
+        fi
+    fi
+
+    if echo ",${NOTIFY_METHODS}," | grep -q ",ntfy,"; then
+        echo ""
+        echo -e "  ${C_BOLD}ntfy${C_NC}"
+        echo -e "  ${C_DIM}The topic is part of the URL, e.g. https://ntfy.sh/my-topic${C_NC}"
+        read -rp "  Topic URL: " I <&3 || true
+        NTFY_URL="${I:-${PREV_NTFY_URL}}"
+        if [ -n "${NTFY_URL}" ]; then
+            read -rsp "  Access token [Enter for none]: " I <&3 || true; echo ""
+            NTFY_TOKEN="${I:-${PREV_NTFY_TOKEN}}"
+            print_ok "ntfy configured"
+        else
+            print_fail "No URL given — dropping ntfy."
+            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/ntfy//; s/,,/,/g; s/^,//; s/,$//')
+        fi
+    fi
+
+    if echo ",${NOTIFY_METHODS}," | grep -q ",gotify,"; then
+        echo ""
+        echo -e "  ${C_BOLD}Gotify${C_NC}"
+        read -rp "  Server URL (e.g. https://gotify.example.com): " I <&3 || true
+        GOTIFY_URL="${I:-${PREV_GOTIFY_URL}}"
+        read -rsp "  Application token: " I <&3 || true; echo ""
+        GOTIFY_TOKEN="${I:-${PREV_GOTIFY_TOKEN}}"
+        if [ -n "${GOTIFY_URL}" ] && [ -n "${GOTIFY_TOKEN}" ]; then
+            print_ok "Gotify configured"
+        else
+            print_fail "Both a URL and a token are needed — dropping Gotify."
+            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/gotify//; s/,,/,/g; s/^,//; s/,$//')
+        fi
+    fi
+
+    if echo ",${NOTIFY_METHODS}," | grep -q ",telegram,"; then
+        echo ""
+        echo -e "  ${C_BOLD}Telegram${C_NC}"
+        echo -e "  ${C_DIM}Create a bot with @BotFather, message it, then read your chat ID${C_NC}"
+        echo -e "  ${C_DIM}from https://api.telegram.org/bot<token>/getUpdates${C_NC}"
+        read -rsp "  Bot token: " I <&3 || true; echo ""
+        TELEGRAM_BOT_TOKEN="${I:-${PREV_TG_TOKEN}}"
+        read -rp "  Chat ID: " I <&3 || true
+        TELEGRAM_CHAT_ID="${I:-${PREV_TG_CHAT}}"
+        if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+            print_ok "Telegram configured"
+        else
+            print_fail "Both a token and a chat ID are needed — dropping Telegram."
+            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/telegram//; s/,,/,/g; s/^,//; s/,$//')
         fi
     fi
 
     if echo ",${NOTIFY_METHODS}," | grep -q ",webhook,"; then
         echo ""
         echo -e "  ${C_BOLD}Generic webhook${C_NC}"
-        echo -e "  ${C_DIM}Receives a JSON POST — ntfy, Gotify, Home Assistant, n8n...${C_NC}"
+        echo -e "  ${C_DIM}Receives a JSON POST — Home Assistant, n8n, your own endpoint.${C_NC}"
+        echo -e "  ${C_DIM}ntfy and Gotify have their own options above; they need their own${C_NC}"
+        echo -e "  ${C_DIM}request shapes, not this one.${C_NC}"
         read -rp "  URL: " I <&3 || true
         GENERIC_WEBHOOK_URL="${I:-${PREV_GENERIC}}"
         if [ -n "${GENERIC_WEBHOOK_URL}" ]; then
@@ -926,17 +1049,30 @@ cat > "${CONFIG_FILE}" <<CONF
 # Proxmox Auto-Update — Configuration
 # Generated by installer on $(date '+%d/%m/%Y %H:%M:%S')
 
-# Notification channels: comma-separated list of email, discord, slack, webhook.
+# Notification channels: comma-separated list of email, discord, slack, teams,
+# ntfy, gotify, telegram, webhook.
 # Empty means no notifications — updates still run, they just run quietly.
 NOTIFY_METHODS="${NOTIFY_METHODS}"
 
 # Stay silent on clean runs, so the channel only fires when something needs you
 NOTIFY_ON_FAILURE_ONLY="${NOTIFY_ON_FAILURE_ONLY}"
 
-# Mailgun API credentials (only used when "email" is in NOTIFY_METHODS)
+# How email leaves the box: "mailgun" or "smtp". Blank auto-detects from
+# whichever set of credentials below is filled in.
+EMAIL_TRANSPORT="${EMAIL_TRANSPORT}"
+
+# Mailgun API credentials (only used when EMAIL_TRANSPORT resolves to mailgun)
 MAILGUN_API_KEY="${MAILGUN_API_KEY}"
 MAILGUN_DOMAIN="${MAILGUN_DOMAIN}"
 MAILGUN_REGION="${MAILGUN_REGION}"
+
+# SMTP relay (only used when EMAIL_TRANSPORT resolves to smtp). SMTP_SECURITY
+# is starttls, ssl or none. Leave SMTP_USER blank for an unauthenticated relay.
+SMTP_HOST="${SMTP_HOST}"
+SMTP_PORT="${SMTP_PORT}"
+SMTP_USER="${SMTP_USER}"
+SMTP_PASSWORD="${SMTP_PASSWORD}"
+SMTP_SECURITY="${SMTP_SECURITY}"
 
 # Email addresses
 SENDER_EMAIL="${SENDER_EMAIL}"
@@ -946,7 +1082,22 @@ RECIPIENT_EMAIL="${RECIPIENT_EMAIL}"
 # can post to your channel — so this file is chmod 600.
 DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL}"
+TEAMS_WEBHOOK_URL="${TEAMS_WEBHOOK_URL}"
 GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL}"
+
+# ntfy: the topic is part of the URL. The token is only needed on a protected
+# topic; ntfy.sh public topics take none.
+NTFY_URL="${NTFY_URL}"
+NTFY_TOKEN="${NTFY_TOKEN}"
+NTFY_PRIORITY="${NTFY_PRIORITY:-default}"
+
+# Gotify: server URL plus an application token from Apps → Create Application
+GOTIFY_URL="${GOTIFY_URL}"
+GOTIFY_TOKEN="${GOTIFY_TOKEN}"
+
+# Telegram: a @BotFather token, and the chat ID to send to
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
 
 # Discord direct message instead of a channel webhook. Set both and the report
 # is DM'd to that user; the webhook above stays as a fallback. The bot is never
@@ -1375,9 +1526,17 @@ echo ""
 echo -e "  ${C_CYAN}Script:${C_NC}     ${TARGET_PATH}"
 echo -e "  ${C_CYAN}Config:${C_NC}     ${CONFIG_FILE} ${C_DIM}(600, root-only)${C_NC}"
 echo -e "  ${C_CYAN}Logs:${C_NC}       ${LOG_DIR}/"
-echo -e "  ${C_CYAN}Region:${C_NC}     ${MAILGUN_REGION}"
-echo -e "  ${C_CYAN}Sender:${C_NC}     ${SENDER_EMAIL}"
-echo -e "  ${C_CYAN}Recipient:${C_NC}  ${RECIPIENT_EMAIL}"
+# Only the channels actually set up. This block used to print a Mailgun region
+# and two blank email lines to everyone, including the majority who skip
+# notifications entirely, which read as something half-configured.
+echo -e "  ${C_CYAN}Notify:${C_NC}     ${NOTIFY_METHODS:-none}"
+if echo ",${NOTIFY_METHODS}," | grep -q ",email,"; then
+    if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
+        echo -e "  ${C_CYAN}Email:${C_NC}      Mailgun ${MAILGUN_REGION}, ${SENDER_EMAIL} → ${RECIPIENT_EMAIL}"
+    else
+        echo -e "  ${C_CYAN}Email:${C_NC}      ${SMTP_HOST}:${SMTP_PORT} (${SMTP_SECURITY}), ${SENDER_EMAIL} → ${RECIPIENT_EMAIL}"
+    fi
+fi
 echo -e "  ${C_CYAN}Excluded:${C_NC}   ${EXCLUDE_IDS:-none}"
 echo -e "  ${C_CYAN}LXC:${C_NC}        Start stopped=${START_STOPPED_LXC}"
 echo -e "  ${C_CYAN}Linux VMs:${C_NC}  Start stopped=${START_STOPPED_LINUX_VMS}"

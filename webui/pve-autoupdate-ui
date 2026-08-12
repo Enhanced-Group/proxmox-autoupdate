@@ -275,7 +275,7 @@ EDITABLE_KEYS = {
     "WINDOWS_UPDATE_TIMEOUT": _v_int,
     "LINUX_UPDATE_TIMEOUT": _v_int,
     "APT_LOCK_TIMEOUT": _v_int,
-    # Added in 4.0.0 and previously unreachable from the UI.
+    # Added in 1.0.0 and previously unreachable from the UI.
     "WINDOWS_SHUTDOWN_TIMEOUT": _v_int,
     "LINUX_SHUTDOWN_TIMEOUT": _v_int,
     "AGENT_ERROR_GRACE": _v_int,
@@ -967,6 +967,20 @@ TAGS_API = "https://api.github.com/repos/%s/tags?per_page=100" % GITHUB_REPO
 REF_RE = re.compile(r"\A[A-Za-z0-9._/-]{1,64}\Z")
 VERSION_TAG_RE = re.compile(r"\Av?[0-9]+(\.[0-9]+)*\Z")
 
+# Tags from the retired numbering.
+#
+# This project released under a 2.x–4.x scheme before settling on the 1.x line.
+# Those tags are still on GitHub — the history is worth keeping — but they sort
+# numerically above every 1.x release, so "highest tag wins" would report the
+# retired code as an available update on every machine, forever.
+#
+# If this ever legitimately reaches 2.0, this filter has to go with it.
+RETIRED_TAG_RE = re.compile(r"\Av?[234]\.")
+
+
+def _retired(tag):
+    return bool(tag) and bool(RETIRED_TAG_RE.match(tag))
+
 
 def _highest_version_tag(data):
     """The highest version-shaped tag name in a GitHub /tags response."""
@@ -974,7 +988,7 @@ def _highest_version_tag(data):
         return None
     names = [item.get("name") for item in data
              if isinstance(item, dict) and isinstance(item.get("name"), str)]
-    versions = [n for n in names if VERSION_TAG_RE.match(n)]
+    versions = [n for n in names if VERSION_TAG_RE.match(n) and not _retired(n)]
     if not versions:
         return None
     return max(versions, key=lambda n: _version_tuple(n.lstrip("v")))
@@ -1033,12 +1047,14 @@ def latest_release_ref(force=False):
     # maintainer who tags and pushes without also clicking "publish release"
     # leaves it pointing at an older version, and every installation then sits
     # on "up to date" forever while newer tags exist. That is not hypothetical:
-    # it happened here between v4.4.0 and v4.5.3, six tags with no Release, and
-    # every panel reported 4.4.0 as current.
+    # it happened here between v1.4.0 and v1.5.3, six tags with no Release, and
+    # every panel reported 1.4.0 as current.
     #
     # Tags are compared by version, never by the order GitHub returns them,
     # so this cannot resolve backwards.
     release_ref = _github_json_tag(LATEST_RELEASE_API, lambda d: d.get("tag_name"))
+    if _retired(release_ref):
+        release_ref = None
     tag_ref = _github_json_tag(TAGS_API, _highest_version_tag)
 
     ref = release_ref or tag_ref
@@ -1082,6 +1098,16 @@ def installed_version():
     except OSError:
         pass
     return "unknown"
+
+
+# The version this process started up on.
+#
+# Snapshotted rather than read per request: an update replaces the script on
+# disk a few seconds before this service restarts, so for that window the file
+# reports the new version while this process is still serving the old page.
+# Stamping pages with the file's version there would tell an open tab it is
+# current when it is not, which is the whole thing the check exists to catch.
+PROCESS_VERSION = installed_version()
 
 
 def _version_tuple(v):
@@ -1208,10 +1234,17 @@ def check_for_updates(force=False):
                 "error": "Could not read a version from the published script."}
 
     latest = m.group(1)
-    try:
-        behind = _version_tuple(latest) > _version_tuple(current)
-    except ValueError:
-        behind = latest != current
+    # A machine still on the retired 2.x–4.x numbering is behind everything on
+    # the 1.x line, however the numbers compare. Without this, every existing
+    # installation would sit on "up to date" forever after the renumbering and
+    # need a manual re-install to escape.
+    if _retired(current) and not _retired(latest):
+        behind = True
+    else:
+        try:
+            behind = _version_tuple(latest) > _version_tuple(current)
+        except ValueError:
+            behind = latest != current
     return {
         "current": current,
         "latest": latest,
@@ -2536,6 +2569,50 @@ function dialog(opts) {
     (needsText ? input : okBtn).focus();
   });
 }
+
+/* --- stale-interface watch ------------------------------------------------
+   The version this page was served by. If the version on disk stops matching
+   it, this page is running the previous release's HTML, CSS and JavaScript,
+   and needs reloading.
+
+   This watches the *version*, not the self-update systemd unit. The unit only
+   runs for a panel-driven update, so watching it meant a `bash install.sh`
+   from the node's shell — the way most upgrades actually happen — finished
+   without anything ever saying the open tab had gone stale. A version change
+   is a version change however it was made. */
+const PAGE_VERSION = "{{VERSION}}";
+let versionDriftPrompted = false;
+
+async function checkVersionDrift() {
+  if (versionDriftPrompted) { return; }
+  let now;
+  try {
+    now = (await api("/api/self/version")).version;
+  } catch (e) {
+    return;                       /* mid-restart; the next tick will catch it */
+  }
+  if (!now || !PAGE_VERSION || now === PAGE_VERSION) { return; }
+  versionDriftPrompted = true;
+  const go = await dialog({
+    title: "Updated to " + now,
+    okText: "Reload now",
+    cancelText: "Later",
+    message:
+      "Proxmox Auto-Update is now on version <b>" + now + "</b>." +
+      "<p style='margin:10px 0 0'>This page is still showing " +
+      PAGE_VERSION + "'s interface. Reloading picks up the new one.</p>" +
+      "<p style='margin:10px 0 0;opacity:.75'>Any other Proxmox tabs you have " +
+      "open will want a refresh too.</p>",
+  });
+  if (go) { window.location.reload(); }
+}
+
+setInterval(checkVersionDrift, 15000);
+/* Also on return to the tab: a laptop asleep through the update comes back to
+   the prompt straight away rather than up to fifteen seconds later. */
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { checkVersionDrift(); }
+});
 """
 
 
@@ -2546,7 +2623,9 @@ def confirm_updates_flag():
 
 
 def _shared_js():
-    return SHARED_JS.replace("{{CONFIRM_UPDATES}}", confirm_updates_flag())
+    return (SHARED_JS
+            .replace("{{CONFIRM_UPDATES}}", confirm_updates_flag())
+            .replace("{{VERSION}}", PROCESS_VERSION))
 
 
 def render_page(user, csrf):
@@ -3493,7 +3572,7 @@ const CSRF = "{{CSRF}}";
 // wrote back the stale text value and silently reverted them.
 //
 // What is left here is the set of settings with no dedicated screen of their
-// own — including three added in 4.0.0 that had no UI at all.
+// own — including three added in 1.0.0 that had no UI at all.
 const FIELDS = [
   ["WINDOWS_UPDATE_TIMEOUT",  "Windows update timeout (s)",   "number",
    "How long a Windows guest gets to install updates. Cumulative updates often need more than an hour."],
@@ -3949,7 +4028,10 @@ function watchMaintenance() {
       $("reloadWarning").classList.add("hidden");
       latestVersion = null;
       loadChangelog();
-      offerReload(v.version);
+      if (!versionDriftPrompted) {
+        versionDriftPrompted = true;
+        offerReload(v.version);
+      }
     }
   }, 3000);
 }

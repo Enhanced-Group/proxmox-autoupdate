@@ -12,11 +12,61 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
-## 4.7.0 — 2026-08-12
+## 1.8.0 — 2026-08-12
+
+### Changed
+
+- **Renumbered to the 1.x line.** Releases up to this point were numbered 2.x
+  to 4.x, which overstated how long the tool had been in the open. Everything
+  in this changelog has been restated on the 1.x line — what shipped as 4.7.0
+  is 1.7.0 here — and the old tags are left in place on GitHub as a record.
+
+  The tag lookup ignores the retired 2.x–4.x tags, because they sort above
+  every 1.x release and "newest tag wins" would otherwise install the retired
+  code on every fresh machine. An installation still reporting a 2.x–4.x
+  version is treated as behind any 1.x release, so existing machines are
+  offered the update instead of being stranded on "up to date" forever.
+
+### Added
+
+- **The installer asks about every notification channel.** It offered email,
+  Discord, Slack and a generic webhook; the tool has supported Microsoft
+  Teams, ntfy, Gotify and Telegram since 1.2.0, and the only way to reach them
+  was to hand-edit the config or use the panel. All eight are now on the menu
+  with their own prompts. Teams is listed separately from Slack because it
+  cannot read Slack's payload format.
 
 ### Fixed
 
-- **Only the installer got the readable-colour fix in 4.4.0.** The uninstaller,
+- **The installer asked for SMTP settings and then threw them away.** The
+  prompts were added in 1.7.0 but the generated config file never contained
+  `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SECURITY` or
+  `EMAIL_TRANSPORT` — so a fresh install that chose SMTP email silently sent
+  nothing at all. The same omission covered every newer channel:
+  `TEAMS_WEBHOOK_URL`, `NTFY_URL`, `NTFY_TOKEN`, `GOTIFY_URL`, `GOTIFY_TOKEN`,
+  `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+
+- **Still no reload prompt after updating from a shell.** The prompt was tied
+  to the self-update systemd unit, which only runs when the update is started
+  from the panel. Running `install.sh` over SSH — how most upgrades actually
+  happen — replaced the panel and the injected Proxmox JavaScript underneath
+  every open tab without a word. Both now watch the installed version itself
+  and offer the reload whenever it changes, whatever caused the change.
+
+- **The generic webhook was described as the way to reach ntfy and Gotify.**
+  Posting this tool's JSON payload to an ntfy topic publishes the raw JSON as
+  the message body. Both have their own entries now, with the request shape
+  each one actually expects.
+
+- The deployment summary printed a Mailgun region and two empty email lines to
+  everyone, including the majority who skip notifications entirely. It now
+  lists the channels that were actually configured.
+
+## 1.7.0 — 2026-08-12
+
+### Fixed
+
+- **Only the installer got the readable-colour fix in 1.4.0.** The uninstaller,
   the update script and the web-UI patcher were all still using the ANSI faint
   attribute, which xterm.js — the Proxmox web shell — renders at very low
   contrast. So every hint and detail line in the tool people actually run
@@ -48,11 +98,11 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   an unprivileged container, while still reporting itself as active. Every probe
   is time-boxed; a diagnostic that hangs is worse than none.
 
-## 4.6.3 — 2026-08-12
+## 1.6.3 — 2026-08-12
 
 ### Fixed
 
-- **Container detection never ran.** The Docker/Podman check added in 4.5.0 was
+- **Container detection never ran.** The Docker/Podman check added in 1.5.0 was
   placed after the package-manager branches — every one of which ends in
   `exit 0`, because that is how the sentinel protocol signals completion. It was
   unreachable on every successful path, so a Docker host with nothing to upgrade
@@ -70,11 +120,11 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   those minutes were `apt-get update`" — which is what identifies a slow mirror
   or a contended host rather than a problem with this tool.
 
-## 4.6.2 — 2026-08-12
+## 1.6.2 — 2026-08-12
 
 ### Fixed
 
-- **No reload prompt after a self-update.** 4.5.6 removed the duplicate prompt
+- **No reload prompt after a self-update.** 1.5.6 removed the duplicate prompt
   by silencing the panel's and leaving it to the toolbar patch. That was the
   wrong way round: the toolbar polls every 25 seconds when idle, and the panel
   service is restarting for part of that window, so its status request fails and
@@ -84,7 +134,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   stands down while the panel is open, and still prompts other Proxmox tabs,
   which are the ones left running stale injected code.
 
-## 4.6.1 — 2026-08-12
+## 1.6.1 — 2026-08-12
 
 ### Fixed
 
@@ -95,7 +145,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   identical values. It now evaluates arithmetic before comparing, restricted to
   digits and operators so nothing in a config default can be executed.
 
-## 4.6.0 — 2026-08-12
+## 1.6.0 — 2026-08-12
 
 ### Fixed
 
@@ -131,7 +181,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   Discord is now reported as "too large" with the setting to adjust, rather
   than a bare HTTP code.
 
-## 4.5.6 — 2026-08-12
+## 1.5.6 — 2026-08-12
 
 ### Fixed
 
@@ -142,7 +192,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   parent page reloads the frame with it; opened standalone in its own tab there
   is no toolbar, so it still offers the reload itself.
 
-## 4.5.5 — 2026-08-12
+## 1.5.5 — 2026-08-12
 
 ### Fixed
 
@@ -153,7 +203,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   it again changed nothing. An explicit check now bypasses the cache and
   refreshes it; background polls still use it.
 
-## 4.5.4 — 2026-08-12
+## 1.5.4 — 2026-08-12
 
 ### Fixed
 
@@ -163,15 +213,15 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   returned nothing at all. So a maintainer who tags and pushes without also
   publishing a Release leaves every installation reporting "up to date" against
   a version that is not the newest — which is exactly what happened here
-  between v4.4.0 and v4.5.3: six tags, no Releases, and every panel reporting
-  4.4.0 as current.
+  between v1.4.0 and v1.5.3: six tags, no Releases, and every panel reporting
+  1.4.0 as current.
 
   Both now take whichever is *newer* of the published Release and the highest
   git tag, comparing by version rather than by the order GitHub returns things.
   A missing Release, a deleted tag, or an odd ordering can no longer make an
   update check resolve backwards or stall.
 
-## 4.5.3 — 2026-08-12
+## 1.5.3 — 2026-08-12
 
 ### Changed
 
@@ -187,7 +237,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   It also states plainly what the tool will not do: containers inside guests,
   anything on another node, and the exact conditions under which it reboots.
 
-## 4.5.2 — 2026-08-12
+## 1.5.2 — 2026-08-12
 
 ### Fixed
 
@@ -201,7 +251,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   false failure after a three-second no-op, the new one does not, and it still
   catches a real modification.
 
-## 4.5.1 — 2026-08-12
+## 1.5.1 — 2026-08-12
 
 ### Fixed
 
@@ -215,7 +265,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   Replaced with herestrings, which have no pipe to break: measured 20/20 false
   failures before, 0/20 after.
 
-## 4.5.0 — 2026-08-12
+## 1.5.0 — 2026-08-12
 
 ### Added
 
@@ -243,7 +293,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   reported. Alpine was advertised for a long time while its branch was
   unreachable; this stops that recurring.
 
-## 4.4.2 — 2026-08-12
+## 1.4.2 — 2026-08-12
 
 ### Fixed
 
@@ -254,7 +304,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   in the console, in notifications, and in the run history the panel shows.
   Found on the first real dry run against a live host.
 
-## 4.4.1 — 2026-08-12
+## 1.4.1 — 2026-08-12
 
 ### Fixed
 
@@ -270,7 +320,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   `--doctor` on a real host with 15 containers and 5 stopped VMs, where it
   reported on none of them.
 
-## 4.4.0 — 2026-08-12
+## 1.4.0 — 2026-08-12
 
 ### Fixed
 
@@ -294,7 +344,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   last few lines of what actually went wrong instead of only lacking a tick.
   Without a terminal the spinner degrades to a plain line.
 
-## 4.3.1 — 2026-08-11
+## 1.3.1 — 2026-08-11
 
 ### Changed
 
@@ -311,24 +361,24 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 - The save button that briefly lived in the header is gone. Each section keeps
   its save next to the form it applies to, which is where you look for it.
 
-## 4.3.0 — 2026-08-11
+## 1.3.0 — 2026-08-11
 
 ### Added
 
 - **A sticky header.** The title, status, schedule and tabs stay put while the
   page scrolls, so navigation is reachable from anywhere on a long page.
 
-## 4.2.2 — 2026-08-11
+## 1.2.2 — 2026-08-11
 
 ### Fixed
 
 - **The Settings tab opened empty.** Clicking it showed the container and
   fetched the data but never unhid the sub-section inside it, so the content
   sat behind `hidden` until a sub-tab click revealed it — which is why clicking
-  away and back appeared to fix it. Introduced in 4.1.0 with the tab
+  away and back appeared to fix it. Introduced in 1.1.0 with the tab
   consolidation.
 
-## 4.2.1 — 2026-08-11
+## 1.2.1 — 2026-08-11
 
 ### Fixed
 
@@ -355,7 +405,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   the URL.
 
 - **Saving the Configuration tab failed with "invalid value".** The three
-  timeouts added in 4.2.0 are not present in a config file written by an
+  timeouts added in 1.2.0 are not present in a config file written by an
   earlier version, so the panel served them as empty strings — and since a form
   posts every field it renders, and an empty integer failed validation, the
   whole form became unsaveable. Settings absent from the config file now show
@@ -377,7 +427,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   its own darker scrollbar, because it stays a console view in both themes —
   the page scrollbar there would have been a light bar on black.
 
-## 4.2.0 — 2026-08-11
+## 1.2.0 — 2026-08-11
 
 ### Added
 
@@ -415,7 +465,7 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   your own network with a token sent separately. The hosted-service webhooks
   still require `https://`, where the URL is the only credential.
 
-## 4.1.1 — 2026-08-11
+## 1.1.1 — 2026-08-11
 
 ### Fixed
 
@@ -439,9 +489,9 @@ The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
   than only on the status poll. A run started outside the panel — by cron — is
   labelled as such instead of showing a misleading clock.
 
-## 4.1.0 — 2026-08-11
+## 1.1.0 — 2026-08-11
 
-An interface release, on top of the correctness work in 4.0.0. The panel now
+An interface release, on top of the correctness work in 1.0.0. The panel now
 answers "did the scheduled run work?" on the page you land on, instead of
 making you go and find out.
 
@@ -470,7 +520,7 @@ making you go and find out.
   access, and does not touch `/etc/subscription`. If you run Proxmox
   commercially, buy a subscription.
 - **Three settings that had no interface.** `WINDOWS_SHUTDOWN_TIMEOUT`,
-  `LINUX_SHUTDOWN_TIMEOUT` and `AGENT_ERROR_GRACE` were added in 4.0.0 and were
+  `LINUX_SHUTDOWN_TIMEOUT` and `AGENT_ERROR_GRACE` were added in 1.0.0 and were
   only reachable by editing the config file. `PAU_TZ` is now editable too.
 
 ### Changed
@@ -498,7 +548,7 @@ making you go and find out.
 
 ### Fixed
 
-- **Exit code 2 was reported as a failure.** 4.0.0 introduced it to mean "the
+- **Exit code 2 was reported as a failure.** 1.0.0 introduced it to mean "the
   run finished, but guests were left mid-update, so the host reboot was held
   back" — usually a Windows guest still installing. The panel showed that as
   "last run failed (2)", turning a successful and deliberately cautious run
@@ -506,7 +556,7 @@ making you go and find out.
 - **A lost connection looked identical to an idle panel.** The page silently
   stopped updating. It now says it is reconnecting — which matters most during
   a host upgrade, when the Proxmox API restarts and someone is watching.
-- Panel copy that stopped being true in 4.0.0: the Run tab promised "Both email
+- Panel copy that stopped being true in 1.0.0: the Run tab promised "Both email
   the report to your configured recipient" when notifications are optional and
   email is one of four channels; the Exclusions tab pointed at an "Auto-Update
   tab" that does not exist; and the dry-run description still described the old
@@ -525,6 +575,10 @@ making you go and find out.
 Summarised so the record is visible here, with full detail in the
 [git history](https://github.com/Enhanced-Group/proxmox-autoupdate/commits/main)
 and on the [releases page](https://github.com/Enhanced-Group/proxmox-autoupdate/releases).
+
+These predate the 1.x line and keep the tag names they were released under, so
+the links still work. Their numbers sort above 1.x and mean nothing next to it —
+v3.5.1 is older than 1.0.0, not newer.
 
 - **[v3.5.1](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.5.1)** — test-notification button fixed.
 - **[v3.5.0](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v3.5.0)** — credentials passed to curl on stdin, never in the process list.
