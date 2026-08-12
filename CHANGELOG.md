@@ -12,6 +12,17 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.6.1 — 2026-08-12
+
+### Fixed
+
+- **CI compared config defaults as text, so two spellings of the same number
+  failed.** `DISCORD_MAX_UPLOAD` is written as `$((8 * 1024 * 1024))` in the
+  script, which is clearer than `8388608`, and stored as the number in the
+  panel. The check compared the strings and reported a mismatch between two
+  identical values. It now evaluates arithmetic before comparing, restricted to
+  digits and operators so nothing in a config default can be executed.
+
 ## 4.6.0 — 2026-08-12
 
 ### Fixed

@@ -187,6 +187,23 @@ bad = False
 # inference in effective_email_transport().
 INFERRED = {"EMAIL_TRANSPORT"}
 
+# A shell default may be written as arithmetic — $((8 * 1024 * 1024)) is
+# clearer in the script than 8388608, and the panel has to store the number.
+# Compare what they evaluate to, not how they are spelled, or the check fails
+# on two spellings of the same value.
+ARITH = re.compile(r'\A\$\(\(([0-9+\-*/ ()]+)\)\)\Z')
+
+
+def as_value(text):
+    m = ARITH.match(text.strip())
+    if not m:
+        return text
+    try:
+        return str(eval(m.group(1), {"__builtins__": {}}, {}))  # digits and operators only
+    except Exception:
+        return text
+
+
 for key, shown in sorted(defaults.items()):
     if key in INFERRED:
         continue
@@ -194,7 +211,7 @@ for key, shown in sorted(defaults.items()):
     if not sm:
         continue          # panel-only setting; nothing to compare against
     actual = sm.group(1)
-    if actual != shown:
+    if as_value(actual) != as_value(shown):
         print("  [FAIL] %s: panel shows %r, script defaults to %r" % (key, shown, actual))
         bad = True
 if not bad:

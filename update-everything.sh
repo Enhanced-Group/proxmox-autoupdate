@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.6.0"
+PAU_VERSION="4.6.1"
 
 set -u
 set -o pipefail
