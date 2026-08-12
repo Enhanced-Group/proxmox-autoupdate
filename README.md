@@ -62,6 +62,102 @@ Required packages — the installer adds the first two automatically if missing,
 
 ---
 
+## Before You Install
+
+**On a stock Proxmox install this works out of the box.** Everything it needs is
+either already there or installed for you, and the installer refuses to run
+anywhere that isn't a Proxmox VE host. You do not need to prepare anything.
+
+There are, however, four things worth knowing first — two of which catch almost
+everybody.
+
+### 1. The enterprise repository, if you have no subscription
+
+A fresh Proxmox enables `pve-enterprise`, which returns **HTTP 401** without a
+subscription. `apt-get update` then fails on every run and **the host can never
+be updated** — while Debian's own repositories keep working, so it is easy to
+miss.
+
+This is the single most common reason a homelab install appears to do nothing.
+Check with:
+
+```bash
+update-everything.sh --doctor
+```
+
+It detects this case specifically and names it. To fix, either buy a
+subscription (it funds Proxmox) or switch to the no-subscription repository —
+Proxmox documents both.
+
+### 2. VMs need the guest agent; containers do not
+
+Containers are updated through `pct exec` and need nothing installed.
+
+**VMs are different.** There is no way into a VM without the QEMU guest agent,
+so a VM without it is reported as *Agent Offline* and skipped — permanently, and
+quietly, unless you look. Two steps, both required:
+
+1. Enable the agent in Proxmox: **VM → Options → QEMU Guest Agent → Enabled**
+2. Install it **inside** the guest:
+   - Debian/Ubuntu: `apt install qemu-guest-agent`
+   - RHEL/Alma/Rocky: `dnf install qemu-guest-agent`
+   - Windows: the VirtIO driver ISO, which includes `qemu-ga`
+
+`--doctor` lists every running VM whose agent is not answering.
+
+### 3. Decide what should happen to stopped guests
+
+By default, **stopped containers are started, updated and stopped again**;
+stopped VMs are left alone. That is often not what people expect, in either
+direction. The defaults:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `START_STOPPED_LXC` | `true` | Stopped containers are booted, updated, then returned to stopped |
+| `START_STOPPED_LINUX_VMS` | `true` | Same for Linux VMs |
+| `START_STOPPED_WINDOWS` | `false` | Stopped Windows VMs are skipped |
+
+If you have containers that are stopped deliberately — a spare, a broken
+experiment, something half-built — set `START_STOPPED_LXC=false` before the
+first scheduled run.
+
+### 4. Snapshots are off by default
+
+`SNAPSHOT_BEFORE_UPDATE=false`. Turning it on requires storage that supports
+snapshots (ZFS, LVM-thin, or qcow2 on directory storage); on plain LVM or raw
+disks the snapshot fails and the guest is updated anyway.
+
+### Then, before you trust it
+
+Run the two read-only checks in order. Neither changes anything:
+
+```bash
+update-everything.sh --doctor
+```
+
+```bash
+update-everything.sh --dry-run
+```
+
+A dry run reports exactly what a real run would install, and starts nothing,
+installs nothing and reboots nothing. If both look right, the scheduled run will
+do what you expect.
+
+### What it will not do for you
+
+- **Containers inside your guests.** Docker and Podman hosts are detected and
+  reported, but their images are never pulled or restarted — that needs compose
+  files and restart ordering, and it can take a stack down in ways `apt` cannot.
+- **Anything on another node.** Each install manages its own host.
+- **Reboot unexpectedly.** A reboot is scheduled only when this run installed a
+  new kernel, or when the system itself has flagged `/var/run/reboot-required`.
+  It is always suppressed during a `--dry-run`, during a `--only` run, when the
+  host upgrade failed, and when any guest was left mid-update — taking the host
+  down then would kill `dpkg` part way through inside it. The time is
+  `REBOOT_TIME`, in the host's own timezone.
+
+---
+
 ## One-Command Quick Install / Update
 
 Run this on your Proxmox host **as `root`**:

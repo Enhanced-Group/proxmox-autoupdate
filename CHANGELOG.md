@@ -12,6 +12,22 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.3 — 2026-08-12
+
+### Changed
+
+- **Added a "Before You Install" section to the README.** On a stock Proxmox
+  this installs and runs without preparation, but four things decide whether it
+  does what you expect, and two of them catch almost everybody: the enterprise
+  repository returning 401 without a subscription, so the host can never update
+  while Debian's own repositories keep working; and VMs needing the QEMU guest
+  agent installed *inside* the guest, without which they are skipped silently
+  and permanently. The other two are what happens to stopped guests, and that
+  snapshots are off by default and need snapshot-capable storage.
+
+  It also states plainly what the tool will not do: containers inside guests,
+  anything on another node, and the exact conditions under which it reboots.
+
 ## 4.5.2 — 2026-08-12
 
 ### Fixed
