@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="1.8.0"
+PAU_VERSION="1.8.1"
 
 set -u
 set -o pipefail
@@ -3917,8 +3917,14 @@ cat <<EOF > "${HTML_FILE}"
       ${VM_HTML}
     </table>
 
+    <!-- This said "delivered via Mailgun ${MAILGUN_REGION} API" for every
+         report, on every channel. One file is built and then handed to all of
+         them — SMTP, Discord, Slack, Teams, ntfy, Gotify, Telegram, webhook —
+         so it cannot name its own transport, and MAILGUN_REGION defaults to EU
+         even on a host with no Mailgun credentials at all. What the report can
+         honestly say is which machine produced it, and when. -->
     <div class='footer'>
-      Automated report delivered via Mailgun ${MAILGUN_REGION} API by <strong>${HOST_NAME}</strong>.
+      Proxmox Auto-Update ${PAU_VERSION} on <strong>${HOST_NAME}</strong> — ${TIMESTAMP}
     </div>
   </div>
 </body>

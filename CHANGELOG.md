@@ -12,6 +12,79 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.8.1 — 2026-08-12
+
+Six defects that every automated check passed. They pass `bash -n`, they pass
+shellcheck, and a scripted install completes cleanly with all of them present —
+they are only wrong for a human sitting at a terminal, or for a value nobody
+thought to type. Found by reading the installer as a transcript rather than as
+a program.
+
+### Fixed
+
+- **None of the installer's questions were printed.** `read -p` shows its prompt
+  only when *stdin* is a terminal, and the documented install is
+  `curl -fsSL … | bash`, where stdin is the script being piped in. All 43
+  questions printed nothing: the terminal sat at a blank line, cursor waiting,
+  for a question it had never shown. Whole sections — Advanced settings most
+  visibly — looked empty. Every prompt is now written out explicitly.
+
+  The same bug made the uninstaller's `Proceed? (y/N):` invisible.
+
+- **A password containing `$` stopped every scheduled run, silently.** Answers
+  were interpolated raw into the config file, which is `source`d as root on
+  every run. A `$` in a password aborted the run with `unbound variable` before
+  the fatal-notification code was reached, so nothing was sent and updates
+  simply stopped. A backtick or `$( )` in a pasted token **executed as root**
+  every week. A `"` made the file unparseable. None of it was visible — the
+  file on disk showed the right password. Values are now single-quoted with
+  embedded quotes escaped, which is what the panel has always done and what
+  the update script's own comment already claimed the installer did.
+
+- **A port clash deleted the panel it had just installed.** If something else
+  held the chosen port — Proxmox Backup Server on 8007 is the documented case —
+  the installer flipped an internal flag that dropped it into the *teardown*
+  branch, whose guard is "does the unit file exist?" — satisfied by the unit
+  written seconds earlier. It un-patched the Proxmox UI, deleted the binary,
+  the unit, its drop-in directory and the apt hook, and finished with a green
+  "✓ Web control panel removed" for a panel the operator had just asked for,
+  while the config file still said `ENABLE_WEB_UI="true"`. Nothing is removed
+  now; the panel is left installed and stopped, with the two commands needed to
+  put it on a free port.
+
+- **`9:00` at the reboot prompt bricked the schedule.** The installer accepted
+  any text, printed a green tick and "Deployment successful". The update script
+  treats anything that is not 24-hour `HH:MM` as fatal and exits before touching
+  a single guest — so every run from then on did nothing, into a cron log nobody
+  reads. A single-digit hour is now padded; anything else is re-asked.
+
+- **Re-installing downgraded an SSL/465 mail setup to STARTTLS.**
+  `SMTP_SECURITY` was the one setting with no carry-over: it was reset to
+  `starttls` on every run and written straight back out. That includes the
+  panel's own unattended self-update, so mail could stop working after an
+  upgrade nobody thought of as a mail change.
+
+- **Every report claimed Mailgun delivered it.** The footer read "delivered via
+  Mailgun EU API" whatever sent it — SMTP, Discord, Slack, Teams, ntfy, Gotify,
+  Telegram, webhook — and on hosts with no Mailgun credentials at all, because
+  the region defaults to EU. One report is built and handed to every channel, so
+  it cannot name its own transport; it now names the host and the time instead.
+
+### Changed
+
+- Prompt copy throughout. `(current)` labelled the built-in defaults on a fresh
+  install, where nothing is current; `[default: false]` and `[current: true]`
+  asked the reader to decode a boolean to answer a 1-or-2 question;
+  `Username []` offered an empty default and the password prompt offered to keep
+  one that did not exist. Exclusions, the Windows timeout and the reboot time
+  had no heading or explanation at all.
+
+- Discord's bot token is no longer echoed to the terminal. Telegram's already
+  was not.
+
+- CI checks that no prompt uses `read -p`, and that every config value goes
+  through the quoting helper. Both were invisible to every existing check.
+
 ## 1.8.0 — 2026-08-12
 
 ### Changed

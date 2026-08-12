@@ -300,6 +300,51 @@ else
     ok "every channel credential reaches the config file"
 fi
 
+# --- 3d-ter. Every question is actually printed ------------------------------
+# `read -p` prints its prompt only when *stdin* is a terminal. The documented
+# way to install this is `curl -fsSL … | bash`, where stdin is the script being
+# piped in — so all forty-odd questions printed nothing, and the terminal sat
+# at a blank line waiting for an answer to a question it had never shown. Whole
+# sections of the installer looked empty.
+#
+# Nothing in bash -n, shellcheck or an automated run catches this: the reads
+# still work, so the installer completes. It is only visible to a human at a
+# terminal, which is why it survived several releases.
+echo "== prompts are printed, not passed to read -p =="
+BAD=$(grep -nE 'read +-[a-zA-Z]*p[a-zA-Z]* ' install.sh uninstall.sh || true)
+if [ -n "${BAD}" ]; then
+    fail "read -p used for a prompt (invisible under 'curl | bash'):"
+    echo "${BAD}" | sed 's/^/         /'
+else
+    ok "no read -p prompts in the installer or uninstaller"
+fi
+ASKS=$(grep -cE '^[[:space:]]*ask(_secret)? ' install.sh)
+if [ "${ASKS}" -lt 30 ]; then
+    fail "only ${ASKS} ask()/ask_secret() prompts — did the conversion get reverted?"
+else
+    ok "${ASKS} questions go through the printing helpers"
+fi
+
+# --- 3d-quater. Config values are shell-quoted --------------------------------
+# The config file is `source`d as root by every cron run. The installer wrote
+# answers into a double-quoted heredoc raw, so a password containing "$" killed
+# every run with "unbound variable" (before notify_fatal, so silently), a token
+# containing a backtick executed as root weekly, and a value containing a quote
+# made the file unparseable. Nothing showed it: the file on disk looked right.
+#
+# update-everything.sh's own comment asserts "anything the panel or installer
+# wrote is single-quoted". This keeps that true.
+echo "== config values are shell-quoted =="
+CONF_BODY=$(sed -n '/^cat > "${CONFIG_FILE}" <<CONF$/,/^CONF$/p' install.sh \
+            | grep -E '^[A-Z0-9_]+=')
+RAW=$(echo "${CONF_BODY}" | grep -vE '^[A-Z0-9_]+=\$\(sq ' || true)
+if [ -n "${RAW}" ]; then
+    fail "config values written without sq():"
+    echo "${RAW}" | sed 's/^/         /'
+else
+    ok "all $(echo "${CONF_BODY}" | wc -l | tr -d ' ') config values go through sq()"
+fi
+
 # --- 3e. No faint text -------------------------------------------------------
 # \033[2m is rendered at very low contrast by xterm.js, which is what the
 # Proxmox web shell uses — it made roughly a third of the installer invisible

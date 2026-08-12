@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.8.0"
+PAU_FALLBACK_REF="v1.8.1"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -197,6 +197,54 @@ run_step() {
 # Never leave a spinner spinning if the script aborts.
 trap 'spin_stop' EXIT INT TERM
 
+# Ask a question on fd 3.
+#
+# `read -p` cannot be used for this, and using it was the single worst bug in
+# this installer. Bash prints a -p prompt *only when stdin is a terminal* — and
+# under the documented install, `curl -fsSL … | bash`, stdin is the script being
+# piped in. Every one of the forty-odd questions here therefore printed nothing
+# at all: the terminal sat at a blank line, cursor waiting, for an answer to a
+# question it had never shown. Whole sections looked empty. Prompts are written
+# out explicitly here, so they are visible however the installer was started.
+#
+# The prompt goes through %b so ${C_BOLD} and friends still render.
+ask() {
+    local __var="$1" __prompt="$2" __ans=""
+    printf '%b' "${__prompt}"
+    # On EOF — no terminal, or an answer file that has run out — read leaves the
+    # line half-written, so close it here.
+    read -r __ans <&3 || { __ans=""; echo ""; }
+    printf -v "${__var}" '%s' "${__ans}"
+}
+
+# The same, without echoing what is typed. For tokens, passwords and API keys.
+ask_secret() {
+    local __var="$1" __prompt="$2" __ans=""
+    printf '%b' "${__prompt}"
+    read -rs __ans <&3 || __ans=""
+    echo ""
+    printf -v "${__var}" '%s' "${__ans}"
+}
+
+# Render a value as a single-quoted shell literal, for writing into the config.
+#
+# The config file is `source`d as root by every cron run. Values used to be
+# written into a double-quoted heredoc raw, so whatever was typed at a prompt
+# was re-interpreted by the shell on the way back in:
+#
+#   a password containing $      ->  every run dies with "unbound variable",
+#                                    before notify_fatal, so silently
+#   a token containing `cmd`     ->  cmd runs as root, weekly, forever
+#   a value containing "         ->  the file stops being valid shell
+#
+# None of it is visible: the file on disk shows the right password. The panel
+# has always written single-quoted values through sh_quote(), and
+# update-everything.sh's comment already asserts "anything the panel or
+# installer wrote is single-quoted" — this makes that true of the installer.
+sq() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # Prompt for a value that must not end up empty, falling back to whatever is
 # already configured.
 #
@@ -212,9 +260,9 @@ ask_required() {
     while [ "${attempts}" -lt 5 ]; do
         attempts=$((attempts + 1))
         if [ -n "${prev}" ]; then
-            read -rp "  ${label} [Enter to keep existing]: " answer <&3 || true
+            ask answer "  ${label} [Enter to keep existing]: "
         else
-            read -rp "  ${label}: " answer <&3 || true
+            ask answer "  ${label}: "
         fi
         answer="${answer:-${prev}}"
         if [ -n "${answer}" ]; then
@@ -419,6 +467,7 @@ PREV_SMTP_HOST=""
 PREV_SMTP_PORT=""
 PREV_SMTP_USER=""
 PREV_SMTP_PASSWORD=""
+PREV_SMTP_SECURITY=""
 PREV_NOTIFY_METHODS=""
 PREV_FAIL_ONLY=""
 PREV_DISCORD=""
@@ -430,7 +479,14 @@ PREV_BOT_TOKEN=""
 PREV_USER_ID=""
 PREV_CONFIRM=""
 
+# On a fresh box the built-in defaults are not "current" — nothing is current
+# yet — and labelling them that way made the installer look like it had found a
+# configuration it had not.
+MARK_CURRENT="(default)"
+WORD_CURRENT="default"
 if [ -f "${CONFIG_FILE}" ]; then
+    MARK_CURRENT="(current)"
+    WORD_CURRENT="current"
     echo ""
     print_ok "Found existing configuration at ${C_DIM}${CONFIG_FILE}${C_NC}"
     # shellcheck source=/dev/null
@@ -483,6 +539,7 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_SMTP_PORT="${SMTP_PORT:-}"
     PREV_SMTP_USER="${SMTP_USER:-}"
     PREV_SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+    PREV_SMTP_SECURITY="${SMTP_SECURITY:-}"
 
     # Installs predating NOTIFY_METHODS had Mailgun and nothing else.
     if [ -z "${PREV_NOTIFY_METHODS}" ] && [ -n "${MAILGUN_API_KEY:-}" ]; then
@@ -542,7 +599,13 @@ echo -e "  ${C_CYAN}8)${C_NC} Telegram  ${C_DIM}(bot)${C_NC}"
 echo -e "  ${C_CYAN}9)${C_NC} Generic webhook  ${C_DIM}(JSON POST)${C_NC}"
 echo ""
 echo -e "  ${C_DIM}Enter one or more numbers, e.g. \"3\" or \"2,3\".${C_NC}"
-read -rp "  Select [Enter to keep current]: " INPUT_METHODS <&3 || true
+# "[Enter to keep current]" was meaningless on a fresh install, where there is
+# no current — it read as though pressing Enter would keep something.
+if [ -n "${DEFAULT_METHODS}" ]; then
+    ask INPUT_METHODS "  Select [Enter to keep ${DEFAULT_METHODS}]: "
+else
+    ask INPUT_METHODS "  Select [Enter for 1, skip]: "
+fi
 
 MAILGUN_API_KEY="${PREV_KEY}"
 MAILGUN_DOMAIN="${PREV_DOMAIN}"
@@ -552,7 +615,11 @@ SMTP_HOST="${PREV_SMTP_HOST}"
 SMTP_PORT="${PREV_SMTP_PORT:-587}"
 SMTP_USER="${PREV_SMTP_USER}"
 SMTP_PASSWORD="${PREV_SMTP_PASSWORD}"
-SMTP_SECURITY="starttls"
+# Every other key carries the previous value forward; this one did not, so a
+# re-install — including the panel's unattended self-update — silently rewrote
+# an SSL/465 or unauthenticated-relay setup back to STARTTLS, and mail stopped
+# going out with nothing on screen to say so.
+SMTP_SECURITY="${PREV_SMTP_SECURITY:-starttls}"
 TEAMS_WEBHOOK_URL="${PREV_TEAMS}"
 NTFY_URL="${PREV_NTFY_URL}"
 NTFY_TOKEN="${PREV_NTFY_TOKEN}"
@@ -604,7 +671,7 @@ else
         DEFAULT_TRANSPORT="1"
         [ "${PREV_TRANSPORT}" = "mailgun" ] && DEFAULT_TRANSPORT="2"
         [ -z "${PREV_TRANSPORT}" ] && [ -n "${PREV_KEY}" ] && DEFAULT_TRANSPORT="2"
-        read -rp "  Send via [${DEFAULT_TRANSPORT}]: " I <&3 || true
+        ask I "  Send via [${DEFAULT_TRANSPORT}]: "
         case "${I:-${DEFAULT_TRANSPORT}}" in
             2) EMAIL_TRANSPORT="mailgun" ;;
             *) EMAIL_TRANSPORT="smtp" ;;
@@ -613,19 +680,36 @@ else
         if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
             ask_required MAILGUN_API_KEY "API key" "${PREV_KEY}"
             ask_required MAILGUN_DOMAIN "Domain (e.g. mg.example.com)" "${PREV_DOMAIN}"
-            read -rp "  Region — 1 for EU, 2 for US [${MAILGUN_REGION}]: " I <&3 || true
+            if [ "${MAILGUN_REGION}" = "US" ]; then
+                ask I "  Region — 1 for EU, 2 for US [Enter for 2]: "
+            else
+                ask I "  Region — 1 for EU, 2 for US [Enter for 1]: "
+            fi
             case "${I}" in 1) MAILGUN_REGION="EU" ;; 2) MAILGUN_REGION="US" ;; esac
         else
             ask_required SMTP_HOST "SMTP host (e.g. smtp.example.com)" "${PREV_SMTP_HOST}"
-            read -rp "  Port [${PREV_SMTP_PORT:-587}]: " I <&3 || true
+            ask I "  Port [${PREV_SMTP_PORT:-587}]: "
             SMTP_PORT="${I:-${PREV_SMTP_PORT:-587}}"
             echo -e "  ${C_DIM}1) STARTTLS (587)   2) SSL/TLS (465)   3) none — local relay${C_NC}"
-            read -rp "  Encryption [1]: " I <&3 || true
-            case "${I:-1}" in 2) SMTP_SECURITY="ssl" ;; 3) SMTP_SECURITY="none" ;; *) SMTP_SECURITY="starttls" ;; esac
-            read -rp "  Username [${PREV_SMTP_USER}] (blank for none): " I <&3 || true
+            case "${SMTP_SECURITY}" in ssl) SEC_DEFAULT=2 ;; none) SEC_DEFAULT=3 ;; *) SEC_DEFAULT=1 ;; esac
+            ask I "  Encryption [Enter for ${SEC_DEFAULT}]: "
+            case "${I:-${SEC_DEFAULT}}" in
+                2) SMTP_SECURITY="ssl" ;;
+                3) SMTP_SECURITY="none" ;;
+                *) SMTP_SECURITY="starttls" ;;
+            esac
+            if [ -n "${PREV_SMTP_USER}" ]; then
+                ask I "  Username [Enter keeps ${PREV_SMTP_USER}]: "
+            else
+                ask I "  Username [Enter for none — unauthenticated relay]: "
+            fi
             SMTP_USER="${I:-${PREV_SMTP_USER}}"
             if [ -n "${SMTP_USER}" ]; then
-                read -rsp "  Password [Enter to keep existing]: " I <&3 || true; echo ""
+                if [ -n "${PREV_SMTP_PASSWORD}" ]; then
+                    ask_secret I "  Password [Enter to keep the existing one]: "
+                else
+                    ask_secret I "  Password (not echoed): "
+                fi
                 SMTP_PASSWORD="${I:-${PREV_SMTP_PASSWORD}}"
             fi
         fi
@@ -644,15 +728,15 @@ else
         echo -e "  ${C_BOLD}Discord${C_NC}"
         echo -e "    ${C_CYAN}1)${C_NC} Channel webhook  ${C_DIM}(Server Settings → Integrations → Webhooks)${C_NC}"
         echo -e "    ${C_CYAN}2)${C_NC} Direct message   ${C_DIM}(bot token + your user ID)${C_NC}"
-        read -rp "  Select 1 or 2 [1]: " I <&3 || true
+        ask I "  Select 1 or 2 [1]: "
         if [ "${I}" = "2" ]; then
             echo -e "  ${C_DIM}The bot must share a server with you for Discord to allow the DM.${C_NC}"
             echo -e "  ${C_DIM}It is never run as a process — the token is only used to POST.${C_NC}"
-            read -rp "  Bot token: " I <&3 || true
+            ask_secret I "  Bot token (not echoed): "
             DISCORD_BOT_TOKEN="${I:-${PREV_BOT_TOKEN}}"
-            read -rp "  Your Discord user ID (numeric): " I <&3 || true
+            ask I "  Your Discord user ID (numeric): "
             DISCORD_USER_ID="${I:-${PREV_USER_ID}}"
-            read -rp "  Fallback webhook URL (optional): " I <&3 || true
+            ask I "  Fallback webhook URL (optional): "
             DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
             if [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; then
                 print_ok "Discord DM configured"
@@ -661,7 +745,7 @@ else
                 NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
             fi
         else
-            read -rp "  Webhook URL: " I <&3 || true
+            ask I "  Webhook URL: "
             DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
             if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
                 print_ok "Discord configured"
@@ -675,7 +759,7 @@ else
     if echo ",${NOTIFY_METHODS}," | grep -q ",slack,"; then
         echo ""
         echo -e "  ${C_BOLD}Slack${C_NC}"
-        read -rp "  Webhook URL: " I <&3 || true
+        ask I "  Webhook URL: "
         SLACK_WEBHOOK_URL="${I:-${PREV_SLACK}}"
         if [ -n "${SLACK_WEBHOOK_URL}" ]; then
             print_ok "Slack configured"
@@ -690,7 +774,7 @@ else
         echo -e "  ${C_BOLD}Microsoft Teams${C_NC}"
         echo -e "  ${C_DIM}Works with a Power Automate \"when a Teams webhook request is${C_NC}"
         echo -e "  ${C_DIM}received\" trigger, or a legacy Office 365 connector.${C_NC}"
-        read -rp "  Webhook URL: " I <&3 || true
+        ask I "  Webhook URL: "
         TEAMS_WEBHOOK_URL="${I:-${PREV_TEAMS}}"
         if [ -n "${TEAMS_WEBHOOK_URL}" ]; then
             print_ok "Teams configured"
@@ -704,10 +788,10 @@ else
         echo ""
         echo -e "  ${C_BOLD}ntfy${C_NC}"
         echo -e "  ${C_DIM}The topic is part of the URL, e.g. https://ntfy.sh/my-topic${C_NC}"
-        read -rp "  Topic URL: " I <&3 || true
+        ask I "  Topic URL: "
         NTFY_URL="${I:-${PREV_NTFY_URL}}"
         if [ -n "${NTFY_URL}" ]; then
-            read -rsp "  Access token [Enter for none]: " I <&3 || true; echo ""
+            ask_secret I "  Access token [Enter for none]: "
             NTFY_TOKEN="${I:-${PREV_NTFY_TOKEN}}"
             print_ok "ntfy configured"
         else
@@ -719,9 +803,9 @@ else
     if echo ",${NOTIFY_METHODS}," | grep -q ",gotify,"; then
         echo ""
         echo -e "  ${C_BOLD}Gotify${C_NC}"
-        read -rp "  Server URL (e.g. https://gotify.example.com): " I <&3 || true
+        ask I "  Server URL (e.g. https://gotify.example.com): "
         GOTIFY_URL="${I:-${PREV_GOTIFY_URL}}"
-        read -rsp "  Application token: " I <&3 || true; echo ""
+        ask_secret I "  Application token: "
         GOTIFY_TOKEN="${I:-${PREV_GOTIFY_TOKEN}}"
         if [ -n "${GOTIFY_URL}" ] && [ -n "${GOTIFY_TOKEN}" ]; then
             print_ok "Gotify configured"
@@ -736,9 +820,9 @@ else
         echo -e "  ${C_BOLD}Telegram${C_NC}"
         echo -e "  ${C_DIM}Create a bot with @BotFather, message it, then read your chat ID${C_NC}"
         echo -e "  ${C_DIM}from https://api.telegram.org/bot<token>/getUpdates${C_NC}"
-        read -rsp "  Bot token: " I <&3 || true; echo ""
+        ask_secret I "  Bot token (not echoed): "
         TELEGRAM_BOT_TOKEN="${I:-${PREV_TG_TOKEN}}"
-        read -rp "  Chat ID: " I <&3 || true
+        ask I "  Chat ID: "
         TELEGRAM_CHAT_ID="${I:-${PREV_TG_CHAT}}"
         if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
             print_ok "Telegram configured"
@@ -754,7 +838,7 @@ else
         echo -e "  ${C_DIM}Receives a JSON POST — Home Assistant, n8n, your own endpoint.${C_NC}"
         echo -e "  ${C_DIM}ntfy and Gotify have their own options above; they need their own${C_NC}"
         echo -e "  ${C_DIM}request shapes, not this one.${C_NC}"
-        read -rp "  URL: " I <&3 || true
+        ask I "  URL: "
         GENERIC_WEBHOOK_URL="${I:-${PREV_GENERIC}}"
         if [ -n "${GENERIC_WEBHOOK_URL}" ]; then
             print_ok "Generic webhook configured"
@@ -775,7 +859,11 @@ if [ -n "${NOTIFY_METHODS}" ]; then
     DEFAULT_FAIL_ONLY="${PREV_FAIL_ONLY:-false}"
     echo -e "  ${C_BOLD}Only notify when something fails?${C_NC}"
     echo -e "  ${C_DIM}A weekly \"nothing happened\" message trains you to ignore the channel.${C_NC}"
-    read -rp "  1 = only on failure, 2 = every run [current: ${DEFAULT_FAIL_ONLY}]: " I <&3 || true
+    if [ "${DEFAULT_FAIL_ONLY}" = "true" ]; then
+        ask I "  1 = only on failure, 2 = every run [Enter for 1]: "
+    else
+        ask I "  1 = only on failure, 2 = every run [Enter for 2]: "
+    fi
     case "${I}" in
         1) NOTIFY_ON_FAILURE_ONLY="true" ;;
         2) NOTIFY_ON_FAILURE_ONLY="false" ;;
@@ -790,13 +878,20 @@ fi
 echo ""
 step "Advanced settings"
 echo ""
+echo -e "  ${C_DIM}Every question here has a working default — press Enter to take it.${C_NC}"
+echo -e "  ${C_DIM}All of it can be changed later in the web panel or the config file.${C_NC}"
+echo ""
 
 # --- Exclude IDs ---
+echo -e "  ${C_BOLD}Guests to leave alone${C_NC}"
+echo -e "  ${C_DIM}VM and container IDs the updater should skip entirely — a database${C_NC}"
+echo -e "  ${C_DIM}that must not restart, an appliance you patch by hand. Comma-separated,${C_NC}"
+echo -e "  ${C_DIM}e.g. 100,201,305.${C_NC}"
 EXCLUDE_IDS=""
 if [ -n "${PREV_EXCLUDE}" ]; then
-    read -rp "  Exclude VM/CT IDs [Enter keeps ${PREV_EXCLUDE}, 'none' clears]: " INPUT_EXCLUDE <&3 || true
+    ask INPUT_EXCLUDE "  Exclude VM/CT IDs [Enter keeps ${PREV_EXCLUDE}, 'none' clears]: "
 else
-    read -rp "  Exclude VM/CT IDs (comma-separated, or blank for none): " INPUT_EXCLUDE <&3 || true
+    ask INPUT_EXCLUDE "  Exclude VM/CT IDs [Enter for none]: "
 fi
 # `:-` treats an empty answer as "unset", so pressing Enter to clear the list
 # silently reinstated the previous one and there was no way to empty it from
@@ -816,9 +911,14 @@ else
 fi
 
 # --- Windows Update Timeout ---
+echo ""
+echo -e "  ${C_BOLD}Windows Update timeout${C_NC}"
+echo -e "  ${C_DIM}How long a Windows VM gets to finish before it is reported as timed${C_NC}"
+echo -e "  ${C_DIM}out. Cumulative updates on a machine that has been off for a while${C_NC}"
+echo -e "  ${C_DIM}routinely take longer than you would guess.${C_NC}"
 WINDOWS_UPDATE_TIMEOUT=""
 DEFAULT_WIN_TIMEOUT="${PREV_WIN_TIMEOUT:-1200}"
-read -rp "  Windows Update timeout in seconds [Enter for ${DEFAULT_WIN_TIMEOUT}]: " INPUT_WIN_TIMEOUT <&3 || true
+ask INPUT_WIN_TIMEOUT "  Seconds [Enter for ${DEFAULT_WIN_TIMEOUT}]: "
 WINDOWS_UPDATE_TIMEOUT="${INPUT_WIN_TIMEOUT:-${DEFAULT_WIN_TIMEOUT}}"
 print_ok "Windows timeout: ${WINDOWS_UPDATE_TIMEOUT}s"
 
@@ -828,13 +928,13 @@ echo -e "  ${C_BOLD}Start stopped Windows VMs for updates?${C_NC}"
 echo -e "  ${C_DIM}(Windows Update can take 30+ minutes — not recommended for short maintenance windows)${C_NC}"
 DEFAULT_START_WIN="${PREV_START_WIN:-false}"
 if [ "${DEFAULT_START_WIN}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
     echo -e "    ${C_CYAN}2)${C_NC} No"
 else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_WIN <&3 || true
+ask INPUT_START_WIN "  Select 1 or 2 [Enter to keep the marked one]: "
 case "${INPUT_START_WIN}" in
     1) START_STOPPED_WINDOWS="true" ;;
     2) START_STOPPED_WINDOWS="false" ;;
@@ -848,13 +948,13 @@ echo ""
 echo -e "  ${C_BOLD}Start stopped LXC Containers for updates?${C_NC}"
 DEFAULT_START_LXC="${PREV_START_LXC:-true}"
 if [ "${DEFAULT_START_LXC}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
     echo -e "    ${C_CYAN}2)${C_NC} No"
 else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_LXC <&3 || true
+ask INPUT_START_LXC "  Select 1 or 2 [Enter to keep the marked one]: "
 case "${INPUT_START_LXC}" in
     1) START_STOPPED_LXC="true" ;;
     2) START_STOPPED_LXC="false" ;;
@@ -868,13 +968,13 @@ echo ""
 echo -e "  ${C_BOLD}Start stopped Linux VMs for updates?${C_NC}"
 DEFAULT_START_LINUX_VMS="${PREV_START_LINUX_VMS:-true}"
 if [ "${DEFAULT_START_LINUX_VMS}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
     echo -e "    ${C_CYAN}2)${C_NC} No"
 else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_START_LINUX_VMS <&3 || true
+ask INPUT_START_LINUX_VMS "  Select 1 or 2 [Enter to keep the marked one]: "
 case "${INPUT_START_LINUX_VMS}" in
     1) START_STOPPED_LINUX_VMS="true" ;;
     2) START_STOPPED_LINUX_VMS="false" ;;
@@ -889,7 +989,7 @@ DEFAULT_LINUX_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
 echo -e "  ${C_DIM}How long a Linux guest gets to finish its upgrade before being"
 echo -e "  reported as timed out. A large dist-upgrade on a slow mirror can"
 echo -e "  easily exceed 10 minutes.${C_NC}"
-read -rp "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: " INPUT_LINUX_TIMEOUT <&3 || true
+ask INPUT_LINUX_TIMEOUT "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: "
 LINUX_UPDATE_TIMEOUT="${INPUT_LINUX_TIMEOUT:-${DEFAULT_LINUX_TIMEOUT}}"
 print_ok "Linux timeout: ${LINUX_UPDATE_TIMEOUT}s"
 
@@ -899,7 +999,7 @@ DEFAULT_APT_LOCK="${PREV_APT_LOCK:-600}"
 echo -e "  ${C_DIM}How long apt waits for the dpkg lock inside a guest. Distros with"
 echo -e "  unattended-upgrades enabled (Ubuntu by default) fail with exit code"
 echo -e "  100 if this is 0 and the two happen to overlap.${C_NC}"
-read -rp "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: " INPUT_APT_LOCK <&3 || true
+ask INPUT_APT_LOCK "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: "
 APT_LOCK_TIMEOUT="${INPUT_APT_LOCK:-${DEFAULT_APT_LOCK}}"
 print_ok "APT lock wait: ${APT_LOCK_TIMEOUT}s"
 
@@ -910,13 +1010,13 @@ echo -e "  ${C_DIM}(Needs a snapshot-capable storage backend: ZFS, LVM-thin, qco
 echo -e "  ${C_DIM} Uses disk space, but gives you a one-command rollback.)${C_NC}"
 DEFAULT_SNAPSHOT="${PREV_SNAPSHOT:-false}"
 if [ "${DEFAULT_SNAPSHOT}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
     echo -e "    ${C_CYAN}2)${C_NC} No"
 else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_SNAPSHOT <&3 || true
+ask INPUT_SNAPSHOT "  Select 1 or 2 [Enter to keep the marked one]: "
 case "${INPUT_SNAPSHOT}" in
     1) SNAPSHOT_BEFORE_UPDATE="true" ;;
     2) SNAPSHOT_BEFORE_UPDATE="false" ;;
@@ -926,7 +1026,7 @@ print_ok "Pre-update snapshots: ${SNAPSHOT_BEFORE_UPDATE}"
 
 DEFAULT_SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
 if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
-    read -rp "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: " INPUT_SNAPSHOT_KEEP <&3 || true
+    ask INPUT_SNAPSHOT_KEEP "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: "
     SNAPSHOT_KEEP="${INPUT_SNAPSHOT_KEEP:-${DEFAULT_SNAPSHOT_KEEP}}"
     print_ok "Keeping ${SNAPSHOT_KEEP} snapshot(s) per guest"
 else
@@ -942,13 +1042,13 @@ echo -e "  ${C_DIM}Only root@pam can use it; access is authorised by your existi
 echo -e "  ${C_DIM}Proxmox login session.${C_NC}"
 DEFAULT_WEBUI="${PREV_WEBUI:-false}"
 if [ "${DEFAULT_WEBUI}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
     echo -e "    ${C_CYAN}2)${C_NC} No"
 else
     echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(current)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
 fi
-read -rp "  Select 1 or 2 [Enter to keep current]: " INPUT_WEBUI <&3 || true
+ask INPUT_WEBUI "  Select 1 or 2 [Enter to keep the marked one]: "
 case "${INPUT_WEBUI}" in
     1) ENABLE_WEB_UI="true" ;;
     2) ENABLE_WEB_UI="false" ;;
@@ -957,7 +1057,7 @@ esac
 
 WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
 if [ "${ENABLE_WEB_UI}" = "true" ]; then
-    read -rp "  Port for the control panel [Enter for ${WEB_UI_PORT}]: " INPUT_WEBUI_PORT <&3 || true
+    ask INPUT_WEBUI_PORT "  Port for the control panel [Enter for ${WEB_UI_PORT}]: "
     WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
     print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
 else
@@ -969,7 +1069,11 @@ echo ""
 DEFAULT_KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
 echo -e "  ${C_BOLD}Keep update logs on disk?${C_NC}"
 echo -e "  ${C_DIM}\"No\" still lets you watch a run live, then deletes the log after.${C_NC}"
-read -rp "  1 = keep, 2 = discard [current: ${DEFAULT_KEEP_LOGS}]: " INPUT_KEEP_LOGS <&3 || true
+if [ "${DEFAULT_KEEP_LOGS}" = "true" ]; then
+    ask INPUT_KEEP_LOGS "  1 = keep, 2 = discard [Enter for 1]: "
+else
+    ask INPUT_KEEP_LOGS "  1 = keep, 2 = discard [Enter for 2]: "
+fi
 case "${INPUT_KEEP_LOGS}" in
     1) KEEP_LOGS="true" ;;
     2) KEEP_LOGS="false" ;;
@@ -978,7 +1082,7 @@ esac
 
 DEFAULT_LOG_RETENTION="${PREV_LOG_RETENTION:-90}"
 if [ "${KEEP_LOGS}" = "true" ]; then
-    read -rp "  Delete logs older than N days (0 = never) [${DEFAULT_LOG_RETENTION}]: " I <&3 || true
+    ask I "  Delete logs older than N days (0 = never) [${DEFAULT_LOG_RETENTION}]: "
     LOG_RETENTION_DAYS="${I:-${DEFAULT_LOG_RETENTION}}"
     print_ok "Logs kept in ${LOG_DIR}/ for ${LOG_RETENTION_DAYS} day(s)"
 else
@@ -1008,21 +1112,21 @@ echo ""
 
 # --- Cron Schedule ---
 DEFAULT_CRON="${PREV_CRON:-0 23 * * 5}"
-echo -e "  ${C_BOLD}Select Update Cron Schedule:${C_NC} ${C_DIM}[current: ${DEFAULT_CRON}]${C_NC}"
+echo -e "  ${C_BOLD}Select Update Cron Schedule:${C_NC} ${C_DIM}[${WORD_CURRENT}: ${DEFAULT_CRON}]${C_NC}"
 echo -e "    ${C_CYAN}1)${C_NC} Friday at 23:00  ${C_DIM}(0 23 * * 5)${C_NC}"
 echo -e "    ${C_CYAN}2)${C_NC} Friday at 22:00  ${C_DIM}(0 22 * * 5)${C_NC}"
 echo -e "    ${C_CYAN}3)${C_NC} Friday at 20:00  ${C_DIM}(0 20 * * 5)${C_NC}"
 echo -e "    ${C_CYAN}4)${C_NC} Friday at 10:00  ${C_DIM}(0 10 * * 5)${C_NC}"
 echo -e "    ${C_CYAN}5)${C_NC} Custom cron expression / time"
 
-read -rp "  Select 1-5 [Enter for ${DEFAULT_CRON}]: " INPUT_SCHED_CHOICE <&3 || true
+ask INPUT_SCHED_CHOICE "  Select 1-5 [Enter for ${DEFAULT_CRON}]: "
 case "${INPUT_SCHED_CHOICE:-0}" in
     1) UPDATE_SCHEDULE_CRON="0 23 * * 5" ;;
     2) UPDATE_SCHEDULE_CRON="0 22 * * 5" ;;
     3) UPDATE_SCHEDULE_CRON="0 20 * * 5" ;;
     4) UPDATE_SCHEDULE_CRON="0 10 * * 5" ;;
     5)
-        read -rp "  Enter 5-field cron expression (e.g. 0 10 * * 5): " CUSTOM_CRON <&3 || true
+        ask CUSTOM_CRON "  Enter 5-field cron expression (e.g. 0 10 * * 5): "
         UPDATE_SCHEDULE_CRON="${CUSTOM_CRON:-${DEFAULT_CRON}}"
         ;;
     "") UPDATE_SCHEDULE_CRON="${DEFAULT_CRON}" ;;
@@ -1031,9 +1135,31 @@ esac
 print_ok "Update schedule: ${UPDATE_SCHEDULE_CRON}"
 
 # --- Reboot Time ---
+echo ""
+echo -e "  ${C_BOLD}Reboot time after a kernel update${C_NC}"
+echo -e "  ${C_DIM}A new kernel only takes effect after a reboot. If one is installed,${C_NC}"
+echo -e "  ${C_DIM}the host is scheduled to reboot at this time; otherwise nothing${C_NC}"
+echo -e "  ${C_DIM}happens. 24-hour HH:MM.${C_NC}"
 DEFAULT_REBOOT_TIME="${PREV_REBOOT_TIME:-00:00}"
-read -rp "  Reboot time if kernel is updated (HH:MM format, e.g. 00:00, 01:00, 02:00) [Enter for ${DEFAULT_REBOOT_TIME}]: " INPUT_REBOOT_TIME <&3 || true
-REBOOT_TIME="${INPUT_REBOOT_TIME:-${DEFAULT_REBOOT_TIME}}"
+# Checked here because update-everything.sh treats anything that is not HH:MM
+# as FATAL and exits before touching a single guest. Typing the obvious "9:00"
+# used to earn a green tick and "Deployment successful", and then every
+# scheduled run aborted for good, into a cron log nobody reads. A single-digit
+# hour is the common slip, so it is padded rather than rejected.
+REBOOT_ATTEMPTS=0
+while :; do
+    REBOOT_ATTEMPTS=$((REBOOT_ATTEMPTS + 1))
+    ask INPUT_REBOOT_TIME "  Reboot at [Enter for ${DEFAULT_REBOOT_TIME}]: "
+    REBOOT_TIME="${INPUT_REBOOT_TIME:-${DEFAULT_REBOOT_TIME}}"
+    [[ "${REBOOT_TIME}" =~ ^[0-9]:[0-5][0-9]$ ]] && REBOOT_TIME="0${REBOOT_TIME}"
+    [[ "${REBOOT_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break
+    print_fail "Not a 24-hour HH:MM time: '"'"'${REBOOT_TIME}'"'"'  (e.g. 00:00, 03:30, 23:15)"
+    if [ "${HAVE_TTY}" != true ] || [ "${REBOOT_ATTEMPTS}" -ge 5 ]; then
+        REBOOT_TIME="${DEFAULT_REBOOT_TIME}"
+        print_skip "Using ${REBOOT_TIME}."
+        break
+    fi
+done
 print_ok "Scheduled reboot time: ${REBOOT_TIME}"
 
 # 3. Write credentials to a secure config file
@@ -1052,116 +1178,116 @@ cat > "${CONFIG_FILE}" <<CONF
 # Notification channels: comma-separated list of email, discord, slack, teams,
 # ntfy, gotify, telegram, webhook.
 # Empty means no notifications — updates still run, they just run quietly.
-NOTIFY_METHODS="${NOTIFY_METHODS}"
+NOTIFY_METHODS=$(sq "${NOTIFY_METHODS}")
 
 # Stay silent on clean runs, so the channel only fires when something needs you
-NOTIFY_ON_FAILURE_ONLY="${NOTIFY_ON_FAILURE_ONLY}"
+NOTIFY_ON_FAILURE_ONLY=$(sq "${NOTIFY_ON_FAILURE_ONLY}")
 
 # How email leaves the box: "mailgun" or "smtp". Blank auto-detects from
 # whichever set of credentials below is filled in.
-EMAIL_TRANSPORT="${EMAIL_TRANSPORT}"
+EMAIL_TRANSPORT=$(sq "${EMAIL_TRANSPORT}")
 
 # Mailgun API credentials (only used when EMAIL_TRANSPORT resolves to mailgun)
-MAILGUN_API_KEY="${MAILGUN_API_KEY}"
-MAILGUN_DOMAIN="${MAILGUN_DOMAIN}"
-MAILGUN_REGION="${MAILGUN_REGION}"
+MAILGUN_API_KEY=$(sq "${MAILGUN_API_KEY}")
+MAILGUN_DOMAIN=$(sq "${MAILGUN_DOMAIN}")
+MAILGUN_REGION=$(sq "${MAILGUN_REGION}")
 
 # SMTP relay (only used when EMAIL_TRANSPORT resolves to smtp). SMTP_SECURITY
 # is starttls, ssl or none. Leave SMTP_USER blank for an unauthenticated relay.
-SMTP_HOST="${SMTP_HOST}"
-SMTP_PORT="${SMTP_PORT}"
-SMTP_USER="${SMTP_USER}"
-SMTP_PASSWORD="${SMTP_PASSWORD}"
-SMTP_SECURITY="${SMTP_SECURITY}"
+SMTP_HOST=$(sq "${SMTP_HOST}")
+SMTP_PORT=$(sq "${SMTP_PORT}")
+SMTP_USER=$(sq "${SMTP_USER}")
+SMTP_PASSWORD=$(sq "${SMTP_PASSWORD}")
+SMTP_SECURITY=$(sq "${SMTP_SECURITY}")
 
 # Email addresses
-SENDER_EMAIL="${SENDER_EMAIL}"
-RECIPIENT_EMAIL="${RECIPIENT_EMAIL}"
+SENDER_EMAIL=$(sq "${SENDER_EMAIL}")
+RECIPIENT_EMAIL=$(sq "${RECIPIENT_EMAIL}")
 
 # Webhook URLs. These are credentials in their own right — anyone holding one
 # can post to your channel — so this file is chmod 600.
-DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
-SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL}"
-TEAMS_WEBHOOK_URL="${TEAMS_WEBHOOK_URL}"
-GENERIC_WEBHOOK_URL="${GENERIC_WEBHOOK_URL}"
+DISCORD_WEBHOOK_URL=$(sq "${DISCORD_WEBHOOK_URL}")
+SLACK_WEBHOOK_URL=$(sq "${SLACK_WEBHOOK_URL}")
+TEAMS_WEBHOOK_URL=$(sq "${TEAMS_WEBHOOK_URL}")
+GENERIC_WEBHOOK_URL=$(sq "${GENERIC_WEBHOOK_URL}")
 
 # ntfy: the topic is part of the URL. The token is only needed on a protected
 # topic; ntfy.sh public topics take none.
-NTFY_URL="${NTFY_URL}"
-NTFY_TOKEN="${NTFY_TOKEN}"
-NTFY_PRIORITY="${NTFY_PRIORITY:-default}"
+NTFY_URL=$(sq "${NTFY_URL}")
+NTFY_TOKEN=$(sq "${NTFY_TOKEN}")
+NTFY_PRIORITY=$(sq "${NTFY_PRIORITY:-default}")
 
 # Gotify: server URL plus an application token from Apps → Create Application
-GOTIFY_URL="${GOTIFY_URL}"
-GOTIFY_TOKEN="${GOTIFY_TOKEN}"
+GOTIFY_URL=$(sq "${GOTIFY_URL}")
+GOTIFY_TOKEN=$(sq "${GOTIFY_TOKEN}")
 
 # Telegram: a @BotFather token, and the chat ID to send to
-TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
-TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
+TELEGRAM_BOT_TOKEN=$(sq "${TELEGRAM_BOT_TOKEN}")
+TELEGRAM_CHAT_ID=$(sq "${TELEGRAM_CHAT_ID}")
 
 # Discord direct message instead of a channel webhook. Set both and the report
 # is DM'd to that user; the webhook above stays as a fallback. The bot is never
 # run as a process — the token is only an Authorization header on two REST
 # calls made at report time.
-DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN}"
-DISCORD_USER_ID="${DISCORD_USER_ID}"
+DISCORD_BOT_TOKEN=$(sq "${DISCORD_BOT_TOKEN}")
+DISCORD_USER_ID=$(sq "${DISCORD_USER_ID}")
 
 # Ask before starting an update ("true" or "false"). Deleting logs and
 # uninstalling always confirm regardless.
-CONFIRM_UPDATES="${CONFIRM_UPDATES}"
+CONFIRM_UPDATES=$(sq "${CONFIRM_UPDATES}")
 
 # Log retention. KEEP_LOGS=false still streams a run live, then deletes it.
 # LOG_RETENTION_DAYS=0 keeps logs forever.
-KEEP_LOGS="${KEEP_LOGS}"
-LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS}"
+KEEP_LOGS=$(sq "${KEEP_LOGS}")
+LOG_RETENTION_DAYS=$(sq "${LOG_RETENTION_DAYS}")
 
 # Comma-separated VM/CT IDs to exclude from updates (e.g., "100,201,305")
-EXCLUDE_IDS="${EXCLUDE_IDS}"
+EXCLUDE_IDS=$(sq "${EXCLUDE_IDS}")
 
 # Windows Update timeout in seconds (default: 1200 = 20 minutes)
-WINDOWS_UPDATE_TIMEOUT="${WINDOWS_UPDATE_TIMEOUT}"
+WINDOWS_UPDATE_TIMEOUT=$(sq "${WINDOWS_UPDATE_TIMEOUT}")
 
 # How long a Linux guest gets to finish its upgrade (default: 1800 = 30 minutes)
-LINUX_UPDATE_TIMEOUT="${LINUX_UPDATE_TIMEOUT}"
+LINUX_UPDATE_TIMEOUT=$(sq "${LINUX_UPDATE_TIMEOUT}")
 
 # How long apt waits for the dpkg lock inside a guest, in seconds.
 # Prevents spurious "exit code 100" failures when unattended-upgrades is
 # running at the same time (default: 600 = 10 minutes)
-APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT}"
+APT_LOCK_TIMEOUT=$(sq "${APT_LOCK_TIMEOUT}")
 
 # Take a snapshot of each guest before updating it? ("true" or "false")
 # Requires snapshot-capable storage (ZFS, LVM-thin, qcow2).
-SNAPSHOT_BEFORE_UPDATE="${SNAPSHOT_BEFORE_UPDATE}"
+SNAPSHOT_BEFORE_UPDATE=$(sq "${SNAPSHOT_BEFORE_UPDATE}")
 
 # How many auto-generated snapshots to keep per guest before pruning the oldest
-SNAPSHOT_KEEP="${SNAPSHOT_KEEP}"
+SNAPSHOT_KEEP=$(sq "${SNAPSHOT_KEEP}")
 
 # Report what would be updated without changing anything ("true" or "false").
 # Leave this false for the scheduled run — use 'update-everything.sh --dry-run'
 # when you want a one-off preview.
-DRY_RUN="${PREV_DRY_RUN:-false}"
+DRY_RUN=$(sq "${PREV_DRY_RUN:-false}")
 
 # Where run logs are written.
-LOG_DIR="${PREV_LOG_DIR:-/var/log/proxmox-autoupdate}"
+LOG_DIR=$(sq "${PREV_LOG_DIR:-/var/log/proxmox-autoupdate}")
 
 # Web control panel (toolbar button in the Proxmox UI)
-ENABLE_WEB_UI="${ENABLE_WEB_UI}"
-WEB_UI_PORT="${WEB_UI_PORT}"
+ENABLE_WEB_UI=$(sq "${ENABLE_WEB_UI}")
+WEB_UI_PORT=$(sq "${WEB_UI_PORT}")
 
 # Start stopped Windows VMs to update them? ("true" or "false")
-START_STOPPED_WINDOWS="${START_STOPPED_WINDOWS}"
+START_STOPPED_WINDOWS=$(sq "${START_STOPPED_WINDOWS}")
 
 # Start stopped LXC Containers to update them? ("true" or "false")
-START_STOPPED_LXC="${START_STOPPED_LXC}"
+START_STOPPED_LXC=$(sq "${START_STOPPED_LXC}")
 
 # Start stopped Linux VMs to update them? ("true" or "false")
-START_STOPPED_LINUX_VMS="${START_STOPPED_LINUX_VMS}"
+START_STOPPED_LINUX_VMS=$(sq "${START_STOPPED_LINUX_VMS}")
 
 # Cron schedule (default: "0 23 * * 5" = Fridays at 23:00)
-UPDATE_SCHEDULE_CRON="${UPDATE_SCHEDULE_CRON}"
+UPDATE_SCHEDULE_CRON=$(sq "${UPDATE_SCHEDULE_CRON}")
 
 # Scheduled reboot time if kernel is updated (default: "00:00")
-REBOOT_TIME="${REBOOT_TIME}"
+REBOOT_TIME=$(sq "${REBOOT_TIME}")
 CONF
 
 chmod 600 "${CONFIG_FILE}"
@@ -1369,8 +1495,29 @@ DROPIN
         if [ "${WEB_UI_PORT}" = "8007" ]; then
             print_fail "Port 8007 belongs to Proxmox Backup Server. Choose another port."
         fi
-        print_fail "Re-run the installer and pick a free port."
-        ENABLE_WEB_UI="false"
+        # WEBUI_SKIP_ALL, *not* ENABLE_WEB_UI="false".
+        #
+        # The panel files were installed a moment ago, at the top of this
+        # section. Flipping ENABLE_WEB_UI here dropped straight through to the
+        # teardown branch below, whose guard — "does the unit file exist?" — was
+        # satisfied by the unit this run had just written. So a port clash on a
+        # fresh install un-patched the Proxmox UI, deleted the binary, the unit,
+        # its drop-in directory and the apt hook, and signed off with a green
+        # "✓ Web control panel removed" for a panel the operator had just asked
+        # for. Meanwhile the config file, written earlier, still said
+        # ENABLE_WEB_UI="true".
+        #
+        # This is the same failure the download path was fixed for; the fix just
+        # never reached this branch. Leave everything installed and stopped, so
+        # changing the port and starting the unit is all that is needed.
+        WEBUI_SKIP_ALL=true
+        echo ""
+        echo -e "  ${C_BOLD}The panel is installed but not started.${C_NC}"
+        echo -e "  ${C_DIM}Nothing has been removed. Pick a free port and start it:${C_NC}"
+        echo -e "    ${C_CYAN}sed -i 's/^WEB_UI_PORT=.*/WEB_UI_PORT='\\''8009'\\''/' ${CONFIG_FILE}${C_NC}"
+        echo -e "    ${C_CYAN}systemctl start pve-autoupdate-ui.service${C_NC}"
+        echo -e "  ${C_DIM}Or re-run this installer and choose a different port.${C_NC}"
+        echo ""
     fi
 fi
 
@@ -1609,7 +1756,7 @@ echo -e "    ${C_CYAN}2)${C_NC} Full run  ${C_DIM}— update the host and every 
 echo -e "                  ${C_DIM}then email the report${C_NC}"
 echo -e "    ${C_CYAN}3)${C_NC} Skip      ${C_DIM}— wait for the scheduled run (${UPDATE_SCHEDULE_CRON})${C_NC}"
 echo ""
-read -rp "  Select 1-3 [Enter for 1]: " RUN_CHOICE <&3 || true
+ask RUN_CHOICE "  Select 1-3 [Enter for 1]: "
 
 RUN_MODE=""
 case "${RUN_CHOICE:-1}" in
@@ -1625,7 +1772,7 @@ esac
 if [ "${RUN_MODE}" = "full" ]; then
     echo ""
     echo -e "  ${C_YELLOW}${C_BOLD}This will update the host and every guest right now.${C_NC}"
-    read -rp "  Type 'yes' to confirm: " CONFIRM_FULL <&3 || true
+    ask CONFIRM_FULL "  Type 'yes' to confirm: "
     if [ "${CONFIRM_FULL}" != "yes" ]; then
         print_action "Not confirmed — falling back to a dry run."
         RUN_MODE="dry"

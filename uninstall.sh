@@ -134,7 +134,11 @@ if [ "${ASSUME_YES}" != true ]; then
     # outright, and `set -u` then turned the test below into a fatal
     # "CONFIRM: unbound variable" instead of a clean cancellation.
     CONFIRM=""
-    if ! read -rp "  Proceed? (y/N): " CONFIRM < /dev/tty 2>/dev/null; then
+    # Printed rather than passed to `read -p`: bash only shows a -p prompt when
+    # *stdin* is a terminal, and under `curl -fsSL … | bash` stdin is the script
+    # itself — so the question was invisible and the terminal simply waited.
+    printf '  Proceed? (y/N): '
+    if ! read -r CONFIRM < /dev/tty 2>/dev/null; then
         echo ""
         print_skip "No terminal to confirm on — nothing was changed."
         echo -e "  ${C_DIM}Re-run with --yes to uninstall non-interactively.${C_NC}"
