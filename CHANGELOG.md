@@ -12,6 +12,20 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.6.2 — 2026-08-12
+
+### Fixed
+
+- **No reload prompt after a self-update.** 4.5.6 removed the duplicate prompt
+  by silencing the panel's and leaving it to the toolbar patch. That was the
+  wrong way round: the toolbar polls every 25 seconds when idle, and the panel
+  service is restarting for part of that window, so its status request fails and
+  it frequently never observes the update at all — leaving no prompt from
+  either. The panel polls every two seconds and is the thing performing the
+  update, so it is the reliable detector and now always prompts. The toolbar
+  stands down while the panel is open, and still prompts other Proxmox tabs,
+  which are the ones left running stale injected code.
+
 ## 4.6.1 — 2026-08-12
 
 ### Fixed

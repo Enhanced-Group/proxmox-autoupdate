@@ -3808,11 +3808,15 @@ let maintPoll = null;
    previous version's JavaScript — but it is a normal end-of-update step, not a
    warning, so it reads as one. */
 async function offerReload(version) {
-  // Embedded in the Proxmox UI, the toolbar patch already offers this — and
-  // reloading the parent page reloads this frame with it, so prompting here
-  // too produced two dialogs for one event. Standalone in its own tab there is
-  // no toolbar, so this is the only offer and must still happen.
-  if (window.self !== window.top) { return; }
+  // This prompt always fires, embedded or not.
+  //
+  // It was briefly suppressed when embedded, on the assumption that the
+  // toolbar patch would prompt instead. It often does not: the toolbar polls
+  // every 25 seconds when idle, and the panel service is restarting for part of
+  // that window, so its status fetch fails and it never observes the update
+  // happening at all. The panel is driving the update and polling every two
+  // seconds, so it is the reliable detector — and it is the window being looked
+  // at. The toolbar suppresses its own prompt while this panel is open instead.
   const go = await dialog({
     title: "Updated to " + version,
     okText: "Reload now",

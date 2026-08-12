@@ -334,7 +334,16 @@ JSBLOCK_HEAD
             }, {
                 text: 'Close',
                 handler: function () { win.close(); }
-            }]
+            }],
+            /* While the panel is open it prompts for its own reload, and it is
+               the reliable detector: it polls every two seconds and is driving
+               the update, whereas this poll runs every 25 seconds when idle and
+               fails outright while the panel service restarts. Two prompts for
+               one event is worse than one, so this one stands down. */
+            listeners: {
+                show:  function () { panelWindowOpen = true; },
+                close: function () { panelWindowOpen = false; }
+            }
         });
         win.show();
     }
@@ -433,6 +442,9 @@ JSBLOCK_HEAD
        guest update: a self-update swaps out this very file, so every open
        Proxmox tab is left running stale JavaScript until it is reloaded. */
     var selfUpdateSeen = false;
+    /* True while the control panel is open in a window on this page. It prompts
+       for its own reload, so this one must not also. */
+    var panelWindowOpen = false;
 
     function applyStatus(btn) {
         if (!btn || btn.destroyed) { return; }
@@ -476,7 +488,10 @@ JSBLOCK_HEAD
                    it is running came from the previous version. */
                 if (selfUpdateSeen) {
                     selfUpdateSeen = false;
-                    promptReload(state.version);
+                    /* The open panel has already offered this. Other Proxmox
+                       tabs, which have no panel open, still need telling —
+                       their injected code is the stale part. */
+                    if (!panelWindowOpen) { promptReload(state.version); }
                 }
             }
 
