@@ -12,6 +12,20 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.2 — 2026-08-12
+
+### Fixed
+
+- **The CI check that `--doctor` is read-only failed on a read-only run.** It
+  compared `find -newermt '-1 minute'` before and after, but that is relative
+  to *now* — and `--doctor` takes about ninety seconds on a runner because it
+  refreshes the package index, so the two samples covered different sliding
+  windows and files aged out of the first one whether or not anything was
+  written. It now compares actual paths, mtimes and sizes, and prints a diff of
+  what changed when it does fail. Verified both ways: the old form reports a
+  false failure after a three-second no-op, the new one does not, and it still
+  catches a real modification.
+
 ## 4.5.1 — 2026-08-12
 
 ### Fixed

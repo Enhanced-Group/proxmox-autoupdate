@@ -50,12 +50,26 @@ jobs:
       # checked is that it runs to completion and changes nothing.
       - name: doctor runs read-only
         run: |
-          before=$(find /etc /usr/local -newermt '-1 minute' 2>/dev/null | sort)
+          # Compare actual paths and mtimes, not a time-relative find.
+          #
+          # This was `find -newermt '-1 minute'`, which is relative to *now*:
+          # --doctor takes about ninety seconds on a runner because it refreshes
+          # the package index, so before and after sampled two different sliding
+          # windows and files aged out of the first one regardless of whether
+          # anything was written. It failed on a perfectly read-only run.
+          snapshot() {
+            find /etc /usr/local -xdev \( -type f -o -type l \) \
+              -printf '%p %T@ %s\n' 2>/dev/null | sort
+          }
+          before=$(snapshot)
           bash update-everything.sh --doctor >/dev/null 2>&1 || true
-          after=$(find /etc /usr/local -newermt '-1 minute' 2>/dev/null | sort)
+          after=$(snapshot)
           if [ "$before" != "$after" ]; then
-            echo "--doctor modified the filesystem"; exit 1
+            echo "--doctor modified something under /etc or /usr/local:"
+            diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -20
+            exit 1
           fi
+          echo "--doctor left /etc and /usr/local untouched"
 
       - name: repo invariants
         run: bash ci/invariants.sh
