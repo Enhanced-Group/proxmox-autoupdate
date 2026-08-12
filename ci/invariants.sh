@@ -266,6 +266,30 @@ else
     fail "could not extract the guest script from build_guest_update_script"
 fi
 
+# --- 5b. Every advertised package manager is actually handled ----------------
+# The README lists the distro families this supports. Alpine was listed for a
+# long time while its branch was unreachable, so the list and the code are
+# checked against each other rather than trusted.
+echo "== distro coverage =="
+if [ -n "${GUEST}" ]; then
+    COVER_OK=1
+    for PM in apt-get dnf yum apk zypper pacman; do
+        if printf '%s' "${GUEST}" | grep -q "command -v ${PM}"; then
+            ok "${PM} branch present"
+        else
+            fail "${PM} is advertised but has no branch in the guest script"
+            COVER_OK=0
+        fi
+    done
+    [ "${COVER_OK}" -eq 1 ] && ok "all six package managers handled"
+    # A runtime present but unmanaged must be reported, not silently ignored.
+    if printf '%s' "${GUEST}" | grep -q '__CONTAINERS__'; then
+        ok "container runtimes are detected and reported"
+    else
+        fail "guest script no longer reports container runtimes"
+    fi
+fi
+
 # --- 6. Guests are never invoked with bash -----------------------------------
 echo "== guest interpreter =="
 if grep -nE 'pct exec .* -- /bin/bash|--command "/bin/bash"' update-everything.sh; then

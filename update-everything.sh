@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="4.4.2"
+PAU_VERSION="4.5.0"
 
 set -u
 set -o pipefail
@@ -1570,9 +1570,67 @@ elif command -v apk >/dev/null 2>&1; then
         emit_log
     fi
 
+elif command -v zypper >/dev/null 2>&1; then
+    # openSUSE / SLES. --non-interactive is essential: zypper otherwise stops to
+    # ask about licences and vendor changes and would sit there until the
+    # guest-agent timeout killed it.
+    zypper --non-interactive refresh -q </dev/null >/dev/null 2>&1 || true
+    # Start at the table's separator rather than a fixed line number: zypper
+    # prints a variable number of "Loading repository data..." lines first, so
+    # skipping a fixed count found nothing on some hosts and everything on
+    # others.
+    zypper --non-interactive list-updates 2>/dev/null \\
+        | awk -F'|' '/^-+\\+/ {t=1; next}
+                     t && NF>=5 {gsub(/^[ \\t]+|[ \\t]+\$/,"",\$3); if (\$3 != "") print "__PKG__ " \$3}' || true
+    if [ "\${DRY_RUN}" = "true" ]; then
+        echo "__RESULT__ OK"
+    else
+        zypper --non-interactive update -y -l </dev/null >"\${WORK_LOG}" 2>&1
+        ZRC=\$?
+        # 0 = done, 100 = updates applied, 101 = applied and a reboot is advised.
+        # Anything else is a real failure.
+        if [ \${ZRC} -eq 0 ] || [ \${ZRC} -eq 100 ] || [ \${ZRC} -eq 101 ]; then
+            echo "__RESULT__ OK"
+        else
+            echo "__RESULT__ FAIL"
+            echo "__DETAIL__ zypper update failed (exit \${ZRC})"
+            emit_log
+        fi
+    fi
+
+elif command -v pacman >/dev/null 2>&1; then
+    # Arch. Refresh and upgrade are one operation here; a partial upgrade is
+    # explicitly unsupported upstream, so -Sy on its own is never done.
+    pacman -Sy --noconfirm </dev/null >/dev/null 2>&1 || true
+    pacman -Qu 2>/dev/null | awk '{print "__PKG__ " \$1}' || true
+    if [ "\${DRY_RUN}" = "true" ]; then
+        echo "__RESULT__ OK"
+    elif pacman -Su --noconfirm </dev/null >"\${WORK_LOG}" 2>&1; then
+        echo "__RESULT__ OK"
+    else
+        echo "__RESULT__ FAIL"
+        echo "__DETAIL__ pacman -Su failed"
+        emit_log
+    fi
+
 else
     echo "__RESULT__ UNSUPPORTED"
+    echo "__DETAIL__ no supported package manager found (looked for apt-get, dnf, yum, apk, zypper, pacman)"
 fi
+
+# Report a container runtime if one is present.
+#
+# The tool updates the guest's own packages and nothing inside its containers,
+# so on a Docker or Podman host "already up to date" is true of apt and silent
+# about the images actually running the services. Reporting it stops a green
+# tick implying something it does not mean. Deliberately does not pull or
+# restart anything: that needs compose files and restart ordering, and it can
+# take a stack down in ways apt never will.
+for RUNTIME in docker podman; do
+    command -v "\${RUNTIME}" >/dev/null 2>&1 || continue
+    RUNNING=\$("\${RUNTIME}" ps -q 2>/dev/null | grep -c . || echo 0)
+    [ "\${RUNNING}" -gt 0 ] && echo "__CONTAINERS__ \${RUNTIME} \${RUNNING}"
+done
 
 rm -f "\${WORK_LOG}" 2>/dev/null || true
 GUESTSCRIPT
@@ -2556,7 +2614,20 @@ guest_summary_html() {
     if [ -n "${GU_LOG}" ]; then
         html="${html}<pre class='log-snippet'>$(echo "${GU_LOG}" | html_escape)</pre>"
     fi
+    if [ -n "${GU_CONTAINERS}" ]; then
+        html="${html}<div class='detail'>$(container_note "${GU_CONTAINERS}" | html_escape)</div>"
+    fi
     echo "${html}"
+}
+
+# "docker 14" -> a sentence saying those 14 are not this tool's business.
+container_note() {
+    local runtime count
+    runtime=$(echo "${1}" | awk '{print $1}')
+    count=$(echo "${1}" | awk '{print $2}')
+    [ -z "${count}" ] && return 0
+    printf '%s %s container(s) are running here and are not updated by this tool — their images are managed separately.' \
+        "${count}" "${runtime}"
 }
 
 # ==============================================================================
@@ -2575,6 +2646,9 @@ parse_guest_result() {
     GU_HELD=$(echo "${raw}"   | sed -n 's/^__HELD__ //p'   || true)
     GU_DETAIL=$(echo "${raw}" | sed -n 's/^__DETAIL__ //p' | head -1 || true)
     GU_LOG=$(echo "${raw}"    | sed -n 's/^__LOG__ //p'    || true)
+    # "docker 14" / "podman 3" — a runtime present in the guest and how many
+    # containers it is running. Reported, never touched.
+    GU_CONTAINERS=$(echo "${raw}" | sed -n 's/^__CONTAINERS__ //p' | head -1 || true)
 
     local result=""
     result=$(echo "${raw}" | sed -n 's/^__RESULT__ //p' | tail -1 || true)
@@ -2831,6 +2905,7 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
 
     CT_STATUS=$(pct status "${CTID}" | awk '{print $2}')
     CT_WAS_STOPPED=false
+    GU_CONTAINERS=""
 
     # Check exclusion list
     if is_excluded "${CTID}"; then
@@ -2934,7 +3009,7 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
         unsupported)
             print_warn "LXC ${CTID} (${CT_NAME}) — unsupported package manager${local_suffix}"
             LXC_SKIPPED=$((LXC_SKIPPED + 1))
-            LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>No supported package manager found (apt/dnf/yum/apk).</td></tr>"
+            LXC_HTML="${LXC_HTML}<tr><td>${CT_LABEL}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>${GU_DETAIL:-No supported package manager found.}</td></tr>"
             ;;
         timeout)
             print_warn "LXC ${CTID} (${CT_NAME}) — update timed out after ${LINUX_UPDATE_TIMEOUT}s${local_suffix}"
@@ -2977,6 +3052,11 @@ for CTID in $(echo "${CT_LIST}" | awk 'NR>1 {print $1}'); do
             fi
             ;;
     esac
+
+    # Say when a guest is running containers this tool does not manage.
+    if [ -n "${GU_CONTAINERS:-}" ]; then
+        print_warn "  $(container_note "${GU_CONTAINERS}")"
+    fi
 
     # Restore stopped state if needed
     if [ "${CT_WAS_STOPPED}" = true ] && [ "${DRY_RUN}" != "true" ]; then
@@ -3024,6 +3104,7 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
 
     VM_STATUS=$(qm status "${VMID}" | awk '{print $2}')
     VM_WAS_STOPPED=false
+    GU_CONTAINERS=""
     VM_OS_TYPE="linux"
 
     # Check exclusion list
@@ -3312,7 +3393,7 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
             unsupported)
                 print_warn "VM ${VMID} (${VM_NAME}) — unsupported package manager${local_suffix}"
                 VM_SKIPPED=$((VM_SKIPPED + 1))
-                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>No supported package manager found (apt/dnf/yum/apk).</td></tr>"
+                VM_HTML="${VM_HTML}<tr><td>${VM_LABEL}</td><td><span class='status-badge badge-warning'>Unsupported</span></td><td>${GU_DETAIL:-No supported package manager found.}</td></tr>"
                 ;;
             nosentinel)
                 print_fail "VM ${VMID} (${VM_NAME}) — update did not report a result${local_suffix}"
@@ -3345,6 +3426,10 @@ for VMID in $(echo "${VM_LIST}" | awk 'NR>1 {print $1}'); do
                 fi
                 ;;
         esac
+    fi
+
+    if [ -n "${GU_CONTAINERS:-}" ]; then
+        print_warn "  $(container_note "${GU_CONTAINERS}")"
     fi
 
     # Restore stopped state if needed

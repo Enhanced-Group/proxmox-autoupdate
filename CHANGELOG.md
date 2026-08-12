@@ -12,6 +12,34 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 4.5.0 — 2026-08-12
+
+### Added
+
+- **openSUSE/SLES and Arch guests are updated.** `zypper` and `pacman` joined
+  `apt`, `dnf`, `yum` and `apk`; those two previously fell through to
+  "unsupported package manager" and were silently counted as skipped. zypper's
+  exit codes 100 and 101 are treated as success, because they mean "updates
+  applied" and "applied, reboot advised" rather than failure — reading them as
+  errors would have marked every successful openSUSE update as failed.
+- **Docker and Podman hosts are reported.** A guest running containers gets a
+  note in the console and the report saying how many are running and that this
+  tool does not update them. It deliberately does not pull or restart anything:
+  that needs compose files and restart ordering, and it can take a stack down
+  in ways `apt` never will. Without the note, "already up to date" was true of
+  the guest's packages and silent about the images actually running the
+  services — a green tick that implied more than it meant.
+- `--doctor` and the unsupported-guest message now name every package manager
+  that was looked for, instead of an out-of-date list.
+
+### Fixed
+
+- The `unsupported` result gave no reason. It now says what it searched for.
+- `ci/invariants.sh` checks that every package manager the README advertises
+  has a branch in the guest script, and that container runtimes are still
+  reported. Alpine was advertised for a long time while its branch was
+  unreachable; this stops that recurring.
+
 ## 4.4.2 — 2026-08-12
 
 ### Fixed
