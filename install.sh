@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.13.1"
+PAU_FALLBACK_REF="v1.13.2"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -175,24 +175,6 @@ spin_stop() {
     return 0
 }
 
-# Run a command behind a spinner and report the outcome. Returns the command's
-# own status, so a caller can still decide what a failure means; on failure the
-# last few lines of its output are shown, which is what was missing when these
-# ran silently and only their absence of a tick told you anything.
-run_step() {
-    local msg="$1"; shift
-    spin_start "${msg}"
-    local out rc=0
-    out=$("$@" 2>&1) || rc=$?
-    spin_stop
-    if [ "${rc}" -eq 0 ]; then
-        print_ok "${msg}"
-    else
-        print_fail "${msg} ${C_DIM}(exit ${rc})${C_NC}"
-        [ -n "${out}" ] && echo "${out}" | tail -n 4 | sed "s/^/      ${C_DIM}/;s/\$/${C_NC}/"
-    fi
-    return "${rc}"
-}
 
 # Never leave a spinner spinning if the script aborts.
 trap 'spin_stop' EXIT INT TERM

@@ -45,9 +45,7 @@ fi
 
 print_ok()     { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
 print_fail()   { echo -e "  ${C_RED}✗${C_NC} $1"; }
-print_warn()   { echo -e "  ${C_YELLOW}⚠${C_NC} $1"; }
 print_skip()   { echo -e "  ${C_DIM}⊘ $1${C_NC}"; }
-print_action() { echo -e "  ${C_CYAN}▶${C_NC} $1"; }
 
 print_box_top()    { echo -e "${C_BOLD}${C_CYAN}╔═══════════════════════════════════════════════════════════╗${C_NC}"; }
 print_box_bottom() { echo -e "${C_BOLD}${C_CYAN}╚═══════════════════════════════════════════════════════════╝${C_NC}"; }

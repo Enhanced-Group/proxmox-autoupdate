@@ -12,6 +12,52 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.13.2 — 2026-08-24
+
+A third pass, driven by an index of every function and its call sites rather
+than by reading. **One bad byte from a guest could lose a notification.**
+
+### Fixed
+
+- **Invalid UTF-8 from a guest lost the report.** The payload builder read the
+  body with `sys.stdin.read()`, which decodes strictly — so a container with a
+  latin-1 locale emitting an accented character in an apt error (a raw `0xe9`)
+  raised `UnicodeDecodeError`, produced no payload, and the notification simply
+  did not arrive. The email helper and the run-history writer had the same
+  read, and the panel ran ten subprocesses — `pct`, `qm`, `pvesh`, `crontab`,
+  `journalctl` — with `text=True` and no `errors=`, so one odd byte in a guest
+  name raised inside a request handler.
+
+  All fifteen decode tolerantly now: an undecodable byte becomes U+FFFD. A
+  mangled character in a report is cosmetic; a report that never arrives is not.
+
+### Changed
+
+- **Five functions nothing called were removed** — `run_step`, `print_warn` and
+  `print_action` in the uninstaller, `run_with_spinner` (which also carried a
+  variable nothing read), and `_v_nonempty`.
+
+### Added
+
+- **CI follows the call graph and refuses anything reachable before it is
+  defined.** bash binds a function name when it reads the definition, so a
+  top-level invocation can only use what is defined above it — including
+  indirectly. That is what made `--doctor` reach `config_field()` 700 lines
+  early, printing "command not found" once per guest and silently deciding no
+  container was a template. `bash -n` is happy, shellcheck is happy, and the
+  definition is right there in the file.
+
+  The first version of this check only looked at direct top-level calls and did
+  not catch its own bug; it was rewritten until reintroducing the original
+  ordering made CI fail with the exact line numbers.
+
+- **The in-guest update script is executed under `/bin/sh` in CI-style tests**,
+  with stubbed package managers, for the first time. Every branch reports
+  honestly: a broken mirror is a `FAIL` with a reason rather than a silent
+  `OK`, a failed upgrade is a `FAIL`, a guest with no package manager is
+  `UNSUPPORTED`, exactly one `__RESULT__` is emitted, and a package still
+  upgradable afterwards is reported as held rather than claimed as upgraded.
+
 ## 1.13.1 — 2026-08-24
 
 Everything here was found after 1.13.0 was tagged, by continuing to attack it. **The first of these means a failed run could not tell you it had failed.**

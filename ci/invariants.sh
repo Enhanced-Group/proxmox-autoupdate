@@ -645,6 +645,110 @@ PYEXTRACT
     rm -rf "${JS_OUT}"
 fi
 
+# --- 3d-octies. No function is reachable before it is defined ---------------
+# bash binds a function name when it reads the definition, so anything invoked
+# at top level can only use functions defined above that point - including the
+# ones it calls indirectly.
+#
+# --doctor did exactly that: run_doctor() is dispatched near the top of
+# update-everything.sh and calls config_field(), which was defined some 700
+# lines further down. Every run printed "config_field: command not found" once
+# per guest, and because the failed call returned nothing, decided that no
+# container was a template. bash -n is happy, shellcheck is happy, and reading
+# the file shows the definition sitting right there - just below.
+#
+# Following the call graph, not only direct calls: the first version of this
+# check looked at top-level call sites alone and did not catch its own bug.
+echo "== functions are defined before they are reachable =="
+if ! have_python3; then
+    ok "python3 not available — skipped (CI always has it)"
+else
+python3 - <<'PYCHECK'
+import io, re, sys
+
+FILES = ["install.sh", "uninstall.sh", "update-everything.sh",
+         "webui/patch-webui.sh", "ci/invariants.sh"]
+bad = False
+
+for path in FILES:
+    lines = io.open(path, encoding="utf-8").read().split("\n")
+
+    defs, bodies = {}, {}
+    ranges = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", line)
+        if not m:
+            continue
+        name = m.group(1)
+        end = i
+        for j in range(i + 1, len(lines)):
+            if lines[j] == "}":
+                end = j
+                break
+        defs[name] = i + 1
+        bodies[name] = lines[i:end + 1]
+        ranges.append((i + 1, end + 1))
+
+    if not defs:
+        continue
+
+    def word_calls(text_lines):
+        found = set()
+        for line in text_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for other in defs:
+                if re.search(r"(^|[;&|(`$]\s*|\s)" + re.escape(other) + r"(\s|;|\)|$)",
+                             line):
+                    found.add(other)
+        return found
+
+    direct = dict((name, word_calls(body) - set([name]))
+                  for name, body in bodies.items())
+
+    def reachable(name, seen=None):
+        if seen is None:
+            seen = set()
+        for callee in direct.get(name, ()):
+            if callee in seen:
+                continue
+            seen.add(callee)
+            reachable(callee, seen)
+        return seen
+
+    def in_a_function(n):
+        return any(a <= n <= b for a, b in ranges)
+
+    for i, line in enumerate(lines, 1):
+        if in_a_function(i):
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for name in defs:
+            if not re.search(r"(^\s*|[;&|(]\s*|\bthen\s+|\belse\s+|\bdo\s+)"
+                             + re.escape(name) + r"(\s|;|$|\))", line):
+                continue
+            if i < defs[name]:
+                print("  [FAIL] %s: %s() runs on line %d, defined on line %d"
+                      % (path, name, i, defs[name]))
+                bad = True
+                continue
+            for callee in sorted(reachable(name)):
+                if defs[callee] > i:
+                    print("  [FAIL] %s: %s() runs on line %d and reaches %s(), "
+                          "which is not defined until line %d"
+                          % (path, name, i, callee, defs[callee]))
+                    bad = True
+
+if not bad:
+    print("  [ ok ] nothing is reachable before its definition")
+sys.exit(1 if bad else 0)
+PYCHECK
+[ $? -eq 0 ] || FAILED=1
+fi
+
 # --- 3e. No faint text -------------------------------------------------------
 # \033[2m is rendered at very low contrast by xterm.js, which is what the
 # Proxmox web shell uses — it made roughly a third of the installer invisible

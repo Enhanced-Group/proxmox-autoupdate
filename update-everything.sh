@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="1.13.1"
+PAU_VERSION="1.13.2"
 
 set -u
 set -o pipefail
@@ -312,7 +312,7 @@ if re.match(r"\A#[0-9a-fA-F]{6}\Z", v):
 
 json_escape() {
     if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null && return
+        printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.buffer.read().decode("utf-8","replace"))[1:-1])' 2>/dev/null && return
     fi
     # `$!{N;ba}` appends only when there IS a next line, which is the whole
     # difference. Control characters that cannot be represented are dropped
@@ -1312,18 +1312,6 @@ print_banner() {
     print_box_bottom
 }
 
-# Run a command with a spinner, capturing output
-# Usage: run_with_spinner "message" command args...
-# Sets: _RUN_OUTPUT (stdout), _RUN_EXIT (exit code)
-run_with_spinner() {
-    local msg="$1"
-    shift
-    local tmpfile="/tmp/pve_update_out_$$"
-    start_spinner "$msg"
-    _RUN_EXIT=0
-    _RUN_OUTPUT=$("$@" 2>&1) || _RUN_EXIT=$?
-    stop_spinner
-}
 
 # ==============================================================================
 # CONFIGURATION
@@ -2364,7 +2352,7 @@ import json, os, sys
 state_file, result, finished, log, scope = sys.argv[1:6]
 counts = json.loads(sys.argv[6])
 failures = []
-for line in sys.stdin.read().splitlines():
+for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
     if not line.strip():
         continue
     parts = line.split("|", 2)
@@ -2565,7 +2553,9 @@ PAYLOAD_HELPER='
 import json, os, sys
 
 fmt, subject = sys.argv[1], sys.argv[2]
-body = sys.stdin.read()
+# Not sys.stdin.read(): guest output is not guaranteed UTF-8, and a strict
+# decode raised here, produced no payload, and sent nothing at all.
+body = sys.stdin.buffer.read().decode("utf-8", "replace")
 failed = os.environ.get("PAU_FAILED") == "true"
 dry = os.environ.get("PAU_DRY") == "true"
 
@@ -2744,7 +2734,7 @@ import os, smtplib, ssl, sys
 from email.message import EmailMessage
 
 subject, html_path = sys.argv[1], sys.argv[2]
-text_body = sys.stdin.read()
+text_body = sys.stdin.buffer.read().decode("utf-8", "replace")
 
 msg = EmailMessage()
 msg["Subject"] = subject

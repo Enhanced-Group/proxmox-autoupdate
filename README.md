@@ -4,9 +4,9 @@ A fully automated maintenance solution for Proxmox VE hosts with fancy terminal 
 
 This tool performs weekly updates across your entire Proxmox stack — including the host node, all LXC containers (running **and** stopped), Linux VMs, and Windows VMs — then delivers a detailed HTML report via Mailgun and conditionally reboots when a kernel update is detected.
 
-**Latest release: [v1.13.1](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v1.13.1)**
-&middot; [tar.gz](https://github.com/Enhanced-Group/proxmox-autoupdate/archive/refs/tags/v1.13.1.tar.gz)
-&middot; [zip](https://github.com/Enhanced-Group/proxmox-autoupdate/archive/refs/tags/v1.13.1.zip)
+**Latest release: [v1.13.2](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v1.13.2)**
+&middot; [tar.gz](https://github.com/Enhanced-Group/proxmox-autoupdate/archive/refs/tags/v1.13.2.tar.gz)
+&middot; [zip](https://github.com/Enhanced-Group/proxmox-autoupdate/archive/refs/tags/v1.13.2.zip)
 
 The installer resolves the newest published release on its own, so the one-line
 install below always fetches the current version — you only need these links to
