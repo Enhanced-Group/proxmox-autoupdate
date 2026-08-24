@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.10.0"
+PAU_FALLBACK_REF="v1.10.1"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -1273,7 +1273,16 @@ if asking; then
     echo -e "  ${C_DIM}panel to run updates, edit the schedule and config, and read logs.${C_NC}"
     echo -e "  ${C_DIM}Only root@pam can use it; access is authorised by your existing${C_NC}"
     echo -e "  ${C_DIM}Proxmox login session.${C_NC}"
-    DEFAULT_WEBUI="${PREV_WEBUI:-false}"
+    # Yes on a fresh install.
+#
+# This defaulted to "no", and combined with prompts that printed nothing under
+# `curl … | bash` it is the likeliest reason people reported installing the tool
+# and finding no button and no panel: they saw a menu, saw no question, pressed
+# Enter to move on, and silently declined the panel. Nothing was patched into
+# pvemanagerlib.js and no service was installed, and the installer still ended
+# with "Deployment successful". A re-install still carries the previous answer
+# forward, so anyone who deliberately said no stays as they are.
+DEFAULT_WEBUI="${PREV_WEBUI:-true}"
     if [ "${DEFAULT_WEBUI}" = "true" ]; then
         echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
         echo -e "    ${C_CYAN}2)${C_NC} No"

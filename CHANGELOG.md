@@ -12,6 +12,27 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.10.1 — 2026-08-12
+
+### Fixed
+
+- **"I installed it and the button never appeared" — found, and it was not the
+  patcher.** The web-panel question defaulted to **No** on a fresh install, in
+  every release up to and including 1.10.0. Combined with prompts that printed
+  nothing under `curl … | bash` (fixed in 1.8.1), the sequence was: you saw a
+  menu, saw no question, pressed Enter to move past it, and silently declined
+  the panel. Nothing was patched into `pvemanagerlib.js`, no service was
+  installed, so no port ever listened — and the installer still finished with
+  **Deployment successful ✓**. Both reported symptoms, one cause.
+
+  Reproduced by running the shipped installer with every answer left blank:
+  `ENABLE_WEB_UI="false"`, zero occurrences of the button block in
+  `pvemanagerlib.js`, and a green success banner.
+
+  A fresh install now defaults to **Yes**. A re-install still carries the
+  previous answer forward, so anyone who deliberately declined stays declined.
+  1.10.0's Typical install already set it; this fixes Custom too.
+
 ## 1.10.0 — 2026-08-12
 
 ### Added
