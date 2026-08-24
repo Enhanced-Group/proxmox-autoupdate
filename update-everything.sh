@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="1.13.2"
+PAU_VERSION="1.13.3"
 
 set -u
 set -o pipefail
@@ -1633,8 +1633,32 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 TEE_PID=$!
 
 # Prune old logs. Retention of 0 means "keep forever".
+#
+# Two guards on what is otherwise `find <path from a config file> -delete`
+# running as root with its errors discarded:
+#
+#   * only the names this tool writes - update_*.log from a run, webui_*.log
+#     from the panel. It used to match *.log, which also removed cron.log,
+#     the one file logrotate is responsible for;
+#   * never a system directory. LOG_DIR is not prompted for and not editable
+#     in the panel, so it takes a hand-edit to get wrong - but a typo of
+#     /var/log for /var/log/proxmox-autoupdate would have deleted every system
+#     log older than the retention window without a word.
+#
+# -maxdepth 1 as well: the log directory is flat, and recursing is only a way
+# to reach further than intended.
 if [ "${LOG_RETENTION_DAYS}" -gt 0 ]; then
-    find "${LOG_DIR}" -name '*.log' -mtime +"${LOG_RETENTION_DAYS}" -delete 2>/dev/null || true
+    case "${LOG_DIR%/}" in
+        ""|/|/var|/var/log|/etc|/usr|/usr/local|/home|/root|/tmp|/boot|/dev|/proc|/sys|/run|/opt)
+            print_warn "LOG_DIR is ${LOG_DIR} — refusing to prune logs in a system directory"
+            print_warn "  set LOG_DIR to a directory of this tool's own in ${CONFIG_FILE}"
+            ;;
+        *)
+            find "${LOG_DIR}" -maxdepth 1 \
+                 \( -name 'update_*.log' -o -name 'webui_*.log' \) \
+                 -mtime +"${LOG_RETENTION_DAYS}" -delete 2>/dev/null || true
+            ;;
+    esac
 fi
 
 # --- jq is a hard dependency ---

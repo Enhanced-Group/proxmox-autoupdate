@@ -12,6 +12,56 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.13.3 — 2026-08-25
+
+The four areas nothing had ever looked at: the Windows payload, concurrency,
+the self-update, and log retention. **One of them could delete system logs.**
+
+### Fixed
+
+- **Log retention could reach outside its own directory.** Pruning ran
+  `find "${LOG_DIR}" -name '*.log' -mtime +N -delete` as root with its errors
+  discarded, and nothing checks what `LOG_DIR` says. It is not prompted for and
+  cannot be set from the panel, so getting it wrong takes a hand-edit — but a
+  typo of `/var/log` for `/var/log/proxmox-autoupdate` would have deleted every
+  system log older than the retention window, silently. It also deleted
+  `cron.log`, the one file logrotate is responsible for.
+
+  Pruning now matches only the names this tool writes (`update_*.log`,
+  `webui_*.log`), does not recurse, and refuses a system directory outright.
+  The panel's `resolve_log_dir()` refuses the same list — it is the root
+  `purge_logs()` empties from a button, and the boundary `safe_log_path()`
+  checks a requested log against, so `LOG_DIR=/etc` would have made `shadow` a
+  valid log name.
+
+- **A file the panel could not decode stopped it starting.** `installed_version()`
+  opens the updater with `encoding="utf-8"` and caught only `OSError`, but a
+  `UnicodeDecodeError` is a `ValueError` — and that call runs at import as well
+  as on `/api/status`, which the page polls every two seconds. Every text read
+  in the panel — the theme file, the state file, the changelog, the
+  reboot-pending marker — now decodes tolerantly.
+
+### Verified, unchanged
+
+- **A dry run cannot install Windows updates.** The payload is base64 UTF-16LE
+  handed to `-EncodedCommand`, so nothing about it is readable at the call
+  site. It round-trips exactly, the dry-run guard sits at line 31 — before
+  `CreateUpdateDownloader` at 38 and `Install()` at 47 — and its branch exits
+  rather than falling through. The two modes differ by exactly one line, and
+  nothing from the host is interpolated into the script.
+
+- **Two runs cannot start at once.** Twenty threads calling the panel's
+  `Job.start()` simultaneously produced one start, one child process and
+  nineteen refusals; a new run is allowed only once the previous child has
+  exited. The real boundary remains `flock(2)` in the updater, held for the
+  process lifetime so a killed run releases it.
+
+- **The self-update cannot be steered by a hostile ref.** The tag comes from
+  GitHub's API and is interpolated into a command root then executes. Every
+  shell metacharacter is refused by `REF_RE` before that point, `shlex.quote`
+  holds regardless, and every URL curl was actually asked for stayed on
+  `raw.githubusercontent.com` under this repository.
+
 ## 1.13.2 — 2026-08-24
 
 A third pass, driven by an index of every function and its call sites rather
