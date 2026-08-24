@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.10.1"
+PAU_FALLBACK_REF="v1.11.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -515,6 +515,7 @@ PREV_SNAPSHOT=""
 PREV_SNAPSHOT_KEEP=""
 PREV_WEBUI=""
 PREV_WEBUI_PORT=""
+PREV_WEBUI_PUBLIC_URL=""
 PREV_DRY_RUN=""
 PREV_LOG_DIR=""
 PREV_TRANSPORT=""
@@ -572,6 +573,7 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_SNAPSHOT_KEEP="${SNAPSHOT_KEEP:-}"
     PREV_WEBUI="${ENABLE_WEB_UI:-}"
     PREV_WEBUI_PORT="${WEB_UI_PORT:-}"
+    PREV_WEBUI_PUBLIC_URL="${WEB_UI_PUBLIC_URL:-}"
     PREV_NOTIFY_METHODS="${NOTIFY_METHODS:-}"
     PREV_FAIL_ONLY="${NOTIFY_ON_FAILURE_ONLY:-}"
     PREV_DISCORD="${DISCORD_WEBHOOK_URL:-}"
@@ -637,6 +639,7 @@ apply_typical_profile() {
     SNAPSHOT_KEEP="3"
     ENABLE_WEB_UI="true"
     WEB_UI_PORT="8007"
+    WEB_UI_PUBLIC_URL="${PREV_WEBUI_PUBLIC_URL}"
     KEEP_LOGS="true"
     LOG_RETENTION_DAYS="90"
     UPDATE_SCHEDULES="0 23 * * 5|yes|Weekly updates"
@@ -668,6 +671,7 @@ apply_keep_profile() {
     SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
     ENABLE_WEB_UI="${PREV_WEBUI:-false}"
     WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
+    WEB_UI_PUBLIC_URL="${PREV_WEBUI_PUBLIC_URL}"
     KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
     LOG_RETENTION_DAYS="${PREV_LOG_RETENTION:-90}"
     UPDATE_SCHEDULE_CRON="${PREV_CRON:-0 23 * * 5}"
@@ -793,6 +797,7 @@ LOG_DIR="${PREV_LOG_DIR:-${LOG_DIR}}"
 # These used to sit inside the Notifications prompts. Typical and unattended
 # installs skip those prompts, and under `set -u` an unset key here is not a
 # missing default, it is an immediate abort partway through writing the config.
+WEB_UI_PUBLIC_URL="${PREV_WEBUI_PUBLIC_URL}"
 DISCORD_BOT_TOKEN="${PREV_BOT_TOKEN}"
 DISCORD_USER_ID="${PREV_USER_ID}"
 CONFIRM_UPDATES="${PREV_CONFIRM:-true}"
@@ -1301,6 +1306,36 @@ DEFAULT_WEBUI="${PREV_WEBUI:-true}"
     if [ "${ENABLE_WEB_UI}" = "true" ]; then
         ask INPUT_WEBUI_PORT "  Port for the control panel [Enter for ${WEB_UI_PORT}]: "
         WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
+
+        # Reaching Proxmox through a proxy or a tunnel?
+        #
+        # The toolbar button builds its link as https://<the host in your
+        # address bar>:<port>. Behind Cloudflare Tunnel, nginx, Traefik or
+        # Tailscale that host forwards the Proxmox port and nothing else, so the
+        # button points at a port the browser can never open, and times out.
+        # Naming the panel's real public address is the only way to know.
+        echo ""
+        echo -e "  ${C_DIM}If you reach Proxmox through a reverse proxy or tunnel (Cloudflare,${C_NC}"
+        echo -e "  ${C_DIM}nginx, Traefik, Tailscale), publish the panel through it as well and${C_NC}"
+        echo -e "  ${C_DIM}give its address here. Leave blank if you connect to this node${C_NC}"
+        echo -e "  ${C_DIM}directly, which is the normal case.${C_NC}"
+        if [ -n "${WEB_UI_PUBLIC_URL}" ]; then
+            ask INPUT_WEBUI_URL "  Panel URL [Enter keeps ${WEB_UI_PUBLIC_URL}, '-' clears]: "
+        else
+            ask INPUT_WEBUI_URL "  Panel URL [Enter for none]: "
+        fi
+        case "${INPUT_WEBUI_URL}" in
+            "")  : ;;
+            -)   WEB_UI_PUBLIC_URL=""; print_ok "Panel URL cleared" ;;
+            http://*|https://*)
+                WEB_UI_PUBLIC_URL="${INPUT_WEBUI_URL%/}"
+                print_ok "Panel URL: ${WEB_UI_PUBLIC_URL}"
+                ;;
+            *)
+                print_fail "Not a URL: '${INPUT_WEBUI_URL}' — it must start with https://"
+                print_skip "Leaving it unset; the button will use this node's own address."
+                ;;
+        esac
         print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
     else
         print_ok "Web control panel: disabled"
@@ -1647,6 +1682,13 @@ LOG_DIR=$(sq "${PREV_LOG_DIR:-/var/log/proxmox-autoupdate}")
 # Web control panel (toolbar button in the Proxmox UI)
 ENABLE_WEB_UI=$(sq "${ENABLE_WEB_UI}")
 WEB_UI_PORT=$(sq "${WEB_UI_PORT}")
+
+# Where a *browser* should reach the panel, when that is not simply this node's
+# own hostname on the port above. Set this when Proxmox sits behind a reverse
+# proxy or a tunnel that forwards 8006 and nothing else: the toolbar button uses
+# it instead of guessing. Run 'pve-autoupdate-patch-webui apply' after changing
+# it, so the injected button picks it up.
+WEB_UI_PUBLIC_URL=$(sq "${WEB_UI_PUBLIC_URL}")
 
 # Start stopped Windows VMs to update them? ("true" or "false")
 START_STOPPED_WINDOWS=$(sq "${START_STOPPED_WINDOWS}")

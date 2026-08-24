@@ -864,6 +864,48 @@ directly at `https://<node>:8007/`. Please
 [open an issue](https://github.com/Enhanced-Group/proxmox-autoupdate/issues)
 with your Proxmox version.
 
+### Proxmox is behind a reverse proxy or tunnel, and the button times out
+
+If you reach Proxmox through Cloudflare Tunnel, nginx, Traefik or Tailscale,
+that hostname forwards the Proxmox port and nothing else. The toolbar button
+builds its link as `https://<the host in your address bar>:8007`, which from
+your browser's point of view does not exist — you get `ERR_CONNECTION_TIMED_OUT`
+and the status dot never turns green.
+
+Publish the panel through the same proxy, then tell the button where it is:
+
+```bash
+# /etc/proxmox-autoupdate.conf
+WEB_UI_PUBLIC_URL='https://panel.example.com'
+```
+
+```bash
+pve-autoupdate-patch-webui apply
+```
+
+then hard-refresh the Proxmox UI. The installer also asks for this, right after
+the panel's port.
+
+**Cloudflare Tunnel**, as an example — add a second public hostname to the same
+tunnel:
+
+| Field | Value |
+| --- | --- |
+| Public hostname | `panel.example.com` |
+| Service | `https://localhost:8007` |
+| Additional settings → **No TLS Verify** | **on** (the node uses its own self-signed certificate) |
+
+The panel authenticates with your existing Proxmox session cookie, so treat that
+hostname exactly as you treat the Proxmox one — put it behind the same access
+policy. Anyone who can reach it and log in can update, and reboot, the host.
+
+There is no way to serve the panel on port 8006 itself: `pveproxy` has no
+reverse-proxy or add-a-route mechanism, and the only supported way to add
+server-side endpoints under it is a Perl `PVE::API2` module — tied to Proxmox
+internals, broken by upgrades, and needing `pveproxy` restarted. For a tool that
+has to survive unattended `pve-manager` upgrades, a separate port with a
+configurable public address is the safer trade.
+
 ### The panel's port is not listening after installing
 
 ```bash

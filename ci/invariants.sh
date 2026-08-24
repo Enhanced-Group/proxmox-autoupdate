@@ -101,7 +101,10 @@ echo "== config key parity =="
 # list to know what it is allowed to do — and the confirmation prompt is a UI
 # behaviour. The update script reads UPDATE_SCHEDULES only in --doctor, through
 # cfg_read, to check that the config and the crontab still agree.
-PANEL_ONLY="UPDATE_SCHEDULE_CRON UPDATE_SCHEDULES CONFIRM_UPDATES SUPPRESS_SUBSCRIPTION_NOTICE"
+# WEB_UI_PUBLIC_URL is read by patch-webui.sh, which bakes it into the button
+# in pvemanagerlib.js. It is a browser-side address; a cron run has no use for
+# it and never looks at it.
+PANEL_ONLY="UPDATE_SCHEDULE_CRON UPDATE_SCHEDULES CONFIRM_UPDATES SUPPRESS_SUBSCRIPTION_NOTICE WEB_UI_PUBLIC_URL"
 
 PANEL_KEYS=$(sed -n '/^EDITABLE_KEYS = {/,/^}/p' webui/pve-autoupdate-ui \
              | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u)
@@ -125,6 +128,13 @@ for key in ${PANEL_ONLY}; do
         fail "${key} is listed as panel-only but update-everything.sh now reads it"
     fi
 done
+
+# A key excused from the parity check above still has to be read by *something*.
+if grep -q 'WEB_UI_PUBLIC_URL' webui/patch-webui.sh; then
+    ok "WEB_UI_PUBLIC_URL is consumed by the toolbar patcher"
+else
+    fail "WEB_UI_PUBLIC_URL is panel-only but nothing reads it"
+fi
 
 # --- 3b. Shared JS only touches elements both pages have ---------------------
 # SHARED_JS is loaded by the main panel *and* by the per-guest page. An element

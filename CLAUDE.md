@@ -95,3 +95,22 @@ already exists; the panel's `--unattended` self-update always takes Keep).
   `apply_typical_profile()` or in the seeded-from-`PREV_*` block above
   `step "Notifications"`. Skipping a prompt otherwise leaves the variable unset,
   and `set -u` aborts partway through writing the config. CI enforces this.
+
+## Reaching the panel
+
+The panel is a separate service on its own port (8007), because `pveproxy` has
+no reverse-proxy or add-a-route mechanism — the only supported way to add
+endpoints under 8006 is a `PVE::API2` Perl module, which upgrades break.
+
+`WEB_UI_PUBLIC_URL` is the escape hatch for anyone behind a tunnel or reverse
+proxy: the injected button uses it verbatim instead of building
+`https://<location.hostname>:<port>`. It is read by `patch-webui.sh` (not the
+updater — CI knows this) and **interpolated into a JavaScript string literal in
+pvemanagerlib.js**, so it is validated as a bare `http(s)` origin in both the
+patcher and the panel. Loosening either regex is a script-injection hole in the
+Proxmox UI.
+
+Anything that probes the panel from the browser (`probePanel`, `fetchStatus`)
+cannot distinguish a rejected certificate from a refused connection, a timeout
+or a DNS failure — a `no-cors` fetch rejects identically for all of them. Never
+write a message that claims to know which.

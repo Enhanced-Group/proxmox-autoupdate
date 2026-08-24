@@ -12,6 +12,44 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.11.0 — 2026-08-12
+
+### Added
+
+- **`WEB_UI_PUBLIC_URL` — the panel's address, for people behind a proxy or
+  tunnel.** The toolbar button built its link as
+  `https://<the host in your address bar>:8007`. If you reach Proxmox through
+  Cloudflare Tunnel, nginx, Traefik or Tailscale, that hostname forwards the
+  Proxmox port and nothing else, so the button pointed at a port the browser
+  can never open and timed out — with the status dot stuck neutral forever.
+
+  Set the panel's real public address in the config (the installer asks for it
+  after the port), re-run `pve-autoupdate-patch-webui apply`, and the button
+  uses it. README documents the Cloudflare Tunnel case specifically.
+
+  The value is interpolated into a JavaScript string inside
+  `pvemanagerlib.js`, so it is validated as a plain `http(s)` origin at both
+  ends — a quote or newline in it would be script injection into the Proxmox
+  UI, not a formatting slip.
+
+### Fixed
+
+- **The "cannot reach the panel" dialog blamed the certificate every time.** It
+  was titled *One-time certificate step* and stated the node's self-signed
+  certificate needed approving. The probe behind it cannot know that: a
+  `no-cors` fetch rejects identically for a rejected certificate, a refused
+  connection, a timeout and a DNS failure. Someone behind a tunnel was told to
+  accept a certificate, clicked through, and got `ERR_CONNECTION_TIMED_OUT` on
+  a port unreachable from their browser. It now names both causes, says which
+  is likely from the port you are on, and gives the exact config line.
+
+- **The status dot could not tell "nothing has run yet" from "cannot reach the
+  panel".** Both left it neutral with a generic tooltip, so a browser that
+  could never reach the panel looked identical to a healthy idle install. An
+  unreachable panel now shows a hollow amber dot after two consecutive failed
+  polls, with a tooltip saying so; a fresh install with no runs says exactly
+  that, and that the dot turns green after the first clean run.
+
 ## 1.10.1 — 2026-08-12
 
 ### Fixed

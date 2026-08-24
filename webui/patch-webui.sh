@@ -37,6 +37,28 @@ if [ -r "${CONFIG_FILE}" ]; then
     [ -n "${CONFIGURED_PORT}" ] && UI_PORT="${CONFIGURED_PORT}"
 fi
 
+# Where the browser should reach the panel, when that is not simply
+# "this hostname, on the panel's port".
+#
+# The injected button used to build https://<the host you typed>:8007
+# unconditionally. That is wrong for everyone who reaches Proxmox through a
+# reverse proxy or a tunnel — Cloudflare Tunnel, nginx, Traefik, Tailscale — as
+# the tunnel forwards 8006 and nothing else, so the button pointed at a port
+# that does not exist from where the browser is sitting and timed out.
+UI_PUBLIC_URL=""
+if [ -r "${CONFIG_FILE}" ]; then
+    # Strip the key, then the quotes and any stray whitespace. No capture
+    # group, because the value is a URL and every character class that could
+    # appear in one is one more thing to get wrong.
+    CONFIGURED_URL=$(sed -n 's/^[[:space:]]*WEB_UI_PUBLIC_URL[[:space:]]*=[[:space:]]*//p' \
+        "${CONFIG_FILE}" | tail -1 | tr -d "\"'" | tr -d "[:space:]")
+    # Only ever an https:// or http:// origin, with no quotes or spaces: this
+    # string is interpolated into JavaScript in pvemanagerlib.js.
+    if echo "${CONFIGURED_URL}" | grep -qE '^https?://[A-Za-z0-9._~:@/-]+$'; then
+        UI_PUBLIC_URL="${CONFIGURED_URL%/}"
+    fi
+fi
+
 # A string that must still be present after any edit, as a corruption canary.
 SENTINEL="PVE.StdWorkspace"
 
@@ -198,10 +220,13 @@ emit_block() {
     if (typeof Ext === 'undefined') { return; }
 
     var OPEN_PORT = ${UI_PORT};
+    /* Empty unless WEB_UI_PUBLIC_URL is set, in which case it wins. */
+    var PUBLIC_BASE = '${UI_PUBLIC_URL}';
 JSBLOCK_HEAD
     cat <<'JSBLOCK'
 
     function panelBase() {
+        if (PUBLIC_BASE) { return PUBLIC_BASE; }
         return 'https://' + window.location.hostname + ':' + OPEN_PORT;
     }
 
@@ -283,6 +308,12 @@ JSBLOCK_HEAD
             '}',
             '.pau-btn.pau-ok      .x-btn-icon-el.pau-ico::before { background: var(--pau-ok); }',
             '.pau-btn.pau-error   .x-btn-icon-el.pau-ico::before { background: var(--pau-err); }',
+            /* Hollow amber: not an error on this node, but not a working
+               status either — the browser cannot see the panel. */
+            '.pau-btn.pau-unreachable .x-btn-icon-el.pau-ico::before {',
+            '  background: transparent;',
+            '  box-shadow: inset 0 0 0 2px var(--pau-warn), 0 0 0 1px rgba(0,0,0,.25);',
+            '}',
             '.pau-btn.pau-running .x-btn-icon-el.pau-ico::before {',
             '  background: var(--pau-warn); animation: pau-pulse 1.2s ease-in-out infinite;',
             '}',
@@ -318,20 +349,52 @@ JSBLOCK_HEAD
             .catch(function () { return false; });
     }
 
-    function showCertHelp(url) {
+    /* Why the panel could not be reached.
+       
+       This used to be titled "One-time certificate step" and state, flatly,
+       that the node's self-signed certificate needed approving. probePanel()
+       cannot know that: a no-cors fetch rejects identically for a rejected
+       certificate, a refused connection, a timeout and a DNS failure. So
+       somebody reaching Proxmox through a Cloudflare tunnel that forwards 8006
+       and nothing else was told to go and accept a certificate, clicked OK,
+       and got ERR_CONNECTION_TIMED_OUT on a port their browser can never
+       reach. The dialog now names both causes and does not pretend to know
+       which one it is. */
+    function showUnreachableHelp(url) {
+        var viaProxy = window.location.port !== String(OPEN_PORT) &&
+                       window.location.port !== '8006' &&
+                       window.location.port !== '';
         Ext.Msg.show({
-            title: 'One-time certificate step',
+            title: 'Cannot reach the Auto-Update panel',
             message:
-                'The control panel runs on port ' + OPEN_PORT + ', which your browser ' +
-                'treats as a separate site from the Proxmox UI.<br><br>' +
-                'Your node uses a self-signed certificate, so that site has to be ' +
-                'approved once.<br><br>' +
-                '<b>Click OK</b> to open it in a new tab, accept the warning, then ' +
-                'close the tab and try again.<br><br>' +
-                '<span style="opacity:.75">To remove this step permanently, set up ACME ' +
-                'under Datacenter &rarr; ACME, or install the Proxmox root CA on this ' +
-                'computer. Either also removes the warning on the Proxmox UI itself.</span>',
+                'The panel should be at <b>' + panelBase() + '/</b>, and this ' +
+                'browser cannot open it.<br><br>' +
+                '<b>1. A certificate that has not been approved yet.</b><br>' +
+                'The panel is on its own port, which your browser treats as a ' +
+                'separate site, and a self-signed certificate has to be accepted ' +
+                'once per site. <b>Click OK</b> to open it in a new tab — if you ' +
+                'get a certificate warning, accept it, close the tab and try ' +
+                'again.<br><br>' +
+                '<b>2. You are reaching Proxmox through a proxy or tunnel.</b><br>' +
+                'Cloudflare Tunnel, nginx, Traefik and Tailscale forward the ' +
+                'Proxmox port and nothing else, so port ' + OPEN_PORT + ' does ' +
+                'not exist from where your browser is sitting. If OK gives you a ' +
+                'timeout rather than a certificate warning, this is what has ' +
+                'happened. Publish the panel through the same proxy, then set ' +
+                'its address on the node:<br>' +
+                '<pre style="margin:6px 0;white-space:pre-wrap">' +
+                "WEB_UI_PUBLIC_URL='https://panel.example.com'</pre>" +
+                'in <code>/etc/proxmox-autoupdate.conf</code>, and run ' +
+                '<code>pve-autoupdate-patch-webui apply</code>.' +
+                (viaProxy
+                    ? '<br><br><b>You are on port ' + window.location.port +
+                      ', so a proxy is likely.</b>'
+                    : '') +
+                '<br><br><span style="opacity:.75">' +
+                '<code>update-everything.sh --doctor</code> on the node says ' +
+                'whether the panel is actually running and listening.</span>',
             buttons: Ext.Msg.OKCANCEL,
+            buttonText: {ok: 'Open it in a new tab', cancel: 'Close'},
             fn: function (btn) {
                 if (btn === 'ok') { window.open(url, '_blank', 'noopener'); }
             }
@@ -401,7 +464,7 @@ JSBLOCK_HEAD
     function openPanel(title, url) {
         var themed = withTheme(url);
         probePanel().then(function (reachable) {
-            if (reachable) { openWindow(title, themed); } else { showCertHelp(url); }
+            if (reachable) { openWindow(title, themed); } else { showUnreachableHelp(url); }
         });
     }
 
@@ -474,6 +537,10 @@ JSBLOCK_HEAD
        with every open tab silently stale. */
     var bootVersion = null;
     var reloadPrompted = false;
+    /* Consecutive failed status fetches. One failure is a service restart;
+       several in a row is a panel this browser cannot reach, and the button
+       should say so rather than sitting on a neutral dot forever. */
+    var statusFailures = 0;
     /* True while the control panel is open in a window on this page. It prompts
        for its own reload, so this one must not also. */
     var panelWindowOpen = false;
@@ -481,9 +548,34 @@ JSBLOCK_HEAD
     function applyStatus(btn) {
         if (!btn || btn.destroyed) { return; }
         fetchStatus().then(function (state) {
-            if (!state || !btn.getEl || btn.destroyed) { return; }
+            if (!btn.getEl || btn.destroyed) { return; }
             var el = btn.getEl();
             if (!el) { return; }
+
+            if (!state) {
+                /* The dot stayed its default grey with a generic tooltip when
+                   the panel could not be reached, which is indistinguishable
+                   from "installed, nothing has run yet" — so a browser that
+                   could never reach the panel looked exactly like a healthy
+                   idle install. */
+                statusFailures++;
+                if (statusFailures >= 2) {
+                    ['pau-ok', 'pau-error', 'pau-running'].forEach(function (c) {
+                        el.removeCls ? el.removeCls(c) : el.dom.classList.remove(c);
+                    });
+                    el.addCls ? el.addCls('pau-unreachable')
+                              : el.dom.classList.add('pau-unreachable');
+                    btn.setTooltip('Cannot reach the Auto-Update panel at ' +
+                        panelBase() + '/
+Click to see why — usually a ' +
+                        'certificate to accept, or a proxy that does not ' +
+                        'forward port ' + OPEN_PORT + '.');
+                }
+                return;
+            }
+            statusFailures = 0;
+            el.removeCls ? el.removeCls('pau-unreachable')
+                         : el.dom.classList.remove('pau-unreachable');
 
             if (state.version) {
                 if (bootVersion === null) {
@@ -521,6 +613,11 @@ JSBLOCK_HEAD
                     cls = 'pau-error'; tip = 'Last run reported errors';
                 } else if (result.indexOf('ok') === 0) {
                     cls = 'pau-ok'; tip = 'Last run completed cleanly';
+                }
+                if (!result) {
+                    tip = 'No update run recorded yet.
+The dot turns green ' +
+                          'after the first run finishes cleanly.';
                 }
                 if (state.last_run && state.last_run.finished) {
                     tip += ' (' + state.last_run.finished + ')';

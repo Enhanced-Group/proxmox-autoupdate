@@ -157,6 +157,20 @@ def _v_cron(v):
     return bool(CRON_RE.match(v))
 
 
+def _v_public_url(v):
+    """Empty, or an http(s) origin safe to interpolate into JavaScript.
+
+    This value is written into pvemanagerlib.js by the patcher, inside a
+    single-quoted JS string, so a quote or a newline in it would be a script
+    injection into the Proxmox UI rather than a formatting mistake.
+    """
+    if v == "":
+        return True
+    if len(v) > 200 or not re.match(r"\Ahttps?://[A-Za-z0-9._~:@/-]+\Z", v):
+        return False
+    return True
+
+
 def _v_schedules(v):
     """';'-separated '<cron>|<yes|no>|<label>' entries, or empty.
 
@@ -315,6 +329,7 @@ EDITABLE_KEYS = {
     "LOG_RETENTION_DAYS": _v_int,
     "UPDATE_SCHEDULE_CRON": _v_cron,
     "UPDATE_SCHEDULES": _v_schedules,
+    "WEB_UI_PUBLIC_URL": _v_public_url,
     "REBOOT_TIME": _v_time,
 }
 
