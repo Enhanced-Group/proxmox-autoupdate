@@ -12,6 +12,28 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.12.0 — 2026-08-12
+
+### Added
+
+- **The panel can be mounted on a path, under the hostname you already use.**
+  Give `WEB_UI_PUBLIC_URL` a path — `https://proxmox.example.com/pau` — and the
+  panel serves itself from there, so a proxy that already fronts Proxmox can
+  publish it as one more route instead of needing a hostname of its own.
+
+  This is the better answer for anyone behind Cloudflare Tunnel, nginx, Traefik
+  or Tailscale. Same origin as the Proxmox UI, so the toolbar button's status
+  request stops being a cross-origin credentialed one; the certificate is the
+  one already trusted; one access policy rather than two.
+
+  No new setting — the prefix is taken from the URL that already existed.
+  Direct access on `https://<node>:8007/` is unchanged, so `--doctor` and the
+  installer's health probe still work on a path-mounted panel.
+
+  Verified by running the panel with a `/pau` mount and requesting it both ways:
+  `/healthz` and `/pau/healthz` both answer, API routes resolve under both, and
+  a lookalike prefix (`/pauline/…`) is correctly not stripped.
+
 ## 1.11.0 — 2026-08-12
 
 ### Added

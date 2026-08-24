@@ -886,18 +886,60 @@ pve-autoupdate-patch-webui apply
 then hard-refresh the Proxmox UI. The installer also asks for this, right after
 the panel's port.
 
-**Cloudflare Tunnel**, as an example — add a second public hostname to the same
-tunnel:
+There are two ways to publish it. **Prefer the first.**
+
+#### Option 1 — a path on the hostname you already use (recommended)
+
+Mount the panel under a path on the same hostname as the Proxmox UI. With
+Cloudflare Tunnel that is one extra route on the tunnel you already have:
+
+| Field | Value |
+| --- | --- |
+| Public hostname | `proxmox.example.com` |
+| Path | `pau/*` |
+| Service | `https://localhost:8007` |
+| Additional settings → **No TLS Verify** | **on** (the node uses its own self-signed certificate) |
+
+```bash
+# /etc/proxmox-autoupdate.conf
+WEB_UI_PUBLIC_URL='https://proxmox.example.com/pau'
+```
+
+```bash
+pve-autoupdate-patch-webui apply
+```
+
+The panel picks the prefix up from that URL and strips it from incoming
+requests. Because it is now the **same origin** as the Proxmox UI, the toolbar
+button's status request stops being a cross-origin credentialed one, the
+certificate is the one you already trust, and there is no second hostname to put
+behind an access policy.
+
+Direct access on `https://<node>:8007/` keeps working, so `--doctor` and the
+installer's health probe are unaffected.
+
+#### Option 2 — a hostname of its own
 
 | Field | Value |
 | --- | --- |
 | Public hostname | `panel.example.com` |
 | Service | `https://localhost:8007` |
-| Additional settings → **No TLS Verify** | **on** (the node uses its own self-signed certificate) |
+| Additional settings → **No TLS Verify** | **on** |
 
-The panel authenticates with your existing Proxmox session cookie, so treat that
-hostname exactly as you treat the Proxmox one — put it behind the same access
-policy. Anyone who can reach it and log in can update, and reboot, the host.
+```bash
+WEB_UI_PUBLIC_URL='https://panel.example.com'
+```
+
+Works identically, but it is a second origin: its own certificate to trust, its
+own access policy to remember, and the status request stays cross-origin.
+
+Either way, the panel authenticates with your existing Proxmox session cookie,
+so put that address behind the same access policy as Proxmox itself. Anyone who
+can reach it and log in can update, and reboot, the host.
+
+> **Cloudflare specifically:** you cannot simply forward port 8007. Cloudflare's
+> proxy only accepts HTTPS on 443, 2053, 2083, 2087, 2096 and 8443 — 8007 is not
+> one of them — so it has to be a tunnel route regardless.
 
 There is no way to serve the panel on port 8006 itself: `pveproxy` has no
 reverse-proxy or add-a-route mechanism, and the only supported way to add

@@ -110,6 +110,13 @@ pvemanagerlib.js**, so it is validated as a bare `http(s)` origin in both the
 patcher and the panel. Loosening either regex is a script-injection hole in the
 Proxmox UI.
 
+`WEB_UI_PUBLIC_URL` may carry a **path** (`https://host/pau`), which mounts the
+panel under that prefix: `base_path()` derives it, `strip_base()` removes it from
+incoming requests, and `{{BASE}}` prefixes the page's own `api()` calls and the
+three download links. Requests without the prefix still route, because direct
+access on :8007 is what `--doctor` and the installer's health probe use — both
+forms must keep working.
+
 Anything that probes the panel from the browser (`probePanel`, `fetchStatus`)
 cannot distinguish a rejected certificate from a refused connection, a timeout
 or a DNS failure — a `no-cors` fetch rejects identically for all of them. Never

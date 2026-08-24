@@ -157,6 +157,43 @@ def _v_cron(v):
     return bool(CRON_RE.match(v))
 
 
+def base_path():
+    """The path this panel is mounted under, from WEB_UI_PUBLIC_URL, or "".
+
+    Set WEB_UI_PUBLIC_URL to something with a path — say
+    https://proxmox.example.com/pau — and the panel can be published as one more
+    route on a proxy that already fronts Proxmox, instead of needing a hostname
+    and a certificate of its own. Same origin as the Proxmox UI, so the toolbar
+    button's status fetch stops being a cross-origin credentialed request too.
+
+    Read fresh rather than cached at import: the config is edited by the panel
+    itself, and a stale prefix would route every request to the wrong place.
+    """
+    url = (read_config().get("WEB_UI_PUBLIC_URL") or "").strip()
+    if not url:
+        return ""
+    try:
+        path = urllib.parse.urlparse(url).path or ""
+    except ValueError:
+        return ""
+    path = "/" + path.strip("/")
+    return "" if path == "/" else path
+
+
+def strip_base(path):
+    """Routing sees the same paths whether or not a prefix is in use.
+
+    Direct access on the panel's own port has no prefix, and the installer's
+    health probe uses exactly that, so stripping is conditional rather than
+    required — both forms have to keep working or a path-mounted panel becomes
+    unmonitorable from the node itself.
+    """
+    prefix = base_path()
+    if prefix and (path == prefix or path.startswith(prefix + "/")):
+        return path[len(prefix):] or "/"
+    return path
+
+
 def _v_public_url(v):
     """Empty, or an http(s) origin safe to interpolate into JavaScript.
 
@@ -1956,6 +1993,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
+        path = strip_base(path)
         params = urllib.parse.parse_qs(query)
 
         if path == "/healthz":
@@ -2166,7 +2204,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
-        path = self.path.partition("?")[0]
+        path = strip_base(self.path.partition("?")[0])
         user = self._auth()
         if not user:
             return
@@ -2585,8 +2623,12 @@ function msg(el, text, ok) {
   if (ok) setTimeout(() => { el.className = "msg"; }, 6000);
 }
 
+/* Every request the page makes goes through here, which is the only reason
+   mounting the panel under a path costs almost nothing. */
+const BASE = "{{BASE}}";
+
 async function api(path, opts) {
-  const res = await fetch(path, Object.assign({credentials: "same-origin"}, opts || {}));
+  const res = await fetch(BASE + path, Object.assign({credentials: "same-origin"}, opts || {}));
   let data = {};
   try { data = await res.json(); } catch (e) { /* non-JSON error page */ }
   if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
@@ -2782,12 +2824,14 @@ def confirm_updates_flag():
 
 def _shared_js():
     return (SHARED_JS
+            .replace("{{BASE}}", base_path())
             .replace("{{CONFIRM_UPDATES}}", confirm_updates_flag())
             .replace("{{VERSION}}", PROCESS_VERSION))
 
 
 def render_page(user, csrf):
     return (PAGE_TEMPLATE
+            .replace("{{BASE}}", base_path())
             .replace("{{CSS}}", SHARED_CSS + theme_css())
             .replace("{{JS}}", _shared_js())
             .replace("{{USER}}", html.escape(user))
@@ -2797,6 +2841,7 @@ def render_page(user, csrf):
 def render_guest_page(user, csrf, vmid, name):
     # vmid is already known to be all digits, so it is safe to inline into JS.
     return (GUEST_TEMPLATE
+            .replace("{{BASE}}", base_path())
             .replace("{{CSS}}", SHARED_CSS + theme_css())
             .replace("{{JS}}", _shared_js())
             .replace("{{USER}}", html.escape(user))
@@ -3589,7 +3634,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <h2>Past reports</h2>
     <div class="row" style="margin-bottom:10px">
       <a id="btnDownloadAll" class="btnlink"
-         href="/api/log/download?name=all"
+         href="{{BASE}}/api/log/download?name=all"
          download="proxmox-autoupdate-logs.tar.gz">Download all as .tar.gz</a>
       <span class="hint" style="margin:0">Useful for attaching to a bug report.</span>
     </div>
@@ -4941,7 +4986,7 @@ async function loadLogList() {
 
       const dlCell = document.createElement("td");
       const dl = document.createElement("a");
-      dl.href = "/api/log/download?name=" + encodeURIComponent(entry.name);
+      dl.href = BASE + "/api/log/download?name=" + encodeURIComponent(entry.name);
       dl.textContent = "Download";
       dl.setAttribute("download", entry.name);
       dl.title = "Save " + entry.name + " to this computer";
@@ -4957,7 +5002,7 @@ async function showLog(name) {
   $("logFile").textContent = "Loading…";
   $("logFileName").textContent = name;
   const dl = $("btnDownloadOne");
-  dl.href = "/api/log/download?name=" + encodeURIComponent(name);
+  dl.href = BASE + "/api/log/download?name=" + encodeURIComponent(name);
   dl.setAttribute("download", name);
   dl.classList.remove("hidden");
   let offset = 0, text = "";
