@@ -4,6 +4,14 @@ A fully automated maintenance solution for Proxmox VE hosts with fancy terminal 
 
 This tool performs weekly updates across your entire Proxmox stack — including the host node, all LXC containers (running **and** stopped), Linux VMs, and Windows VMs — then delivers a detailed HTML report via Mailgun and conditionally reboots when a kernel update is detected.
 
+**Latest release: [v1.13.0](https://github.com/Enhanced-Group/proxmox-autoupdate/releases/tag/v1.13.0)**
+&middot; [tar.gz](https://github.com/Enhanced-Group/proxmox-autoupdate/archive/refs/tags/v1.13.0.tar.gz)
+&middot; [zip](https://github.com/Enhanced-Group/proxmox-autoupdate/archive/refs/tags/v1.13.0.zip)
+
+The installer resolves the newest published release on its own, so the one-line
+install below always fetches the current version — you only need these links to
+read the source or pin a specific version.
+
 ---
 
 ## Features
@@ -15,8 +23,9 @@ This tool performs weekly updates across your entire Proxmox stack — including
 - **Honest Result Reporting:** Guests report status through explicit markers rather than exit codes, so a benign non-zero `apt` exit is no longer reported as a failure — and a real failure is never reported as success. Packages that were genuinely upgraded are distinguished from those held back.
 - **Dry Run Mode:** `update-everything.sh --dry-run` reports exactly what would be upgraded and changes nothing at all — no packages, no snapshots, no reboot, and no starting or stopping of guests. Stopped guests are listed as skipped.
 - **Self-Diagnostic:** `update-everything.sh --doctor` checks everything a run depends on — Proxmox detected, cluster filesystem answering, dependencies present, repositories working, cron running, guest agents responding, disk space — and exits non-zero with a numbered list of what to fix. Read-only.
-- **Pre-Update Snapshots:** Optionally snapshot each guest before updating, with automatic pruning of old auto-snapshots.
-- **Web Control Panel:** Optional **Update Everything** button in the Proxmox toolbar (left of *Documentation*) — run updates, manage exclusions, edit the schedule and config, and read past reports without touching a shell. Authorised by your existing Proxmox login.
+- **Pre-Update Snapshots:** Optionally snapshot each guest before updating, with automatic pruning of old auto-snapshots. **Settings → Snapshots** lists what has accumulated and removes the ones this tool took; snapshots you made by hand are shown for context and refused by the server. Uninstalling asks about them rather than leaving them behind.
+- **Web Control Panel:** Optional **Update Everything** button in the Proxmox toolbar (left of *Documentation*) — run updates, manage exclusions, edit the schedule and config, and read past reports without touching a shell. Authorised by your existing Proxmox login. It opens **inside** the Proxmox UI; nothing sends you to another tab.
+- **Reachable by Default:** The panel listens on **8010** (8007 is Proxmox Backup Server's), and the installer opens that port in the Proxmox firewall — one rule per node address, pinned with `--dest` and sourced from that address's own network, never to `any`. `--doctor` reports the firewall and the certificate rather than asserting reachability it never tested.
 - **Flexible Notifications:** Email over **any SMTP server** or Mailgun, Discord (channel *or* direct message, with the log attached as a file), Slack, **Microsoft Teams**, **ntfy**, **Gotify**, **Telegram**, and any JSON webhook — in any combination, or none at all.
 - **Per-Guest Updates:** Each VM and container gets an **Update Now** button in its toolbar — patch a single guest without running the whole sweep, or exclude it from the schedule with one click. Also available as `--only <id>` on the CLI.
 - **Fancy Terminal Output:** Braille dot spinners, ANSI color-coded results, Unicode box-drawing banners, and a summary table.
@@ -31,7 +40,7 @@ This tool performs weekly updates across your entire Proxmox stack — including
 - **Concurrency Safe:** A `flock` lockfile prevents overlapping runs, and the web panel refuses to start one while a scheduled run is going.
 - **Honest Exit Codes:** `0` clean, `1` errors occurred, `2` guests left mid-update — so cron wrappers and `systemctl status` reflect reality.
 - **Customisable Appearance:** Recolour the panel's accent, success, warning and error colours from the Configuration tab, with presets and a live preview. Text contrast is adjusted automatically.
-- **Full Logging:** Output logged to `LOG_DIR` (default `/var/log/proxmox-autoupdate/`), pruned after `LOG_RETENTION_DAYS` (default 90; `0` keeps forever). `cron.log` is rotated by logrotate.
+- **Full Logging:** Output logged to `LOG_DIR` (default `/var/log/proxmox-autoupdate/`), pruned after `LOG_RETENTION_DAYS` (default 90; `0` keeps forever). `cron.log` is rotated by logrotate. The panel filters the file list and searches within a report, highlighting every match.
 - **Idempotent Deployment:** Re-running the installer safely updates everything while preserving config.
 
 ---
@@ -240,7 +249,7 @@ If a notification channel is configured, both run modes deliver the report throu
 
 | Flag | What it does |
 |------|--------------|
-| `--port N` | Port for the web control panel. Default **8010**. Refused if it is below 1024, above 65535, already listening, or a common service port — 8006, 8007, 3128, 8080, 5900-5999 and 60000-60050 among them. Validated before anything is written. |
+| `--port N` | Port for the web control panel. Default **8010**. Also editable later from **Settings → Configuration**, which rewrites the systemd drop-in, opens the new port in the firewall, closes the old one, re-points the toolbar button and restarts the service. Refused if it is below 1024, above 65535, already listening, or a common service port — 8006, 8007, 3128, 8080, 5900-5999 and 60000-60050 among them. Validated before anything is written. |
 | `--firewall-source CIDR` | Narrow the rule's source to this network. By default each rule is pinned with `--dest` to one of the node's own addresses and sourced from that address's own network; this replaces the source, never the destination. |
 | `--no-firewall` | Do not touch the Proxmox firewall at all. You are then responsible for opening the port, or the panel is reachable only from the node itself. |
 | `--unattended` | Reuse the existing configuration and ask nothing. This is what the panel's own self-update uses. |

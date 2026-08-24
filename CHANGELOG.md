@@ -143,11 +143,18 @@ anything to any log.
   took running the panel and opening the tab.
 
 
-- **The per-guest update page was unreachable.** `/guest?vmid=N` is a complete
-  screen — check for updates, run this guest alone, live output, its own API
-  endpoint — and nothing in the UI linked to it. It existed only for whoever
-  had read the source. Every row of the guest list now offers **Update…**,
-  including for a guest that the schedule skips.
+- **The per-guest page had no route to it from inside the panel.** `/guest?vmid=N`
+  is reached from the **Update Now** button the patcher puts in each guest's
+  toolbar in the Proxmox UI — so it was never lost — but from within the panel
+  itself there was no guest list and no link, and the only list of guests lived
+  under Settings → Exclusions, a screen about something else entirely. The
+  Overview tab now lists every guest with an **Update…** action, including
+  guests the schedule skips.
+
+  Note the two entry points differ on Windows: the injected toolbar button is
+  deliberately not shown for Windows guests ("updated by the scheduled run
+  only"), while the Overview list offers the action for every guest, since a
+  per-guest run is just `--only <id>` and the updater handles Windows.
 
 - **Configuration was one flat column of fourteen unrelated settings**, running
   from Windows update timeouts to snapshot retention to the panel's own port,
