@@ -133,6 +133,32 @@ anything to any log.
   had this installed, automation got an install with no web panel and the
   fallback schedule, on the one path where nobody reads the output.
 
+### Windows guests
+
+- **A Typical install gave Windows a third of the time it needs.**
+  `update-everything.sh` falls back to `3600` and the panel shows `3600` as the
+  default, but `apply_typical_profile()` wrote **1200** into the config — and a
+  value in the config beats the script's default. So the recommended install
+  path gave a Windows guest twenty minutes to install a cumulative update, next
+  to a help string in the panel reading "cumulative updates often need more than
+  an hour". Keep mode fell back to 1200 as well.
+
+  Both are 3600 now. **An install made before this still has 1200 in its
+  config**, and nothing rewrites it — a config value may have been chosen
+  deliberately. `--doctor` says so instead, but only when the node actually has
+  Windows VMs, with the one-line fix.
+
+  CI compared the panel's defaults against the updater's; nothing compared
+  either against the profile that writes the config, so two of the three
+  agreeing looked like agreement. It is compared now, with `REBOOT_TIME`
+  allowed as a deliberate difference.
+
+- **Windows guests are marked in the guest list**, and their **Update…** says
+  what it costs. The injected toolbar button hides itself for Windows
+  ("updated by the scheduled run only"); the panel offers it, because a flaky
+  Windows guest is the one most worth running on its own and watching — but an
+  unmarked action next to a Debian container implied the same five seconds.
+
 ### Found by review of the panel
 
 - **The Schedule tab was dead.** `/api/schedules` was registered under `do_POST`

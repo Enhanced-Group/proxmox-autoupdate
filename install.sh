@@ -811,7 +811,10 @@ apply_typical_profile() {
     NOTIFY_METHODS=""
     NOTIFY_ON_FAILURE_ONLY="false"
     EXCLUDE_IDS=""
-    WINDOWS_UPDATE_TIMEOUT="1200"
+    # 3600, matching update-everything.sh and the panel. At 1200 a
+    # cumulative update times out mid-install, which is the worst place
+    # for a Windows guest to stop.
+    WINDOWS_UPDATE_TIMEOUT="3600"
     LINUX_UPDATE_TIMEOUT="1800"
     APT_LOCK_TIMEOUT="600"
     START_STOPPED_WINDOWS="false"
@@ -845,7 +848,7 @@ apply_keep_profile() {
     NOTIFY_METHODS="${PREV_NOTIFY_METHODS}"
     NOTIFY_ON_FAILURE_ONLY="${PREV_FAIL_ONLY:-false}"
     EXCLUDE_IDS="${PREV_EXCLUDE}"
-    WINDOWS_UPDATE_TIMEOUT="${PREV_WIN_TIMEOUT:-1200}"
+    WINDOWS_UPDATE_TIMEOUT="${PREV_WIN_TIMEOUT:-3600}"
     LINUX_UPDATE_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
     APT_LOCK_TIMEOUT="${PREV_APT_LOCK:-600}"
     START_STOPPED_WINDOWS="${PREV_START_WIN:-false}"

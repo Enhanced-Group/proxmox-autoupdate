@@ -1007,6 +1007,30 @@ def set_excluded_ids(ids):
     return clean
 
 
+# ostype is not on /cluster/resources, so it takes one config call per VM.
+# Cached for the life of the process: a guest does not change operating system,
+# and this is read on every guest-list load.
+_OSTYPE_CACHE = {}
+
+
+def guest_is_windows(node, vmid):
+    key = (node, str(vmid))
+    if key in _OSTYPE_CACHE:
+        return _OSTYPE_CACHE[key]
+    ostype = ""
+    res = _run(["pvesh", "get", "/nodes/%s/qemu/%s/config" % (node, vmid),
+                "--output-format", "json"], timeout=15)
+    if res and res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            ostype = (data or {}).get("ostype", "") or ""
+        except ValueError:
+            ostype = ""
+    is_win = ostype.lower().startswith("w")
+    _OSTYPE_CACHE[key] = is_win
+    return is_win
+
+
 def list_guests():
     """Every VM and container on this cluster, with its exclusion state.
 
@@ -1038,6 +1062,9 @@ def list_guests():
             "status": item.get("status", "unknown"),
             "node": item.get("node", ""),
             "excluded": str(vmid) in skip,
+            # Only VMs can be Windows; asking about a container is a wasted call.
+            "windows": (item.get("type") != "lxc"
+                        and guest_is_windows(item.get("node", ""), vmid)),
         })
     guests.sort(key=lambda g: int(g["vmid"]))
     return guests, None
@@ -3653,6 +3680,9 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <strong>Update…</strong> opens that guest on its own: check what is
       pending, or update just it, without touching anything else. Works for a
       guest the schedule skips.
+      <br>Windows guests are offered here as well, unlike the button in the
+      Proxmox toolbar — a Windows guest is the one most worth updating on its
+      own and watching. Expect it to take far longer than a container.
     </div>
     <div class="table-wrap"><table>
       <thead><tr><th style="width:70px">ID</th><th class="wrap">Name</th>
@@ -5456,7 +5486,8 @@ async function loadRunGuests() {
     }
     data.guests.forEach((g) => {
       const tr = document.createElement("tr");
-      [g.vmid, g.name, g.type === "lxc" ? "LXC" : "VM", g.status].forEach((val) => {
+      [g.vmid, g.name, g.type === "lxc" ? "LXC" : (g.windows ? "VM · Windows" : "VM"),
+       g.status].forEach((val) => {
         const cell = document.createElement("td");
         cell.textContent = val;
         if (val === "stopped") cell.style.color = "var(--muted)";
@@ -5478,7 +5509,13 @@ async function loadRunGuests() {
                   "&name=" + encodeURIComponent(g.name || "");
       link.textContent = "Update\u2026";
       link.className = "btnlink";
-      link.title = "Check or update " + (g.name || g.vmid) + " on its own";
+      // Windows is the guest most worth running on its own and watching, and
+      // the one least like a container when you do. Say so before the click.
+      link.title = g.windows
+        ? "Check or update " + (g.name || g.vmid) + " on its own. Windows "
+          + "Update can run for well over an hour \u2014 the run holds until it "
+          + "finishes or the Windows update timeout expires."
+        : "Check or update " + (g.name || g.vmid) + " on its own";
       actionCell.appendChild(link);
       tr.appendChild(actionCell);
       tbody.appendChild(tr);

@@ -527,6 +527,67 @@ else
     rm -rf "${JS_TMP}"
 fi
 
+# --- 3d-sexies-bis. Typical writes what the updater would have used ---------
+# The panel's defaults are checked against update-everything.sh above. Nothing
+# checked either against apply_typical_profile(), which is the thing that
+# actually writes the config - and a value in the config beats the script's
+# default. WINDOWS_UPDATE_TIMEOUT sat at 1200 there while both other places said
+# 3600, so every Typical install gave a Windows guest twenty minutes for an
+# update the tool's own help text calls an hour's work.
+echo "== Typical profile matches the updater's defaults =="
+if ! have_python3; then
+    ok "python3 not available — skipped (CI always has it)"
+else
+python3 - <<'PYCHECK'
+import io, re, sys
+
+install = io.open("install.sh", encoding="utf-8").read()
+script = io.open("update-everything.sh", encoding="utf-8").read()
+
+profile = re.search(r"^apply_typical_profile\(\) \{(.*?)^\}", install, re.S | re.M).group(1)
+written = dict(re.findall(r'^\s*([A-Z0-9_]+)="([^"$]*)"\s*$', profile, re.M))
+
+# Deliberate differences, with the reason. Typical prints each of these in its
+# summary, so nobody is surprised by them.
+INTENTIONAL = {
+    "REBOOT_TIME": "Typical reboots at 02:00; the bare default is midnight",
+}
+
+ARITH = re.compile(r"\A\$\(\(([0-9+\-*/ ()]+)\)\)\Z")
+
+
+def value(text):
+    m = ARITH.match(text.strip())
+    if not m:
+        return text
+    try:
+        return str(eval(m.group(1), {"__builtins__": {}}, {}))
+    except Exception:
+        return text
+
+
+bad = 0
+checked = 0
+for key in sorted(written):
+    m = re.search(r'^%s="\$\{%s:-([^}]*)\}"' % (key, key), script, re.M)
+    if not m:
+        continue
+    checked += 1
+    if value(written[key]) == value(m.group(1)):
+        continue
+    if key in INTENTIONAL:
+        print("  [ ok ] %s differs on purpose: %s" % (key, INTENTIONAL[key]))
+        continue
+    print("  [FAIL] %s: Typical writes %s, overriding the %s update-everything.sh "
+          "would use" % (key, written[key], m.group(1)))
+    bad = 1
+if not bad:
+    print("  [ ok ] %d Typical values match the updater" % checked)
+sys.exit(bad)
+PYCHECK
+[ $? -eq 0 ] || FAILED=1
+fi
+
 # --- 3d-septies. The panel's own JavaScript parses ---------------------------
 # PAGE_TEMPLATE and GUEST_TEMPLATE each carry a script block, and SHARED_JS is
 # spliced into both. None of it was ever parsed by anything: a stray token would

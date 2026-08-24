@@ -597,6 +597,38 @@ run_doctor() {
         fi
     fi
 
+    # A Windows guest that runs out of time mid-update is the worst outcome
+    # this tool can produce, and installs made before 1.13.0 were given 1200 by
+    # the installer while both the updater and the panel used 3600. Nothing
+    # rewrites it here: it is in the config, and a config value may have been
+    # chosen deliberately. Saying so is enough.
+    local wintimeout ct_windows
+    wintimeout=$(cfg_read WINDOWS_UPDATE_TIMEOUT); wintimeout="${wintimeout:-3600}"
+    case "${wintimeout}" in
+        ''|*[!0-9]*) : ;;
+        *)
+            if [ "${wintimeout}" -lt 3600 ]; then
+                ct_windows=0
+                if command -v qm >/dev/null 2>&1; then
+                    while read -r _vmid _rest; do
+                        case "${_vmid}" in ''|*[!0-9]*) continue ;; esac
+                        if config_field qm "${_vmid}" ostype | grep -qi '^w'; then
+                            ct_windows=$((ct_windows + 1))
+                        fi
+                    done < <(qm list 2>/dev/null | awk 'NR>1 {print $1}')
+                fi
+                if [ "${ct_windows}" -gt 0 ]; then
+                    _d_warn "WINDOWS_UPDATE_TIMEOUT is ${wintimeout}s, and there \
+are ${ct_windows} Windows VM(s)"
+                    _d_warn "  a cumulative update regularly needs more than an hour;"
+                    _d_warn "  below 3600 it is cut off part-way through installing"
+                    _d_warn "  → set WINDOWS_UPDATE_TIMEOUT='3600' in ${CONFIG_FILE},"
+                    _d_warn "    or in the panel under Settings → Configuration"
+                fi
+            fi
+            ;;
+    esac
+
     _d_head "Scheduling"
     if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1 \
        || systemctl is-active --quiet cron 2>/dev/null; then
