@@ -909,6 +909,21 @@ WEB_UI_PUBLIC_URL='https://proxmox.example.com/pau'
 pve-autoupdate-patch-webui apply
 ```
 
+**The order of the routes matters.** A public-hostname entry with no path is a
+catch-all, and Cloudflare matches entries top to bottom — so the `pau/*` entry
+must sit **above** the plain `proxmox.example.com` entry that points at 8006. If
+it does not, `/pau` is handed to `pveproxy`, which answers:
+
+```
+no such file '/pau'
+```
+
+That message is Proxmox, not this tool — it means the request arrived on the
+node but went to the wrong port.
+
+The tunnel forwards the full path, prefix included, so the panel receives
+`/pau/healthz` and strips the prefix itself. Nothing needs to rewrite the URL.
+
 The panel picks the prefix up from that URL and strips it from incoming
 requests. Because it is now the **same origin** as the Proxmox UI, the toolbar
 button's status request stops being a cross-origin credentialed one, the

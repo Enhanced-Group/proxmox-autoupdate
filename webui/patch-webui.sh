@@ -64,6 +64,20 @@ if [ -r "${CONFIG_FILE}" ]; then
     fi
 fi
 
+# The tool version this block is generated from.
+#
+# pvemanagerlib.js is a static .js file, and every CDN and browser caches it
+# hard. Re-patching the node therefore changes nothing for a browser that
+# already holds a copy — which looks exactly like the patch not working, and
+# cost a long debugging session to recognise. Stamping the version in lets the
+# running code compare itself against what the node reports and say so.
+UPDATE_SCRIPT_PATH="${PAU_UPDATE_SCRIPT:-/usr/local/bin/update-everything.sh}"
+BLOCK_VERSION="unknown"
+if [ -r "${UPDATE_SCRIPT_PATH}" ]; then
+    _v=$(sed -n 's/^PAU_VERSION=//p' "${UPDATE_SCRIPT_PATH}" | head -1 | tr -d '"' | tr -d "[:space:]")
+    [ -n "${_v}" ] && BLOCK_VERSION="${_v}"
+fi
+
 # A string that must still be present after any edit, as a corruption canary.
 SENTINEL="PVE.StdWorkspace"
 
@@ -245,6 +259,10 @@ emit_block() {
     var OPEN_PORT = ${UI_PORT};
     /* Empty unless WEB_UI_PUBLIC_URL is set, in which case it wins. */
     var PUBLIC_BASE = '${UI_PUBLIC_URL}';
+    /* The version this file was patched by. Compared against what the panel
+       reports is installed, to catch a browser or CDN serving a stale copy. */
+    var BLOCK_VERSION = '${BLOCK_VERSION}';
+    var staleWarned = false;
 JSBLOCK_HEAD
     cat <<'JSBLOCK'
 
@@ -599,6 +617,37 @@ Click to see why — usually a ' +
             statusFailures = 0;
             el.removeCls ? el.removeCls('pau-unreachable')
                          : el.dom.classList.remove('pau-unreachable');
+
+            /* This tab is running JavaScript older than what is installed on
+               the node. Behind a CDN that caches .js — Cloudflare does by
+               default — re-patching the node changes nothing here until the
+               cache is purged, and every symptom looks like the patch failing. */
+            if (!staleWarned && BLOCK_VERSION !== 'unknown' &&
+                state.version && state.version !== BLOCK_VERSION) {
+                staleWarned = true;
+                if (window.console) {
+                    console.warn('proxmox-autoupdate: this page is running the ' +
+                        'toolbar code from version ' + BLOCK_VERSION + ', but ' +
+                        state.version + ' is installed on the node. Your browser ' +
+                        'or CDN is serving a cached pvemanagerlib.js. Hard-refresh ' +
+                        '(Ctrl+Shift+R), and purge the CDN cache if you use one.');
+                }
+                Ext.Msg.show({
+                    title: 'Reload needed — cached interface',
+                    message:
+                        'This tab is running the Auto-Update toolbar from version ' +
+                        '<b>' + BLOCK_VERSION + '</b>, but <b>' + state.version +
+                        '</b> is installed on the node.<br><br>' +
+                        'Your browser is holding a cached copy of ' +
+                        '<code>pvemanagerlib.js</code>. Hard-refresh with ' +
+                        '<b>Ctrl+Shift+R</b> (Cmd+Shift+R on a Mac).<br><br>' +
+                        'If Proxmox is behind a CDN — Cloudflare caches ' +
+                        '<code>.js</code> by default — purge its cache too, or ' +
+                        'the old file will keep being served however often you ' +
+                        're-patch the node.',
+                    buttons: Ext.Msg.OK
+                });
+            }
 
             if (state.version) {
                 if (bootVersion === null) {

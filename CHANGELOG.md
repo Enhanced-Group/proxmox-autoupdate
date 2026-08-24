@@ -12,6 +12,30 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.12.3 — 2026-08-12
+
+### Fixed
+
+- **A cached `pvemanagerlib.js` now announces itself.** That file is static
+  JavaScript, and every browser and CDN caches it hard — Cloudflare caches
+  `.js` by default. Re-patching the node therefore changes nothing for a
+  browser already holding a copy, and every symptom looks exactly like the
+  patch having failed: the button keeps its old URL, old dialogs keep
+  appearing, and re-running the patcher keeps reporting success.
+
+  The injected block is now stamped with the version that generated it. When
+  the panel reports a different version installed on the node, the page says so
+  — naming both versions, and telling you to purge the CDN cache as well as
+  hard-refreshing, because a hard refresh alone does not clear an edge cache.
+
+### Changed
+
+- README documents the Cloudflare Tunnel route-ordering trap: a public-hostname
+  entry with no path is a catch-all, so a `pau/*` route placed below it never
+  matches and `/pau` is handed to `pveproxy`, which answers
+  `no such file '/pau'`. That message is Proxmox, not this tool — it means the
+  request reached the node but went to port 8006.
+
 ## 1.12.2 — 2026-08-12
 
 ### Fixed
