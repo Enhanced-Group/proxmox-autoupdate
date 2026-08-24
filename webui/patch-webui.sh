@@ -607,8 +607,7 @@ JSBLOCK_HEAD
                     el.addCls ? el.addCls('pau-unreachable')
                               : el.dom.classList.add('pau-unreachable');
                     btn.setTooltip('Cannot reach the Auto-Update panel at ' +
-                        panelBase() + '/
-Click to see why — usually a ' +
+                        panelBase() + '/\nClick to see why — usually a ' +
                         'certificate to accept, or a proxy that does not ' +
                         'forward port ' + OPEN_PORT + '.');
                 }
@@ -687,8 +686,7 @@ Click to see why — usually a ' +
                     cls = 'pau-ok'; tip = 'Last run completed cleanly';
                 }
                 if (!result) {
-                    tip = 'No update run recorded yet.
-The dot turns green ' +
+                    tip = 'No update run recorded yet.\nThe dot turns green ' +
                           'after the first run finishes cleanly.';
                 }
                 if (state.last_run && state.last_run.finished) {

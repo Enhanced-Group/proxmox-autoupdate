@@ -12,6 +12,33 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.12.4 — 2026-08-12
+
+**Upgrade immediately if you are on 1.11.0 – 1.12.3.** On those versions the
+toolbar patch makes the entire Proxmox web UI load blank.
+
+### Fixed
+
+- **The injected JavaScript block did not parse, so every patched node's web UI
+  went blank.** Two string literals in the block contained real newlines instead
+  of `
+`. `pvemanagerlib.js` is a single script, so one syntax error anywhere
+  in it stops the whole file executing — not just this tool's button, but the
+  entire Proxmox interface.
+
+  Present in 1.11.0, 1.12.0, 1.12.1, 1.12.2 and 1.12.3. It went unnoticed
+  because a browser holding a cached copy of the old file keeps working, so the
+  breakage only appears once the cache clears — which is exactly what the same
+  releases were telling people to do.
+
+  If your UI is already blank, recover from the node's shell with
+  `pve-autoupdate-patch-webui restore`, then update and re-apply.
+
+  `bash -n` cannot see this: to the shell the block is text inside a heredoc.
+  CI now generates the block and runs `node --check` over it *and* over the
+  resulting `pvemanagerlib.js`, which is the check that should have existed
+  before any JavaScript was ever appended to a file the whole UI depends on.
+
 ## 1.12.3 — 2026-08-12
 
 ### Fixed

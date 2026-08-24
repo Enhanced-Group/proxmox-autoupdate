@@ -467,6 +467,51 @@ else
     fail "expected 3 asking() gates in install.sh, found ${GATES}"
 fi
 
+# --- 3d-sexies. The injected block is valid JavaScript ------------------------
+# This is appended to pvemanagerlib.js, which is a single script: one syntax
+# error anywhere in it stops the *whole* file executing, so the entire Proxmox
+# web UI loads blank. Recovery needs shell access on the node, which is exactly
+# what someone who administers the box through that UI does not have to hand.
+#
+# It shipped. Two string literals in the block contained real newlines instead
+# of 
+, from an editing slip that `bash -n` cannot see — the shell is happy,
+# because to the shell it is just text inside a heredoc. Nothing checked the
+# JavaScript, so nothing caught it.
+echo "== injected JavaScript parses =="
+if ! command -v node >/dev/null 2>&1; then
+    warn "node not available — skipped (CI installs it)"
+else
+    JS_TMP=$(mktemp -d)
+    {
+        echo "// stub"
+        echo "Ext.define('PVE.StdWorkspace', {});"
+        head -c 70000 /dev/zero | tr ' ' 'x' | fold -w 100 | sed 's|^|// |'
+    } > "${JS_TMP}/pvemanagerlib.js"
+    printf "WEB_UI_PORT='8007'
+" > "${JS_TMP}/conf"
+    if PAU_TARGET="${JS_TMP}/pvemanagerlib.js" PAU_BACKUP="${JS_TMP}/orig"        PAU_CONFIG="${JS_TMP}/conf" bash webui/patch-webui.sh apply >/dev/null 2>&1; then
+        awk '/==== BEGIN proxmox-autoupdate button ====/,/==== END proxmox-autoupdate button ====/'             "${JS_TMP}/pvemanagerlib.js" > "${JS_TMP}/block.js"
+        if [ ! -s "${JS_TMP}/block.js" ]; then
+            fail "the patcher reported success but appended no block"
+        elif node --check "${JS_TMP}/block.js" 2>"${JS_TMP}/err"; then
+            ok "the block appended to pvemanagerlib.js parses as JavaScript"
+        else
+            fail "the injected block is NOT valid JavaScript — every patched node's web UI would load blank:"
+            sed 's/^/         /' "${JS_TMP}/err" | head -6
+        fi
+        # The whole file has to parse too, not only the block in isolation.
+        if node --check "${JS_TMP}/pvemanagerlib.js" >/dev/null 2>&1; then
+            ok "the patched pvemanagerlib.js parses as a whole"
+        else
+            fail "the patched pvemanagerlib.js does not parse"
+        fi
+    else
+        fail "patch-webui.sh apply failed against a stub pvemanagerlib.js"
+    fi
+    rm -rf "${JS_TMP}"
+fi
+
 # --- 3e. No faint text -------------------------------------------------------
 # \033[2m is rendered at very low contrast by xterm.js, which is what the
 # Proxmox web shell uses — it made roughly a third of the installer invisible
