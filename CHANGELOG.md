@@ -133,6 +133,50 @@ anything to any log.
   had this installed, automation got an install with no web panel and the
   fallback schedule, on the one path where nobody reads the output.
 
+### Found by a second audit
+
+- **The fatal notifier could not send.** `json_escape()` opened with
+  `sed -e ':a' -e 'N' -e '$!ba'` to pull every line into the pattern space. With
+  two or more lines that works. With exactly one — which is every message
+  `notify_fatal` builds — `N` has no next line, and GNU sed prints the pattern
+  space and exits **before reaching the substitutions**. So the text went into
+  the JSON body unescaped: one quote or backslash and the body was invalid, the
+  endpoint rejected it, and the message saying the run had died was dropped
+  silently. It failed exactly when it was needed.
+
+  It now escapes with `json.dumps`, which also handles what no sed pipeline
+  can — an ANSI escape or a bell from an apt error is a raw control character,
+  and those are not legal inside a JSON string either. The sed fallback, for the
+  early-failure path where python3 might genuinely be missing, uses
+  `$!{N;ba}` and drops unrepresentable control characters. Sixteen shapes of
+  hostile text now round-trip to valid JSON; before, six of them did not.
+
+- **A line break in a schedule label produced a malformed crontab line.** The
+  label became a comment *and* a second command line beginning with the text
+  after the break, which `crontab(1)` rejects — taking the whole schedule with
+  it and aborting the installer at "Configuring the schedule" with an error
+  pointing at cron rather than at the label. Both of the panel's write paths
+  already refused labels containing `;`, `|`, CR or LF, so only a hand-edited
+  config could reach it; all three parsers now strip line breaks as well.
+
+- **`--purge` left the panel's colours behind.** `/etc/proxmox-autoupdate-theme.json`
+  is written when the panel is recoloured, and nothing ever removed it.
+
+### Reports
+
+- **The HTML report is Proxmox grey, in the colours you chose.** It was
+  hard-coded light — `#f4f6f9` on white — so a report opened from a Discord
+  attachment was a white flash that looked nothing like the tool that sent it.
+  It now reads the same `/etc/proxmox-autoupdate-theme.json` the panel writes
+  and matches the panel's own surfaces, accent included. Status badges carry
+  their colour on the text and border rather than as a pale fill, which is what
+  made them shout against a dark ground.
+
+  Only a plain `#rrggbb` is ever interpolated into that stylesheet: the value
+  reaches CSS in a document you open in a browser, so everything else — a named
+  colour, `url(...)`, a closing `</style>`, a newline — falls back to the
+  shipped default.
+
 ### Windows guests
 
 - **A Typical install gave Windows a third of the time it needs.**

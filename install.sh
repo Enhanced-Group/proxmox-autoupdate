@@ -453,6 +453,12 @@ parse_schedules() {
         # crontab as out of step.
         cron="${cron#"${cron%%[![:space:]]*}"}"
         cron="${cron%"${cron##*[![:space:]]}"}"
+        # A newline here becomes a second, malformed crontab line, which
+        # crontab(1) rejects - taking the whole schedule with it. The panel
+        # refuses these on input; this is the last check before the root
+        # crontab, for a config somebody edited by hand.
+        label=${label//$'\r'/ }
+        label=${label//$'\n'/ }
         case "${reboot}" in
             no|only) : ;;
             *)       reboot="yes" ;;

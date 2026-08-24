@@ -15,6 +15,9 @@ set -uo pipefail
 
 TARGET_PATH="/usr/local/bin/update-everything.sh"
 CONFIG_FILE="/etc/proxmox-autoupdate.conf"
+# Written by the panel when the operator recolours it. Nothing removed it,
+# so a --purge left a file behind in /etc after everything else was gone.
+THEME_FILE="/etc/proxmox-autoupdate-theme.json"
 LOG_DIR="/var/log/proxmox-autoupdate"
 LOCKFILE="/var/run/proxmox-autoupdate.lock"
 STATE_DIR="/var/lib/proxmox-autoupdate"
@@ -139,6 +142,7 @@ echo -e "  the uninstaller itself"
 if [ "${PURGE}" = true ]; then
     echo -e "  ${C_YELLOW}${CONFIG_FILE}${C_NC} ${C_DIM}(your credentials and settings)${C_NC}"
     echo -e "  ${C_YELLOW}${LOG_DIR}/${C_NC} ${C_DIM}(every past update report)${C_NC}"
+    [ -e "${THEME_FILE}" ] && echo -e "  ${C_YELLOW}${THEME_FILE}${C_NC} ${C_DIM}(panel colours)${C_NC}"
 fi
 # Listed unconditionally, because it is removed unconditionally - it holds the
 # pristine pvemanagerlib.js backup, which has to go with the patcher that knows
@@ -421,6 +425,10 @@ if [ "${PURGE}" = true ]; then
     if [ -e "${CONFIG_FILE}" ]; then
         rm -f "${CONFIG_FILE}"
         print_ok "Removed ${CONFIG_FILE}"
+    fi
+    if [ -e "${THEME_FILE}" ]; then
+        rm -f "${THEME_FILE}"
+        print_ok "Removed ${THEME_FILE}"
     fi
     if [ -d "${LOG_DIR}" ]; then
         rm -rf "${LOG_DIR}"

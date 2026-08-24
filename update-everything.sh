@@ -244,6 +244,12 @@ parse_schedules() {
         # crontab as out of step.
         cron="${cron#"${cron%%[![:space:]]*}"}"
         cron="${cron%"${cron##*[![:space:]]}"}"
+        # A newline here becomes a second, malformed crontab line, which
+        # crontab(1) rejects - taking the whole schedule with it. The panel
+        # refuses these on input; this is the last check before the root
+        # crontab, for a config somebody edited by hand.
+        label=${label//$'\r'/ }
+        label=${label//$'\n'/ }
         case "${reboot}" in
             no|only) : ;;
             *)       reboot="yes" ;;
@@ -258,10 +264,63 @@ parse_schedules() {
 # The slurp (:a N $!ba) has to come first. sed applies commands in order within
 # a cycle, so escaping before the slurp only ever escapes the first line — every
 # subsequent line is appended after those substitutions have already run.
+# Escape a string for use inside a JSON string literal.
+#
+# This used to be a sed pipeline opening with `:a; N; $!ba` to slurp every line
+# into the pattern space. With two or more lines that works. With exactly one -
+# which is every message notify_fatal builds - `N` finds no next line, and GNU
+# sed prints the pattern space and exits *before reaching the substitutions*.
+# The result was the input, unescaped: one quote or backslash in the message
+# and the JSON body was invalid, the endpoint rejected it, and the notification
+# saying the run had died was dropped without a word.
+#
+# json.dumps also handles what no sed pipeline can: an ANSI escape or a bell
+# from an apt error is a raw control character, and those are not legal inside a
+# JSON string. python3 is a hard dependency of this tool, but notify_fatal runs
+# on the early-failure path, so there is a corrected sed fallback for the case
+# where it is genuinely absent.
+# The colours the operator picked in the panel, for the HTML report.
+#
+# The panel stores these in /etc/proxmox-autoupdate-theme.json and paints its
+# own surfaces Proxmox grey. The report used to be hard-coded light, so a report
+# opened from a Discord attachment was a white flash that looked nothing like
+# the tool that sent it. Same file, same defaults, so the two agree.
+THEME_FILE="${PAU_THEME_FILE:-/etc/proxmox-autoupdate-theme.json}"
+
+read_theme_colour() {
+    local key="$1" fallback="$2" value=""
+    if [ -r "${THEME_FILE}" ] && command -v python3 >/dev/null 2>&1; then
+        value=$(PAU_TKEY="${key}" python3 -c '
+import json, os, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+v = str(data.get(os.environ["PAU_TKEY"], ""))
+# Only a plain #rrggbb reaches a stylesheet: this string is interpolated into
+# CSS in a file the operator opens in a browser.
+if re.match(r"\A#[0-9a-fA-F]{6}\Z", v):
+    sys.stdout.write(v)
+' "${THEME_FILE}" 2>/dev/null || true)
+    fi
+    case "${value}" in
+        \#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) printf '%s' "${value}" ;;
+        *) printf '%s' "${fallback}" ;;
+    esac
+}
+
 json_escape() {
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null && return
+    fi
+    # `$!{N;ba}` appends only when there IS a next line, which is the whole
+    # difference. Control characters that cannot be represented are dropped
+    # rather than emitted raw.
     printf '%s' "$1" \
         | tr -d '\r' \
-        | sed -e ':a' -e 'N' -e '$!ba' \
+        | tr -d '\000-\010\013\014\016-\037' \
+        | sed -e ':a' -e '$!{N;ba' -e '}' \
               -e 's/\\/\\\\/g' \
               -e 's/"/\\"/g' \
               -e 's/\t/\\t/g' \
@@ -4314,35 +4373,48 @@ if [ -n "${REPEAT_OFFENDERS:-}" ]; then
     REPEAT_SUMMARY_HTML="<br><strong>Failing repeatedly:</strong> $(echo "${REPEAT_OFFENDERS}" | html_escape)"
 fi
 
+# Same palette as the panel's own surfaces, with the operator's accent.
+RPT_ACCENT=$(read_theme_colour accent "#e65c00")
+RPT_OK=$(read_theme_colour ok "#4caf50")
+RPT_WARN=$(read_theme_colour warn "#ffb300")
+RPT_ERR=$(read_theme_colour err "#f44336")
+RPT_BG="#1e1e1e"; RPT_PANEL="#2a2a2a"; RPT_BORDER="#3d3d3d"
+RPT_TEXT="#e8e8e8"; RPT_MUTED="#9a9a9a"; RPT_CODE="#111111"
+
 cat <<EOF > "${HTML_FILE}"
 <!DOCTYPE html>
 <html>
 <head>
 <style>
-  body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
-  .container { max-width: 850px; background: #ffffff; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin: 0 auto; }
-  .header { border-bottom: 2px solid #e65c00; padding-bottom: 15px; margin-bottom: 20px; }
-  h1 { color: #e65c00; margin: 0 0 10px 0; font-size: 22px; }
-  .pve-box { background: #fff3cd; border-left: 4px solid #e65c00; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 15px; font-weight: bold; color: #856404; }
-  .meta-info { background: #eef6fc; border-left: 4px solid #0066cc; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 14px; line-height: 1.6; }
-  .section-title { color: #2c3e50; font-size: 16px; margin-top: 20px; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px; font-weight: bold; }
+  /* Proxmox grey, with the accent the operator chose in the panel. A report
+     is read next to the Proxmox UI or opened from a chat client, and a white
+     page in either place is a flash and a mismatch. */
+  body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: ${RPT_BG}; color: ${RPT_TEXT}; margin: 0; padding: 20px; }
+  .container { max-width: 850px; background: ${RPT_PANEL}; padding: 25px; border-radius: 8px; border: 1px solid ${RPT_BORDER}; margin: 0 auto; }
+  .header { border-bottom: 2px solid ${RPT_ACCENT}; padding-bottom: 15px; margin-bottom: 20px; }
+  h1 { color: ${RPT_ACCENT}; margin: 0 0 10px 0; font-size: 22px; }
+  .pve-box { background: ${RPT_BG}; border-left: 4px solid ${RPT_ACCENT}; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 15px; font-weight: bold; color: ${RPT_TEXT}; }
+  .meta-info { background: ${RPT_BG}; border-left: 4px solid ${RPT_ACCENT}; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 14px; line-height: 1.6; color: ${RPT_TEXT}; }
+  .section-title { color: ${RPT_TEXT}; font-size: 16px; margin-top: 20px; margin-bottom: 10px; border-bottom: 1px solid ${RPT_BORDER}; padding-bottom: 5px; font-weight: bold; }
   table { width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px; }
-  th { background-color: #f8f9fa; color: #495057; text-align: left; padding: 10px; border: 1px solid #dee2e6; }
-  td { padding: 9px 10px; border: 1px solid #dee2e6; vertical-align: top; }
-  tr:nth-child(even) { background-color: #fbfbfb; }
+  th { background-color: ${RPT_BG}; color: ${RPT_MUTED}; text-align: left; padding: 10px; border: 1px solid ${RPT_BORDER}; }
+  td { padding: 9px 10px; border: 1px solid ${RPT_BORDER}; vertical-align: top; color: ${RPT_TEXT}; }
+  tr:nth-child(even) td { background-color: rgba(255,255,255,0.02); }
   .status-badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-weight: bold; font-size: 11px; }
-  .badge-success { background: #d4edda; color: #155724; }
-  .badge-no-updates { background: #e2e3e5; color: #383d41; }
-  .badge-warning { background: #fff3cd; color: #856404; }
-  .badge-error { background: #f8d7da; color: #721c24; }
-  .badge-dim { background: #e9ecef; color: #6c757d; }
-  .pkg-list { font-size: 12px; margin: 5px 0 0 15px; padding: 0; list-style-type: disc; }
+  /* Badges carry their colour on the text and the border rather than as a pale
+     fill, which is what made them shout on a dark ground. */
+  .badge-success { background: transparent; color: ${RPT_OK}; border: 1px solid ${RPT_OK}; }
+  .badge-no-updates { background: transparent; color: ${RPT_MUTED}; border: 1px solid ${RPT_BORDER}; }
+  .badge-warning { background: transparent; color: ${RPT_WARN}; border: 1px solid ${RPT_WARN}; }
+  .badge-error { background: transparent; color: ${RPT_ERR}; border: 1px solid ${RPT_ERR}; }
+  .badge-dim { background: transparent; color: ${RPT_MUTED}; border: 1px solid ${RPT_BORDER}; }
+  .pkg-list { font-size: 12px; margin: 5px 0 0 15px; padding: 0; list-style-type: disc; color: ${RPT_TEXT}; }
   .pkg-list li { font-family: 'Courier New', Courier, monospace; font-size: 11px; padding: 1px 0; }
-  .detail { margin-top: 8px; font-size: 12px; color: #721c24; }
-  .log-snippet { margin: 8px 0 0 0; padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; font-family: 'Courier New', Courier, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; color: #495057; }
-  .dry-run-box { background: #e2e3e5; border-left: 4px solid #6c757d; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 14px; font-weight: bold; color: #383d41; }
-  .summary-box { background: #f8f9fa; border: 1px solid #dee2e6; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px; line-height: 1.8; }
-  .footer { margin-top: 25px; font-size: 12px; color: #6c757d; text-align: center; border-top: 1px solid #eee; padding-top: 15px; }
+  .detail { margin-top: 8px; font-size: 12px; color: ${RPT_ERR}; }
+  .log-snippet { margin: 8px 0 0 0; padding: 8px; background: ${RPT_CODE}; border: 1px solid ${RPT_BORDER}; border-radius: 4px; font-family: 'Courier New', Courier, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; color: ${RPT_MUTED}; }
+  .dry-run-box { background: ${RPT_BG}; border-left: 4px solid ${RPT_MUTED}; padding: 12px 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; font-size: 14px; font-weight: bold; color: ${RPT_MUTED}; }
+  .summary-box { background: ${RPT_BG}; border: 1px solid ${RPT_BORDER}; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px; line-height: 1.8; color: ${RPT_TEXT}; }
+  .footer { margin-top: 25px; font-size: 12px; color: ${RPT_MUTED}; text-align: center; border-top: 1px solid ${RPT_BORDER}; padding-top: 15px; }
 </style>
 </head>
 <body>

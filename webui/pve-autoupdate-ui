@@ -1919,7 +1919,11 @@ def parse_schedules(raw, legacy_cron=""):
         mode = parts[1].strip().lower() if len(parts) > 1 else "yes"
         if mode not in SCHEDULE_MODES:
             mode = "yes"
-        label = parts[2].strip() if len(parts) > 2 else ""
+        # Stripped, not rejected: _v_schedules and _save_schedule already
+        # refuse these on the way in, so anything seen here came from a
+        # hand-edited config, and the shell parser strips it too.
+        label = (parts[2].replace("\r", " ").replace("\n", " ").strip()
+                 if len(parts) > 2 else "")
         out.append({"cron": cron, "mode": mode, "label": label})
     if not out and legacy_cron:
         # A pre-1.9 config: one schedule, and it always rebooted.
