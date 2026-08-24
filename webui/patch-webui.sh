@@ -233,6 +233,18 @@ JSBLOCK_HEAD
             '  --pau-warn: #ffd24d;',
             '  --pau-err: #ff4d4d;',
             '}',
+            /* The fallback button, used only when the header toolbar could
+               not be identified. Deliberately plain DOM and fixed-position, so
+               it does not depend on the ExtJS layout that already failed. */
+            '#pauFallbackBtn {',
+            '  position: fixed; right: 16px; bottom: 16px; z-index: 100000;',
+            '  padding: 8px 14px; border-radius: 4px; cursor: pointer;',
+            '  font: 500 13px/1.2 sans-serif;',
+            '  color: var(--pau-on-accent); background: var(--pau-accent);',
+            '  border: 1px solid var(--pau-accent-border);',
+            '  box-shadow: 0 2px 8px rgba(0,0,0,.35);',
+            '}',
+            '#pauFallbackBtn:hover { background: var(--pau-accent-hover); }',
             '.pau-btn, .pau-btn * { box-sizing: border-box !important; }',
             '.pau-btn {',
             '  background: var(--pau-accent) !important;',
@@ -557,6 +569,72 @@ JSBLOCK_HEAD
     /* ================= Node button: top toolbar, beside Documentation =======
        Global rather than per-node: it updates the host and every guest, so it
        does not belong to whatever happens to be selected in the tree. */
+    /* Where to put the button.
+       
+       Anchoring on the Documentation button alone was too narrow: any Proxmox
+       release that renames it, drops its onlineHelp property or moves it out of
+       a toolbar leaves this code polling for two minutes and then silently
+       giving up, which is indistinguishable from the installer having failed.
+       Several routes are tried, ending with "any toolbar that looks like the
+       main header", and there is a fallback below for when none of them match. */
+    function findAnchorButton() {
+        var q = Ext.ComponentQuery.query.bind(Ext.ComponentQuery);
+        var byHelp = q('button[onlineHelp=pve_documentation_index]')[0];
+        if (byHelp && byHelp.ownerCt) { return byHelp; }
+
+        /* By visible text, in whatever language variants still use English. */
+        var wanted = ['Documentation', 'Dokumentation', 'Documentación',
+                      'Documentazione', 'Documentation en ligne'];
+        var all = q('toolbar button');
+        var i, j;
+        for (i = 0; i < all.length; i++) {
+            for (j = 0; j < wanted.length; j++) {
+                if (all[i].text === wanted[j] && all[i].ownerCt) { return all[i]; }
+            }
+        }
+        /* Failing that, sit next to something else that is always in the header:
+           the logout button, the user menu, or Create VM. */
+        var others = q('button[reference=logoutButton]')
+            .concat(q('button[itemId=logoutButton]'))
+            .concat(q('pveStdWorkspace button'));
+        for (i = 0; i < others.length; i++) {
+            var t = others[i].text || '';
+            if (others[i].ownerCt &&
+                (t === 'Logout' || t === 'Create VM' || t === 'Create CT')) {
+                return others[i];
+            }
+        }
+        return null;
+    }
+
+    function logNoToolbar(attempts) {
+        if (!window.console) { return; }
+        console.warn('proxmox-autoupdate: could not find the Proxmox header ' +
+                     'toolbar after ' + attempts + ' attempts. The panel is ' +
+                     'still reachable at ' + panelBase() + '/ — a floating ' +
+                     'button will be added if this keeps failing.');
+    }
+
+    /* Last resort: a plain DOM button, owing nothing to the ExtJS layout.
+       
+       An unrecognised toolbar must not mean no way in. This is deliberately
+       unstyled by ExtJS and positioned over the page, so it works whatever the
+       surrounding UI looks like. */
+    function installFallbackButton() {
+        if (document.getElementById('pauFallbackBtn')) { return; }
+        logNoToolbar('all');
+        var b = document.createElement('button');
+        b.id = 'pauFallbackBtn';
+        b.type = 'button';
+        b.textContent = 'Update Everything';
+        b.title = 'Proxmox Auto-Update — the toolbar layout was not recognised, ' +
+                  'so this button was added instead.';
+        b.onclick = function () {
+            openPanel('Proxmox Auto-Update', panelBase() + '/');
+        };
+        document.body.appendChild(b);
+    }
+
     function installNodeButton() {
         var attempts = 0;
         Ext.TaskManager.start({
@@ -565,20 +643,22 @@ JSBLOCK_HEAD
                 attempts++;
                 if (attempts > 240) { return false; }
                 try {
-                    var doc = Ext.ComponentQuery.query(
-                        'button[onlineHelp=pve_documentation_index]')[0];
-                    if (!doc) {
-                        var all = Ext.ComponentQuery.query('toolbar button');
-                        for (var i = 0; i < all.length; i++) {
-                            if (all[i].text === 'Documentation') { doc = all[i]; break; }
+                    var anchor = findAnchorButton();
+                    var tb = anchor && anchor.ownerCt;
+                    if (!tb) {
+                        /* Keep looking, but do not look forever in silence.
+                           Every open tab used to poll for two minutes and then
+                           give up without a word, so a layout this code did not
+                           recognise looked exactly like a failed install. */
+                        if (attempts === 20 || attempts === 120) {
+                            logNoToolbar(attempts);
                         }
+                        if (attempts > 240) { installFallbackButton(); return false; }
+                        return true;
                     }
-                    if (!doc || !doc.ownerCt) { return true; }
-
-                    var tb = doc.ownerCt;
                     if (tb.query('#pauNodeBtn').length) { return false; }
 
-                    var idx = tb.items.indexOf(doc);
+                    var idx = tb.items.indexOf(anchor);
                     if (idx < 0) { idx = 0; }
                     /* Copy the neighbours' ui/scale/baseCls, exactly as the
                        per-guest button already does.

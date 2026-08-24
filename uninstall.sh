@@ -226,9 +226,12 @@ fi
 # --- 4. Cron entry ---
 if crontab -l 2>/dev/null | grep -q "${TARGET_PATH}"; then
     CRON_TMP=$(mktemp)
+    # Prefix match, not exact: with more than one schedule each cron line gets
+    # its own "# proxmox-autoupdate: <label>" comment above it, and an exact
+    # match on the bare marker left every one of those behind after uninstall.
     crontab -l 2>/dev/null \
         | grep -v "${TARGET_PATH}" \
-        | grep -v '^# proxmox-autoupdate$' > "${CRON_TMP}" || true
+        | grep -v '^# proxmox-autoupdate' > "${CRON_TMP}" || true
     if crontab "${CRON_TMP}"; then
         print_ok "Cron entry removed"
     else

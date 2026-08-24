@@ -157,6 +157,32 @@ def _v_cron(v):
     return bool(CRON_RE.match(v))
 
 
+def _v_schedules(v):
+    """';'-separated '<cron>|<yes|no>|<label>' entries, or empty.
+
+    Validated field by field rather than with one big regex: this value reaches
+    both the sourced config file and, expression by expression, the root
+    crontab, so a newline slipping through either of them is a root-shell
+    problem, not a formatting one.
+    """
+    if v == "":
+        return True
+    if "\n" in v or "\r" in v or len(v) > 1000:
+        return False
+    entries = [e for e in v.split(";") if e.strip()]
+    if not entries or len(entries) > 10:
+        return False
+    for entry in entries:
+        parts = entry.split("|")
+        if len(parts) > 3 or not _v_cron(parts[0].strip()):
+            return False
+        if len(parts) > 1 and parts[1].strip().lower() not in SCHEDULE_MODES:
+            return False
+        if len(parts) > 2 and len(parts[2]) > 60:
+            return False
+    return True
+
+
 def _v_time(v):
     return bool(TIME_RE.match(v))
 
@@ -288,6 +314,7 @@ EDITABLE_KEYS = {
     "KEEP_LOGS": _v_bool,
     "LOG_RETENTION_DAYS": _v_int,
     "UPDATE_SCHEDULE_CRON": _v_cron,
+    "UPDATE_SCHEDULES": _v_schedules,
     "REBOOT_TIME": _v_time,
 }
 
@@ -1554,17 +1581,86 @@ def current_schedule():
     return ""
 
 
-def write_schedule(expr):
-    """Replace our crontab entry, leaving every other entry untouched."""
+# --- Schedules ---------------------------------------------------------------
+#
+# UPDATE_SCHEDULES is ';'-separated, each entry '<cron>|<yes|no>|<label>'. A
+# schedule marked "no" is written into the crontab with --no-reboot, so a host
+# can take updates weekly and only reboot for a kernel once a month.
+#
+# The same format is parsed by parse_schedules() in update-everything.sh and
+# install.sh; ci/invariants.sh checks that all three agree.
+SCHEDULE_MODES = ("yes", "no", "only")
+
+
+def parse_schedules(raw, legacy_cron=""):
+    """[{'cron': str, 'mode': str, 'label': str}] from the config value.
+
+    mode is 'yes' (update, reboot if a kernel lands), 'no' (update, never
+    reboot) or 'only' (reboot window: install nothing, take a reboot that is
+    already owed).
+    """
+    out = []
+    for entry in (raw or "").split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("|")
+        cron = parts[0].strip()
+        if not cron:
+            continue
+        mode = parts[1].strip().lower() if len(parts) > 1 else "yes"
+        if mode not in SCHEDULE_MODES:
+            mode = "yes"
+        label = parts[2].strip() if len(parts) > 2 else ""
+        out.append({"cron": cron, "mode": mode, "label": label})
+    if not out and legacy_cron:
+        # A pre-1.9 config: one schedule, and it always rebooted.
+        out.append({"cron": legacy_cron, "mode": "yes", "label": "Updates"})
+    return out
+
+
+def format_schedules(items):
+    """The config-file form. Separators cannot appear inside a label."""
+    parts = []
+    for it in items:
+        label = str(it.get("label", "")).replace(";", " ").replace("|", " ").strip()
+        mode = it.get("mode", "yes")
+        if mode not in SCHEDULE_MODES:
+            mode = "yes"
+        parts.append("%s|%s|%s" % (it["cron"], mode, label))
+    return ";".join(parts)
+
+
+def current_schedules():
+    cfg = read_config()
+    return parse_schedules(cfg.get("UPDATE_SCHEDULES", ""),
+                           cfg.get("UPDATE_SCHEDULE_CRON", ""))
+
+
+def write_schedule(items):
+    """Replace our crontab entries, leaving every other entry untouched.
+
+    Every line this tool owns either names UPDATE_SCRIPT or starts with
+    CRON_MARKER, so the per-schedule comments are removed on rewrite instead of
+    accumulating a stale one for every schedule ever configured.
+    """
     kept = [
         line
         for line in read_crontab().splitlines()
-        if UPDATE_SCRIPT not in line and line.strip() != CRON_MARKER
+        if UPDATE_SCRIPT not in line and not line.strip().startswith(CRON_MARKER)
     ]
     while kept and not kept[-1].strip():
         kept.pop()
     kept.append(CRON_MARKER)
-    kept.append("%s %s >> %s/cron.log 2>&1" % (expr, UPDATE_SCRIPT, resolve_log_dir()))
+    logdir = resolve_log_dir()
+    note = {"yes": "", "no": " (no reboot)", "only": " (reboot window)"}
+    flag = {"yes": "", "no": " --no-reboot", "only": " --reboot-window"}
+    for it in items:
+        mode = it.get("mode", "yes")
+        if it.get("label"):
+            kept.append("%s: %s%s" % (CRON_MARKER, it["label"], note.get(mode, "")))
+        kept.append("%s %s%s >> %s/cron.log 2>&1" % (
+            it["cron"], UPDATE_SCRIPT, flag.get(mode, ""), logdir))
     payload = "\n".join(kept) + "\n"
 
     proc = subprocess.run(["crontab", "-"], input=payload, text=True,
@@ -1877,6 +1973,7 @@ class Handler(BaseHTTPRequestHandler):
             status = JOB.snapshot()
             status["lock_held"] = lock_is_held() and not status["running"]
             status["schedule"] = current_schedule()
+            status["schedules"] = current_schedules()
             status["user"] = user
             status["version"] = installed_version()
             # The header has to distinguish "updating the guests" from "updating
@@ -2075,6 +2172,8 @@ class Handler(BaseHTTPRequestHandler):
             self._save_config(body)
         elif path == "/api/theme":
             self._save_theme(body)
+        elif path == "/api/schedules":
+            self._json(200, {"schedules": current_schedules()})
         elif path == "/api/schedule":
             self._save_schedule(body)
         elif path == "/api/notify/test":
@@ -2362,28 +2461,72 @@ class Handler(BaseHTTPRequestHandler):
         # The cron expression lives in both the config and the crontab.
         if "UPDATE_SCHEDULE_CRON" in updates:
             try:
-                write_schedule(updates["UPDATE_SCHEDULE_CRON"])
+                write_schedule(parse_schedules(
+                    read_config().get("UPDATE_SCHEDULES", ""),
+                    updates["UPDATE_SCHEDULE_CRON"]))
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 self._json(500, {"error": "Config saved, but crontab update failed: %s" % exc})
                 return
         self._json(200, {"saved": sorted(updates)})
 
     def _save_schedule(self, body):
-        expr = str(body.get("cron", "")).strip()
-        if not _v_cron(expr):
-            self._json(400, {"error": "Expected a 5-field cron expression."})
+        # Accepts either a list of schedules, or the single "cron" key an older
+        # page would send. The crontab and the config are written together;
+        # letting them drift is how a host ends up running a schedule nobody
+        # can see in the panel.
+        raw = body.get("schedules")
+        if raw is None:
+            expr = str(body.get("cron", "")).strip()
+            raw = [{"cron": expr, "mode": "yes", "label": "Updates"}] if expr else []
+        if not isinstance(raw, list) or not raw:
+            self._json(400, {"error": "At least one schedule is required."})
             return
+        if len(raw) > 10:
+            self._json(400, {"error": "Ten schedules is the limit."})
+            return
+
+        items = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                self._json(400, {"error": "Each schedule must be an object."})
+                return
+            expr = " ".join(str(entry.get("cron", "")).split())
+            if not _v_cron(expr):
+                self._json(400, {"error": "Not a 5-field cron expression: %r" % expr})
+                return
+            label = str(entry.get("label", ""))[:60]
+            if any(c in label for c in ";|\n\r"):
+                self._json(400, {"error": "A label cannot contain ; | or a line break."})
+                return
+            mode = str(entry.get("mode", "yes")).lower()
+            if mode not in SCHEDULE_MODES:
+                self._json(400, {"error": "Unknown schedule mode: %r" % mode})
+                return
+            items.append({"cron": expr, "mode": mode, "label": label.strip()})
+
+        if not any(it["mode"] in ("yes", "only") for it in items):
+            # Not refused — it is a legitimate choice for a host that is
+            # rebooted by hand — but it is almost never what someone means.
+            warning = ("No schedule may reboot, so a new kernel will install "
+                       "and then wait indefinitely.")
+        elif all(it["mode"] == "only" for it in items):
+            warning = ("Every schedule is a reboot window, so nothing will ever "
+                       "be updated.")
+        else:
+            warning = ""
+
         try:
-            write_schedule(expr)
+            write_schedule(items)
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             self._json(400, {"error": str(exc)})
             return
         try:
-            write_config({"UPDATE_SCHEDULE_CRON": expr})
+            write_config({"UPDATE_SCHEDULES": format_schedules(items),
+                          "UPDATE_SCHEDULE_CRON": items[0]["cron"]})
         except OSError as exc:
             self._json(500, {"error": "Crontab updated, but config write failed: %s" % exc})
             return
-        self._json(200, {"cron": expr})
+        self._json(200, {"schedules": items, "warning": warning})
 
 
 # --- The page -----------------------------------------------------------------
@@ -2647,7 +2790,17 @@ def render_guest_page(user, csrf, vmid, name):
             .replace("{{NAME}}", html.escape(name or "")))
 
 
-SHARED_CSS = r"""  :root {
+SHARED_CSS = r"""  .sched-row {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 8px; margin-bottom: 8px;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+  }
+  .sched-row select { flex: 0 1 210px; min-width: 150px; }
+  .sched-row .sched-cron { flex: 0 1 150px; min-width: 120px; font-family: monospace; }
+  .sched-row .sched-label { flex: 1 1 140px; min-width: 120px; }
+  .sched-row .sched-mode { flex: 0 1 220px; min-width: 170px; }
+  .sched-row .sched-del { flex: 0 0 auto; }
+  :root {
     --bg: #1e1e1e; --panel: #2a2a2a; --border: #3d3d3d; --text: #e8e8e8;
     --muted: #9a9a9a; --accent: #e65c00; --ok: #4caf50; --warn: #ffb300;
     --err: #f44336; --btn: #3a3a3a;
@@ -3055,32 +3208,34 @@ PAGE_TEMPLATE = r"""<!doctype html>
 <section id="tab-schedule" class="hidden">
   <div id="unsaved-schedule" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="schedule">Discard them</button></div>
   <div class="card">
-    <h2>Update schedule</h2>
-    <div class="grid">
-      <div>
-        <label for="schedPreset">Preset</label>
-        <select id="schedPreset">
-          <option value="0 23 * * 5">Friday at 23:00</option>
-          <option value="0 22 * * 5">Friday at 22:00</option>
-          <option value="0 20 * * 5">Friday at 20:00</option>
-          <option value="0 10 * * 5">Friday at 10:00</option>
-          <option value="0 3 * * 0">Sunday at 03:00</option>
-          <option value="0 3 * * *">Every day at 03:00</option>
-          <option value="__custom">Custom…</option>
-        </select>
-      </div>
-      <div>
-        <label for="schedCron">Cron expression (5 fields)</label>
-        <input id="schedCron" placeholder="0 23 * * 5">
-        <div class="hint">minute hour day-of-month month day-of-week</div>
-      </div>
+    <h2>Update schedules</h2>
+    <div class="hint" style="margin-bottom:10px">
+      Each schedule says what it is for. A weekly
+      <em>Update &middot; never reboot</em> installs everything, including a new
+      kernel, and leaves the host running the old one; a monthly
+      <em>Reboot window</em> then takes the outage on its own terms without
+      touching a package. A reboot only ever happens when a newer kernel is
+      actually installed &mdash; a window with nothing owed does nothing.
+    </div>
+    <div id="schedRows"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnAddSched">Add schedule</button>
+    </div>
+    <div id="schedWarn" class="note hidden" style="margin-top:10px">
+      No schedule may reboot. A new kernel will install and then wait
+      indefinitely &mdash; the host keeps running the old one until you reboot
+      it yourself.
+    </div>
+    <div class="grid" style="margin-top:14px">
       <div>
         <label for="rebootTime">Reboot time (if kernel updated)</label>
         <input id="rebootTime" placeholder="00:00">
+        <div class="hint">24-hour HH:MM, in this node&#39;s timezone. Used by
+          whichever schedule is allowed to reboot.</div>
       </div>
     </div>
     <div class="row" style="margin-top:12px">
-      <button id="btnSaveSched" class="primary">Save schedule</button>
+      <button id="btnSaveSched" class="primary">Save schedules</button>
     </div>
     <div id="schedMsg" class="msg"></div>
   </div>
@@ -3609,6 +3764,7 @@ const SUB_TABS = ["exclusions", "schedule", "notify", "config"];
 function loadFor(name) {
   if (name === "logs")       { loadLogList(); loadLogCfg(); }
   if (name === "exclusions") { loadGuests(); }
+  if (name === "schedule")   { loadSchedules(); }
   if (name === "notify")     { loadNotify(); }
   if (name === "config")     { loadConfig(); }
   if (name === "maint")      { loadMaint(); }
@@ -4412,22 +4568,161 @@ $("btnFull").onclick = async () => {
   } catch (e) { msg($("runMsg"), e.message, false); }
 };
 
-// --- schedule ---
-$("schedPreset").onchange = () => {
-  const v = $("schedPreset").value;
-  if (v !== "__custom") $("schedCron").value = v;
+// --- schedules ---
+/* A list, not a single expression. Each row carries its own reboot switch,
+   which is the whole point: a weekly run that installs a kernel without taking
+   the host down, and a monthly one that does. */
+const SCHED_PRESETS = [
+  ["0 23 * * 5", "Friday at 23:00"],
+  ["0 22 * * 5", "Friday at 22:00"],
+  ["0 20 * * 5", "Friday at 20:00"],
+  ["0 3 * * 0",  "Sunday at 03:00"],
+  ["0 3 * * *",  "Every day at 03:00"],
+  /* Monthly by day-of-month only. cron ORs day-of-month with day-of-week when
+     both are restricted, so "0 3 1-7 * 0" — the obvious way to write "first
+     Sunday" — actually fires on the 1st to 7th *and* every Sunday. */
+  ["0 3 1 * *",  "1st of the month at 03:00"],
+  ["0 3 15 * *", "15th of the month at 03:00"],
+];
+
+function schedRowEl(item) {
+  const row = document.createElement("div");
+  row.className = "sched-row";
+
+  const preset = document.createElement("select");
+  SCHED_PRESETS.forEach(([expr, name]) => {
+    const o = document.createElement("option");
+    o.value = expr; o.textContent = name;
+    preset.appendChild(o);
+  });
+  const custom = document.createElement("option");
+  custom.value = "__custom"; custom.textContent = "Custom…";
+  preset.appendChild(custom);
+
+  const cron = document.createElement("input");
+  cron.className = "sched-cron";
+  cron.placeholder = "0 23 * * 5";
+  cron.value = item.cron || "";
+  preset.value = SCHED_PRESETS.some(([e]) => e === cron.value) ? cron.value : "__custom";
+  preset.onchange = () => {
+    if (preset.value !== "__custom") { cron.value = preset.value; }
+    markDirty("schedule");
+  };
+  cron.oninput = () => {
+    preset.value = SCHED_PRESETS.some(([e]) => e === cron.value.trim())
+                 ? cron.value.trim() : "__custom";
+    markDirty("schedule");
+  };
+
+  const label = document.createElement("input");
+  label.className = "sched-label";
+  label.placeholder = "Name (optional)";
+  label.maxLength = 60;
+  label.value = item.label || "";
+  label.oninput = () => markDirty("schedule");
+
+  /* Three modes rather than a reboot checkbox, because "reboot only" is a
+     genuinely different job: it installs nothing and exists to give the outage
+     its own slot in the week. */
+  const mode = document.createElement("select");
+  mode.className = "sched-mode";
+  [["yes",  "Update · reboot if needed"],
+   ["no",   "Update · never reboot"],
+   ["only", "Reboot window · no updates"]].forEach(([v, text]) => {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = text;
+    mode.appendChild(o);
+  });
+  mode.value = ["yes", "no", "only"].includes(item.mode) ? item.mode : "yes";
+  mode.onchange = () => { markDirty("schedule"); paintSchedWarning(); };
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "sched-del";
+  del.textContent = "Remove";
+  del.onclick = () => {
+    if ($("schedRows").children.length <= 1) {
+      msg($("schedMsg"), "At least one schedule is needed — updates run from cron.", false);
+      return;
+    }
+    row.remove();
+    markDirty("schedule");
+    paintSchedWarning();
+  };
+
+  [preset, cron, label, mode, del].forEach((el) => row.appendChild(el));
+  return row;
+}
+
+function readSchedRows() {
+  return Array.from($("schedRows").children).map((row) => ({
+    cron: row.querySelector(".sched-cron").value.trim(),
+    label: row.querySelector(".sched-label").value.trim(),
+    mode: row.querySelector(".sched-mode").value,
+  }));
+}
+
+function paintSchedWarning() {
+  const rows = readSchedRows();
+  const canReboot = rows.some((s) => s.mode === "yes" || s.mode === "only");
+  const canUpdate = rows.some((s) => s.mode !== "only");
+  const box = $("schedWarn");
+  if (!canReboot) {
+    box.textContent = "No schedule may reboot. A new kernel will install and " +
+      "then wait indefinitely — the host keeps running the old one until you " +
+      "reboot it yourself.";
+  } else if (!canUpdate) {
+    box.textContent = "Every schedule is a reboot window, so nothing will ever " +
+      "be updated.";
+  }
+  box.classList.toggle("hidden", canReboot && canUpdate);
+}
+
+function renderSchedules(items) {
+  const box = $("schedRows");
+  box.innerHTML = "";
+  (items && items.length ? items : [{cron: "0 23 * * 5", mode: "yes", label: ""}])
+    .forEach((it) => box.appendChild(schedRowEl(it)));
+  paintSchedWarning();
+}
+
+$("btnAddSched").onclick = () => {
+  if ($("schedRows").children.length >= 10) {
+    msg($("schedMsg"), "Ten schedules is the limit.", false);
+    return;
+  }
+  $("schedRows").appendChild(schedRowEl({cron: "0 3 1 * *", mode: "only",
+                                         label: "Reboot window"}));
+  markDirty("schedule");
+  paintSchedWarning();
 };
 
 $("btnSaveSched").onclick = async () => {
+  const items = readSchedRows();
+  const bad = items.find((s) => s.cron.split(/\s+/).filter(Boolean).length !== 5);
+  if (bad) {
+    msg($("schedMsg"), "Not a 5-field cron expression: " + (bad.cron || "(empty)"), false);
+    return;
+  }
   try {
-    await post("/api/schedule", {cron: $("schedCron").value.trim()});
+    const res = await post("/api/schedule", {schedules: items});
     const reboot = $("rebootTime").value.trim();
     if (reboot) await post("/api/config", {config: {REBOOT_TIME: reboot}});
     markClean("schedule");
-    msg($("schedMsg"), "Schedule saved and crontab updated.", true);
+    msg($("schedMsg"), res.warning
+        ? "Saved. " + res.warning
+        : items.length + (items.length === 1 ? " schedule saved" : " schedules saved")
+          + " and the crontab updated.", !res.warning);
     poll();
   } catch (e) { msg($("schedMsg"), e.message, false); }
 };
+
+async function loadSchedules() {
+  try {
+    renderSchedules((await api("/api/schedules")).schedules);
+    setTimeout(() => markClean("schedule"), 0);
+  } catch (e) { msg($("schedMsg"), e.message, false); }
+}
 
 // --- config ---
 function buildConfigForm(cfg, sensitive) {
@@ -4481,7 +4776,6 @@ async function loadConfig() {
   try {
     const data = await api("/api/config");
     buildConfigForm(data.config, data.sensitive);
-    $("schedCron").value = (await api("/api/status")).schedule || "";
     $("rebootTime").value = data.config.REBOOT_TIME || "";
   } catch (e) { msg($("configMsg"), e.message, false); }
   loadTheme();
@@ -4803,6 +5097,7 @@ $("chkNag").onchange = async () => {
 
 watchForChanges();
 loadConfig();
+loadSchedules();
 describeChannels();
 loadSummary();
 poll();

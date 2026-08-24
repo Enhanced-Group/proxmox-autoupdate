@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.8.1"
+PAU_FALLBACK_REF="v1.9.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -245,6 +245,67 @@ sq() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# --- Schedules -----------------------------------------------------------
+#
+# UPDATE_SCHEDULES holds one or more schedules, ';'-separated, each of them
+# '<5-field cron>|<mode>|<label>', where mode is one of:
+#
+#   yes    update, and reboot if this run installs a kernel   (no flag)
+#   no     update, never reboot                               (--no-reboot)
+#   only   do not update; reboot if one is owed               (--reboot-window)
+#
+# For example:
+#
+#   UPDATE_SCHEDULES='0 23 * * 5|no|Weekly updates;0 3 1 * *|only|Reboot window'
+#
+# which installs updates every Friday night, leaving any new kernel waiting, and
+# takes the host down for it on the first of the month without touching a
+# package. 'only' is the schedule to use when the outage needs its own slot
+# rather than riding along with an update run.
+#
+# Empty means a pre-1.9 install: one schedule, taken from UPDATE_SCHEDULE_CRON,
+# allowed to reboot, which is what that config always meant.
+#
+# Emits one tab-separated 'cron<TAB>reboot<TAB>label' line per schedule.
+parse_schedules() {
+    local raw="$1" entry rest cron reboot label
+    if [ -z "${raw}" ]; then
+        if [ -n "${UPDATE_SCHEDULE_CRON:-}" ]; then
+            printf '%s\tyes\tUpdates\n' "${UPDATE_SCHEDULE_CRON}"
+        fi
+        return 0
+    fi
+    local OLD_IFS="${IFS}"
+    IFS=';'
+    # shellcheck disable=SC2086
+    set -- ${raw}
+    IFS="${OLD_IFS}"
+    for entry in "$@"; do
+        [ -n "${entry}" ] || continue
+        case "${entry}" in
+            *\|*)
+                cron="${entry%%|*}"
+                rest="${entry#*|}"
+                reboot="${rest%%|*}"
+                case "${rest}" in
+                    *\|*) label="${rest#*|}" ;;
+                    *)    label="" ;;
+                esac
+                ;;
+            *)
+                # A bare cron expression, from a hand-edited config.
+                cron="${entry}"; reboot="yes"; label=""
+                ;;
+        esac
+        case "${reboot}" in
+            no|only) : ;;
+            *)       reboot="yes" ;;
+        esac
+        [ -n "${cron}" ] || continue
+        printf '%s\t%s\t%s\n' "${cron}" "${reboot}" "${label}"
+    done
+}
+
 # Prompt for a value that must not end up empty, falling back to whatever is
 # already configured.
 #
@@ -444,6 +505,7 @@ PREV_EXCLUDE=""
 PREV_WIN_TIMEOUT=""
 PREV_START_WIN=""
 PREV_CRON=""
+PREV_SCHEDULES=""
 PREV_REBOOT_TIME=""
 PREV_START_LXC=""
 PREV_START_LINUX_VMS=""
@@ -502,6 +564,7 @@ if [ -f "${CONFIG_FILE}" ]; then
     PREV_START_LXC="${START_STOPPED_LXC:-}"
     PREV_START_LINUX_VMS="${START_STOPPED_LINUX_VMS:-}"
     PREV_CRON="${UPDATE_SCHEDULE_CRON:-}"
+    PREV_SCHEDULES="${UPDATE_SCHEDULES:-}"
     PREV_REBOOT_TIME="${REBOOT_TIME:-}"
     PREV_LINUX_TIMEOUT="${LINUX_UPDATE_TIMEOUT:-}"
     PREV_APT_LOCK="${APT_LOCK_TIMEOUT:-}"
@@ -1110,29 +1173,130 @@ echo ""
 step "Schedule and reboot timing"
 echo ""
 
-# --- Cron Schedule ---
+# --- Cron schedules ---
+#
+# More than one is allowed, and each says for itself whether it may reboot the
+# host. The setup this exists for: install updates every week without an
+# outage, and let one run a month be the one that takes the kernel.
 DEFAULT_CRON="${PREV_CRON:-0 23 * * 5}"
-echo -e "  ${C_BOLD}Select Update Cron Schedule:${C_NC} ${C_DIM}[${WORD_CURRENT}: ${DEFAULT_CRON}]${C_NC}"
-echo -e "    ${C_CYAN}1)${C_NC} Friday at 23:00  ${C_DIM}(0 23 * * 5)${C_NC}"
-echo -e "    ${C_CYAN}2)${C_NC} Friday at 22:00  ${C_DIM}(0 22 * * 5)${C_NC}"
-echo -e "    ${C_CYAN}3)${C_NC} Friday at 20:00  ${C_DIM}(0 20 * * 5)${C_NC}"
-echo -e "    ${C_CYAN}4)${C_NC} Friday at 10:00  ${C_DIM}(0 10 * * 5)${C_NC}"
-echo -e "    ${C_CYAN}5)${C_NC} Custom cron expression / time"
+UPDATE_SCHEDULES=""
+SCHED_COUNT=0
 
-ask INPUT_SCHED_CHOICE "  Select 1-5 [Enter for ${DEFAULT_CRON}]: "
-case "${INPUT_SCHED_CHOICE:-0}" in
-    1) UPDATE_SCHEDULE_CRON="0 23 * * 5" ;;
-    2) UPDATE_SCHEDULE_CRON="0 22 * * 5" ;;
-    3) UPDATE_SCHEDULE_CRON="0 20 * * 5" ;;
-    4) UPDATE_SCHEDULE_CRON="0 10 * * 5" ;;
-    5)
-        ask CUSTOM_CRON "  Enter 5-field cron expression (e.g. 0 10 * * 5): "
-        UPDATE_SCHEDULE_CRON="${CUSTOM_CRON:-${DEFAULT_CRON}}"
-        ;;
-    "") UPDATE_SCHEDULE_CRON="${DEFAULT_CRON}" ;;
-    *) UPDATE_SCHEDULE_CRON="${DEFAULT_CRON}" ;;
-esac
-print_ok "Update schedule: ${UPDATE_SCHEDULE_CRON}"
+echo -e "  ${C_DIM}Updates run from cron. You can have more than one schedule, and each${C_NC}"
+echo -e "  ${C_DIM}one decides for itself whether it is allowed to reboot the host — so${C_NC}"
+echo -e "  ${C_DIM}updates can land weekly while the reboot only happens monthly.${C_NC}"
+
+# Offer to keep what is already configured.
+#
+# Without this, pressing Enter through a re-install rebuilt the list from
+# scratch as a single always-reboots schedule, quietly throwing away a
+# weekly/monthly split — and the panel's unattended self-update runs this same
+# script, so it would have happened without anyone at the keyboard.
+KEEP_SCHEDULES=false
+if [ -n "${PREV_SCHEDULES}" ]; then
+    echo ""
+    echo -e "  ${C_BOLD}Currently configured:${C_NC}"
+    parse_schedules "${PREV_SCHEDULES}" | while IFS="$(printf '	')" read -r c r l; do
+        case "${r}" in
+            no)   echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }update, never reboots${C_NC}" ;;
+            only) echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }reboot window, no updates${C_NC}" ;;
+            *)    echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }update, may reboot${C_NC}" ;;
+        esac
+    done
+    echo -e "    ${C_CYAN}1)${C_NC} Keep these"
+    echo -e "    ${C_CYAN}2)${C_NC} Replace them"
+    ask INPUT_SCHED_KEEP "  Select 1 or 2 [Enter for 1]: "
+    if [ "${INPUT_SCHED_KEEP}" != "2" ]; then
+        UPDATE_SCHEDULES="${PREV_SCHEDULES}"
+        KEEP_SCHEDULES=true
+        print_ok "Schedules unchanged"
+    fi
+fi
+
+while [ "${KEEP_SCHEDULES}" = false ] && [ "${SCHED_COUNT}" -lt 5 ]; do
+    SCHED_COUNT=$((SCHED_COUNT + 1))
+    echo ""
+    echo -e "  ${C_BOLD}Schedule ${SCHED_COUNT}${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Friday at 23:00  ${C_DIM}(0 23 * * 5)${C_NC}"
+    echo -e "    ${C_CYAN}2)${C_NC} Friday at 22:00  ${C_DIM}(0 22 * * 5)${C_NC}"
+    echo -e "    ${C_CYAN}3)${C_NC} Friday at 20:00  ${C_DIM}(0 20 * * 5)${C_NC}"
+    echo -e "    ${C_CYAN}4)${C_NC} Sunday at 03:00  ${C_DIM}(0 3 * * 0)${C_NC}"
+    # Monthly by day-of-month, never "first Sunday". cron ORs day-of-month with
+    # day-of-week when both are restricted, so the obvious "0 3 1-7 * 0" fires
+    # on the 1st-7th *and* on every Sunday — weekly, not monthly.
+    echo -e "    ${C_CYAN}5)${C_NC} 1st of the month at 03:00  ${C_DIM}(0 3 1 * *)${C_NC}"
+    echo -e "    ${C_CYAN}6)${C_NC} Custom cron expression"
+
+    SCHED_LABEL=""
+    if [ "${SCHED_COUNT}" -eq 1 ]; then
+        ask INPUT_SCHED_CHOICE "  Select 1-6 [Enter for ${DEFAULT_CRON}]: "
+    else
+        ask INPUT_SCHED_CHOICE "  Select 1-6: "
+    fi
+    case "${INPUT_SCHED_CHOICE:-0}" in
+        1) SCHED_CRON="0 23 * * 5"; SCHED_LABEL="Friday 23:00" ;;
+        2) SCHED_CRON="0 22 * * 5"; SCHED_LABEL="Friday 22:00" ;;
+        3) SCHED_CRON="0 20 * * 5"; SCHED_LABEL="Friday 20:00" ;;
+        4) SCHED_CRON="0 3 * * 0";  SCHED_LABEL="Sunday 03:00" ;;
+        5) SCHED_CRON="0 3 1 * *";  SCHED_LABEL="Monthly, 1st at 03:00" ;;
+        6)
+            ask CUSTOM_CRON "  Enter 5-field cron expression (e.g. 0 10 * * 5): "
+            SCHED_CRON="${CUSTOM_CRON:-${DEFAULT_CRON}}"
+            SCHED_LABEL="Custom"
+            ;;
+        *) SCHED_CRON="${DEFAULT_CRON}"; SCHED_LABEL="Updates" ;;
+    esac
+
+    # Reject a malformed expression here rather than letting crontab refuse the
+    # whole file at the end, which used to abort the install after everything
+    # else had already been written.
+    if ! echo "${SCHED_CRON}" | grep -qE '^[0-9*,/@ -]{1,100}$'        || [ "$(echo "${SCHED_CRON}" | wc -w)" -ne 5 ]; then
+        print_fail "Not a 5-field cron expression: '${SCHED_CRON}'"
+        SCHED_CRON="${DEFAULT_CRON}"
+        SCHED_LABEL="Updates"
+        print_skip "Using ${SCHED_CRON}."
+    fi
+
+    echo ""
+    echo -e "  ${C_DIM}What should this schedule do?${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Update, and reboot if it installs a new kernel"
+    echo -e "    ${C_CYAN}2)${C_NC} Update, never reboot  ${C_DIM}— leave the reboot to another schedule${C_NC}"
+    echo -e "    ${C_CYAN}3)${C_NC} Reboot only  ${C_DIM}— install nothing; reboot if one is already owed${C_NC}"
+    ask INPUT_SCHED_REBOOT "  Select 1-3 [Enter for 1]: "
+    case "${INPUT_SCHED_REBOOT}" in
+        2) SCHED_REBOOT="no" ;;
+        3) SCHED_REBOOT="only"; SCHED_LABEL="Reboot window" ;;
+        *) SCHED_REBOOT="yes" ;;
+    esac
+
+    # ';' and '|' are the separators, so they cannot appear inside a label.
+    SCHED_LABEL=$(echo "${SCHED_LABEL}" | tr -d ';|')
+    UPDATE_SCHEDULES="${UPDATE_SCHEDULES}${UPDATE_SCHEDULES:+;}${SCHED_CRON}|${SCHED_REBOOT}|${SCHED_LABEL}"
+    case "${SCHED_REBOOT}" in
+        yes)  print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(update, may reboot)${C_NC}" ;;
+        no)   print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(update, never reboots)${C_NC}" ;;
+        only) print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(reboot window — no updates)${C_NC}" ;;
+    esac
+
+    [ "${SCHED_COUNT}" -ge 5 ] && break
+    echo ""
+    echo -e "  ${C_DIM}Add another schedule? A second one is how you get weekly updates${C_NC}"
+    echo -e "  ${C_DIM}with a monthly reboot.${C_NC}"
+    echo -e "    ${C_CYAN}1)${C_NC} Yes"
+    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(done)${C_NC}"
+    ask INPUT_SCHED_MORE "  Select 1 or 2 [Enter for 2]: "
+    [ "${INPUT_SCHED_MORE}" = "1" ] || break
+done
+
+# Kept in step with the first schedule so a config written here still reads
+# correctly to anything that only knows about the single-schedule key.
+UPDATE_SCHEDULE_CRON=$(parse_schedules "${UPDATE_SCHEDULES}" | head -1 | cut -f1)
+
+if [ "${SCHED_COUNT}" -gt 1 ] \
+   && ! echo "${UPDATE_SCHEDULES}" | grep -qE '\|(yes|only)\|'; then
+    print_fail "None of these schedules may reboot."
+    print_fail "A kernel update will install and then wait indefinitely."
+fi
 
 # --- Reboot Time ---
 echo ""
@@ -1283,7 +1447,15 @@ START_STOPPED_LXC=$(sq "${START_STOPPED_LXC}")
 # Start stopped Linux VMs to update them? ("true" or "false")
 START_STOPPED_LINUX_VMS=$(sq "${START_STOPPED_LINUX_VMS}")
 
-# Cron schedule (default: "0 23 * * 5" = Fridays at 23:00)
+# Cron schedules. One per entry, ';'-separated, each of them
+#   <5-field cron>|<yes|no, may this schedule reboot>|<label>
+# so updates can land weekly while the host is only taken down monthly:
+#   UPDATE_SCHEDULES='0 23 * * 5|no|Weekly;0 3 1 * *|yes|Monthly reboot'
+# A schedule marked "no" runs update-everything.sh --no-reboot.
+UPDATE_SCHEDULES=$(sq "${UPDATE_SCHEDULES}")
+
+# The first schedule's expression, kept in step with the list above. Only read
+# by older versions and as the fallback when UPDATE_SCHEDULES is empty.
 UPDATE_SCHEDULE_CRON=$(sq "${UPDATE_SCHEDULE_CRON}")
 
 # Scheduled reboot time if kernel is updated (default: "00:00")
@@ -1527,13 +1699,59 @@ elif [ "${ENABLE_WEB_UI}" = "true" ]; then
     systemctl daemon-reload
     systemctl enable pve-autoupdate-ui.service >/dev/null 2>&1 || true
     systemctl restart pve-autoupdate-ui.service >/dev/null 2>&1 || true
-    # Type=simple means restart returns before the bind, so ask again in a
-    # moment whether the process is actually still alive.
-    sleep 2
-    if systemctl is-active --quiet pve-autoupdate-ui.service; then
-        print_ok "Service running on port ${WEB_UI_PORT}"
+
+    # Ask the port, not systemd.
+    #
+    # The unit is Type=simple, so `systemctl is-active` says "active" the moment
+    # the process forks — before it has read a certificate or bound anything. A
+    # panel that starts, throws, and is restarted five seconds later by
+    # Restart=on-failure looks perfectly healthy in that window, which is how an
+    # install could report success while the port never answered. The only
+    # honest test is a request.
+    UI_UP=false
+    UI_CODE="000"
+    for _ATTEMPT in 1 2 3 4 5 6 7 8 9 10; do
+        # Any HTTP status counts as up. 401 in particular is a *success* here:
+        # the server answered, curl simply has no Proxmox session cookie.
+        # "000" is curl's code for "never got a response at all", and the
+        # `|| echo 000` matters — without it a missing curl produces an empty
+        # string, which is not "000", which would have been read as success.
+        UI_CODE=$(curl -s -k -m 5 -o /dev/null -w '%{http_code}' \
+                  "https://127.0.0.1:${WEB_UI_PORT}/" 2>/dev/null) || UI_CODE=""
+        # Match a real status explicitly rather than testing "not 000".
+        # `curl ... || echo 000` appended to curl's own "000" and produced
+        # "000000", which is not "000", so a dead port reported as answering —
+        # exactly the false success this check exists to remove.
+        case "${UI_CODE}" in
+            [1-9][0-9][0-9]) UI_UP=true; break ;;
+            *)               UI_CODE="000" ;;
+        esac
+        sleep 1
+    done
+
+    if [ "${UI_UP}" = true ]; then
+        print_ok "Panel is answering on ${C_BOLD}https://$(hostname -f 2>/dev/null || hostname):${WEB_UI_PORT}/${C_NC} ${C_DIM}(HTTP ${UI_CODE})${C_NC}"
     else
-        print_fail "Service failed to start — check: journalctl -u pve-autoupdate-ui -n 50"
+        print_fail "The panel is not answering on port ${WEB_UI_PORT}."
+        # Print the reason here rather than telling the user to go and find it.
+        # "check journalctl" is a step most people do not take, so the actual
+        # error — a busy port, a missing certificate, a Python traceback — went
+        # unread and the install looked like it had simply not worked.
+        echo ""
+        # Every one of these is best-effort. Under `set -euo pipefail` a
+        # missing journalctl made the *diagnostic* abort the installer with
+        # exit 127 — turning "the panel did not start" into "the install
+        # failed", which is both wrong and much harder to recover from.
+        if command -v systemctl >/dev/null 2>&1; then
+            echo -e "  ${C_DIM}systemctl status pve-autoupdate-ui:${C_NC}"
+            { systemctl --no-pager --lines=0 status pve-autoupdate-ui.service 2>&1                 | sed 's/^/      /' | head -8; } || true
+        fi
+        if command -v journalctl >/dev/null 2>&1; then
+            echo -e "  ${C_DIM}Last lines from the service log:${C_NC}"
+            { journalctl -u pve-autoupdate-ui.service -n 15 --no-pager 2>&1                 | sed 's/^/      /' | tail -15; } || true
+        fi
+        echo ""
+        print_fail "Updates from cron are unaffected — only the panel is down."
     fi
 
     # --- Certificate situation ---
@@ -1572,8 +1790,16 @@ elif [ "${ENABLE_WEB_UI}" = "true" ]; then
     # The toolbar button. Non-fatal: the panel is still reachable by URL if the
     # patch cannot be applied.
     if [ -f "${PVE_JS}" ]; then
-        if "${UI_PATCHER}" apply; then
-            print_ok "Apt hook installed ${C_DIM}(re-applies the button after pve-manager upgrades)${C_NC}"
+        if "${UI_PATCHER}" apply            && grep -qF 'BEGIN proxmox-autoupdate button' "${PVE_JS}"; then
+            # Verified by reading the file back, not by trusting the exit code.
+            print_ok "Toolbar button added to ${C_DIM}${PVE_JS}${C_NC}"
+            print_ok "Apt hook installed ${C_DIM}(re-applies it after pve-manager upgrades)${C_NC}"
+            echo ""
+            echo -e "  ${C_BOLD}The button will not appear until you reload the Proxmox UI.${C_NC}"
+            echo -e "  ${C_DIM}Your browser has the old pvemanagerlib.js cached, and an ordinary${C_NC}"
+            echo -e "  ${C_DIM}refresh will not replace it. Use ${C_NC}${C_CYAN}Ctrl+Shift+R${C_NC}${C_DIM} (${C_NC}${C_CYAN}Cmd+Shift+R${C_NC}${C_DIM} on a Mac),${C_NC}"
+            echo -e "  ${C_DIM}or open the Proxmox UI in a private window to check.${C_NC}"
+            echo ""
         else
             print_fail "Could not patch the Proxmox UI — the panel is still usable directly:"
             print_fail "  https://$(hostname -f 2>/dev/null || hostname):${WEB_UI_PORT}/"
@@ -1612,13 +1838,24 @@ fi
 # 6. Idempotent Cron Configuration
 step "Configuring the schedule"
 CRON_MARKER="# proxmox-autoupdate"
-CRON_JOB="${UPDATE_SCHEDULE_CRON} ${TARGET_PATH} >> ${LOG_DIR}/cron.log 2>&1"
+# One crontab line per schedule. The ones that must not reboot carry
+# --no-reboot; the comment above each is what makes `crontab -l` readable.
+build_cron_lines() {
+    parse_schedules "${UPDATE_SCHEDULES}" | while IFS="$(printf '	')" read -r c r l; do
+        [ -n "${l}" ] && echo "${CRON_MARKER}: ${l}$([ "${r}" = "no" ] && echo " (no reboot)")"
+        case "${r}" in
+            no)   echo "${c} ${TARGET_PATH} --no-reboot >> ${LOG_DIR}/cron.log 2>&1" ;;
+            only) echo "${c} ${TARGET_PATH} --reboot-window >> ${LOG_DIR}/cron.log 2>&1" ;;
+            *)    echo "${c} ${TARGET_PATH} >> ${LOG_DIR}/cron.log 2>&1" ;;
+        esac
+    done
+}
 
 CRON_TMP=$(mktemp)
 CRON_ERR=$(mktemp)
-crontab -l 2>/dev/null | grep -v "${TARGET_PATH}" | grep -v "${CRON_MARKER}" > "${CRON_TMP}" || true
+crontab -l 2>/dev/null | grep -v "${TARGET_PATH}" | grep -v "^${CRON_MARKER}" > "${CRON_TMP}" || true
 echo "${CRON_MARKER}" >> "${CRON_TMP}"
-echo "${CRON_JOB}" >> "${CRON_TMP}"
+build_cron_lines >> "${CRON_TMP}"
 if ! crontab "${CRON_TMP}" 2>"${CRON_ERR}"; then
     print_fail "Invalid cron schedule! crontab rejected it:"
     sed 's/^/    /' "${CRON_ERR}"
@@ -1694,7 +1931,13 @@ if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
 else
     echo -e "  ${C_CYAN}Snapshots:${C_NC}  disabled"
 fi
-echo -e "  ${C_CYAN}Schedule:${C_NC}   ${UPDATE_SCHEDULE_CRON}"
+parse_schedules "${UPDATE_SCHEDULES}" | while IFS="$(printf '	')" read -r c r l; do
+    case "${r}" in
+        no)   echo -e "  ${C_CYAN}Schedule:${C_NC}   ${c}  ${C_DIM}${l:+${l} — }update, never reboots${C_NC}" ;;
+        only) echo -e "  ${C_CYAN}Schedule:${C_NC}   ${c}  ${C_DIM}${l:+${l} — }reboot window, no updates${C_NC}" ;;
+        *)    echo -e "  ${C_CYAN}Schedule:${C_NC}   ${c}  ${C_DIM}${l:+${l} — }update, may reboot${C_NC}" ;;
+    esac
+done
 echo -e "  ${C_CYAN}Reboot:${C_NC}     ${REBOOT_TIME} (if kernel updated)"
 if [ "${ENABLE_WEB_UI}" = "true" ]; then
     PANEL_URL="https://$(hostname -f 2>/dev/null || hostname):${WEB_UI_PORT}/"

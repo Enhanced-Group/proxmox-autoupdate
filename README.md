@@ -24,6 +24,7 @@ This tool performs weekly updates across your entire Proxmox stack — including
 - **EU & US Mailgun Regions:** Quick 1/2 selection during install — supports both `api.eu.mailgun.net` and `api.mailgun.net`.
 - **Local Time:** Timestamps and the scheduled reboot follow the host's own timezone. Set `PAU_TZ` in the config to pin a specific one.
 - **Proxmox Version Tracking:** Highlights exact PVE version deltas (e.g., `8.2.2 → 8.2.7`).
+- **Multiple Schedules, Per-Schedule Reboot Control:** Run updates as often as you like and reboot as rarely as you need. A weekly schedule marked "never reboots" installs the new kernel and records that a reboot is owed; a monthly one that may reboot takes it. Up to ten schedules, editable in the panel or the installer.
 - **Smart Conditional Reboot:** Reboots only when *this run* installed a newer kernel than the one booted, or when the system flags `/var/run/reboot-required`. Kernels are compared by version, not by file timestamp, so a pinned or reinstalled older kernel cannot cause a reboot every run. Never reboots after a failed upgrade, a targeted run, or while a guest is mid-update.
 - **Error Reporting:** Failures are flagged in the email subject and report body with red badges.
 - **Exclusion List:** Skip specific VM/CT IDs via config (`EXCLUDE_IDS="100,201"`).
@@ -350,11 +351,13 @@ CONFIRM_UPDATES="true"
 NOTIFY_METHODS=""                # email, discord, slack, webhook (comma-separated)
 NOTIFY_ON_FAILURE_ONLY="false"
 
-# Timing settings
-# Read by the installer and the web panel, which write it into root's crontab.
-# The update script itself never reads it.
-UPDATE_SCHEDULE_CRON="0 23 * * 5" # Fridays at 23:00 (cron 5-field format)
-REBOOT_TIME="00:00"              # HH:MM format for post-update reboot (if kernel updated)
+# Schedules. Read by the installer and the web panel, which write them into
+# root's crontab. A run never consults this list — its own cron line already
+# carries --no-reboot or not.
+#   <5-field cron>|<yes|no, may it reboot>|<label>, ';'-separated
+UPDATE_SCHEDULES='0 23 * * 5|no|Weekly updates;0 3 1 * *|yes|Monthly reboot'
+UPDATE_SCHEDULE_CRON="0 23 * * 5" # first schedule; kept for older versions
+REBOOT_TIME="00:00"              # HH:MM, for whichever schedule may reboot
 ```
 
 ### Why `APT_LOCK_TIMEOUT` matters
@@ -392,14 +395,89 @@ for a clean one.
 
 ---
 
-## Schedule & Reboot Timing
+## Schedules and reboot timing
 
-Both the update trigger time and the reboot time are fully customizable during installation or via `/etc/proxmox-autoupdate.conf`:
+You can have more than one schedule, and each one decides for itself whether it
+is allowed to reboot the host.
 
-- **Cron Schedule (`UPDATE_SCHEDULE_CRON`):** Choose from preset Friday times (23:00, 22:00, 20:00, 10:00) or specify any custom 5-field cron expression.
-- **Reboot Time (`REBOOT_TIME`):** Specify when the host should reboot if a kernel update was installed (e.g. `00:00`, `01:00`, `02:00`).
+That combination is the point. Updates are safe to apply weekly; the reboot a
+new kernel needs is the part that costs you an outage. So:
 
-To reconfigure at any time, re-run `install.sh` or edit `/etc/proxmox-autoupdate.conf` directly and update crontab (`crontab -e`).
+Each schedule is one of three things:
+
+| Mode | Config value | Cron line gets | What it does |
+| --- | --- | --- | --- |
+| Update · reboot if needed | `yes` | *(no flag)* | Installs updates, and reboots if this run installed a kernel. |
+| Update · never reboot | `no` | `--no-reboot` | Installs everything, kernel included, and leaves the host on the old one. |
+| Reboot window · no updates | `only` | `--reboot-window` | Installs nothing. Reboots **only** if a reboot is already owed. |
+
+A worked example — updates weekly, outage monthly:
+
+| Schedule | Mode | What happens |
+| --- | --- | --- |
+| `0 23 * * 5` — Friday 23:00 | `no` | Installs everything, including the new kernel. The host keeps running the old one. |
+| `0 3 1 * *` — 1st of the month, 03:00 | `only` | Touches no packages. Boots into the kernel that has been waiting; does nothing at all if none is. |
+
+Use `only` when the outage should have its own slot and nothing else. Use `yes`
+on the monthly run instead if you would rather it also install whatever has
+appeared since Friday.
+
+Set it up during install, or on the panel's **Schedule** tab, where each row has
+its own mode. Up to ten schedules.
+
+### How a held reboot is handed over
+
+A schedule that may not reboot still installs the kernel. It records that a
+reboot is owed, in `/var/lib/proxmox-autoupdate/reboot-pending`, and says so in
+its report — *Reboot Pending*, not *No Reboot Needed*, so a host is never
+quietly out of date.
+
+The next run that **is** allowed to reboot picks that up and books the reboot,
+even though it installed nothing itself. The record is cleared as soon as the
+host is seen running the newest installed kernel, whether it got there through
+this tool or because you rebooted it yourself.
+
+`update-everything.sh --doctor` reports a pending reboot, and warns if *no*
+schedule may reboot — a configuration where a new kernel would install and then
+wait indefinitely.
+
+### In the config file
+
+```bash
+# One entry per schedule, ';'-separated:  <5-field cron>|<mode>|<label>
+# mode: yes = update and reboot | no = update, never reboot
+#       only = reboot window, installs nothing
+UPDATE_SCHEDULES='0 23 * * 5|no|Weekly updates;0 3 1 * *|only|Reboot window'
+
+# When the reboot happens, for whichever schedule is allowed to take it.
+REBOOT_TIME="00:00"
+```
+
+Each schedule becomes one line in root's crontab; the ones marked `no` are run
+with `--no-reboot`:
+
+```
+# proxmox-autoupdate
+# proxmox-autoupdate: Weekly updates (no reboot)
+0 23 * * 5 /usr/local/bin/update-everything.sh --no-reboot >> /var/log/proxmox-autoupdate/cron.log 2>&1
+# proxmox-autoupdate: Reboot window (reboot window)
+0 3 1 * * /usr/local/bin/update-everything.sh --reboot-window >> /var/log/proxmox-autoupdate/cron.log 2>&1
+```
+
+`UPDATE_SCHEDULE_CRON` is still written, holding the first schedule's
+expression, so a config from an earlier version keeps working — a single
+schedule that is allowed to reboot, which is what it always meant.
+
+### One warning about monthly cron expressions
+
+cron **ORs** day-of-month with day-of-week when both are restricted. The obvious
+way to write "first Sunday of the month" — `0 3 1-7 * 0` — actually fires on the
+1st to the 7th *and* on every Sunday, which is weekly. Use a day of the month
+(`0 3 1 * *`) and leave day-of-week as `*`.
+
+To reconfigure at any time, re-run `install.sh`, use the panel, or edit
+`/etc/proxmox-autoupdate.conf` and re-save the schedule from the panel so the
+crontab is rewritten to match. `--doctor` warns when the two have drifted.
 
 ---
 
@@ -719,6 +797,64 @@ It changes nothing and exits non-zero if anything is actually broken. The usual 
 | Nothing ever runs at all | No cron daemon | `systemctl enable --now cron` |
 | No notifications, ever | No channel configured, or `NOTIFY_ON_FAILURE_ONLY` is set and the runs are clean | Check the Notifications tab, or `--doctor` |
 | `cron.log` shows a syntax error on line 1 | The install downloaded an error page instead of the script — a captive portal, a filtering proxy, or a DNS blocklist hit on `raw.githubusercontent.com` | Reinstall. The installer now verifies what it downloaded before installing it. |
+
+### The install finished but the Auto-Update button is not there
+
+Run the self-check first — it answers this exact question:
+
+```bash
+update-everything.sh --doctor
+```
+
+It reports, separately, whether the panel is answering on its port and whether
+the button is present in `pvemanagerlib.js`. Those are two different failures
+with two different fixes.
+
+**If the button is present in the file:** it is your browser. Proxmox serves
+`pvemanagerlib.js` with aggressive caching and an ordinary reload will not
+replace it. Hard-refresh with `Ctrl+Shift+R` (`Cmd+Shift+R` on a Mac), or open
+the Proxmox UI in a private window to confirm. This is by far the most common
+cause, and a normal browser restart does not always clear it.
+
+**If the button is not in the file:**
+
+```bash
+/usr/local/bin/pve-autoupdate-patch-webui apply
+```
+
+**If the button is in the file and you have hard-refreshed and it is still not
+there:** the injected code could not find the toolbar to attach to. Open the
+browser's developer console (F12) and look for a `proxmox-autoupdate:` warning —
+it says so explicitly. In that case a floating **Update Everything** button
+appears in the bottom-right corner instead, and the panel is always reachable
+directly at `https://<node>:8007/`. Please
+[open an issue](https://github.com/Enhanced-Group/proxmox-autoupdate/issues)
+with your Proxmox version.
+
+### The panel's port is not listening after installing
+
+```bash
+update-everything.sh --doctor          # says whether the port answers
+systemctl status pve-autoupdate-ui
+journalctl -u pve-autoupdate-ui -n 50  # the actual error
+```
+
+The three things that account for almost all of it:
+
+- **The port is taken.** 8007 is Proxmox Backup Server's. If PBS is on the same
+  node, pick another port — re-run the installer, or edit `WEB_UI_PORT` in
+  `/etc/proxmox-autoupdate.conf` and `systemctl restart pve-autoupdate-ui`.
+- **No certificate.** The panel reuses the node's own Proxmox certificate from
+  `/etc/pve/local/`. If `/etc/pve` is not mounted — pmxcfs not started, or the
+  node is not part of a working cluster filesystem — it exits saying so.
+- **A firewall.** The service can be listening while the Proxmox firewall drops
+  the connection. `curl -k https://127.0.0.1:8007/` from the node itself
+  distinguishes the two: if that answers and your browser does not, it is the
+  firewall.
+
+Note that `systemctl is-active` is not a reliable check here on its own — the
+unit is `Type=simple`, so systemd reports "active" as soon as the process forks,
+before it has bound anything. Ask the port, as `--doctor` does.
 
 ### The Proxmox web UI is blank after an update
 

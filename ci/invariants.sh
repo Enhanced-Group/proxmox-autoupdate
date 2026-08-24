@@ -96,9 +96,12 @@ fi
 # with no UI. LOG_DIR was both at once for a while.
 echo "== config key parity =="
 # Settings that are deliberately consumed by the panel or the installer rather
-# than by the update script: the schedule lives in the crontab, and the
-# confirmation prompt is a UI behaviour.
-PANEL_ONLY="UPDATE_SCHEDULE_CRON CONFIRM_UPDATES SUPPRESS_SUBSCRIPTION_NOTICE"
+# than by the update script: the schedules live in the crontab — each cron line
+# already carries its own --no-reboot or not, so a run never has to consult the
+# list to know what it is allowed to do — and the confirmation prompt is a UI
+# behaviour. The update script reads UPDATE_SCHEDULES only in --doctor, through
+# cfg_read, to check that the config and the crontab still agree.
+PANEL_ONLY="UPDATE_SCHEDULE_CRON UPDATE_SCHEDULES CONFIRM_UPDATES SUPPRESS_SUBSCRIPTION_NOTICE"
 
 PANEL_KEYS=$(sed -n '/^EDITABLE_KEYS = {/,/^}/p' webui/pve-autoupdate-ui \
              | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u)
@@ -344,6 +347,72 @@ if [ -n "${RAW}" ]; then
 else
     ok "all $(echo "${CONF_BODY}" | wc -l | tr -d ' ') config values go through sq()"
 fi
+
+# --- 3d-quinquies. The three schedule parsers agree --------------------------
+# UPDATE_SCHEDULES is parsed in three places: the installer (to build the
+# crontab), the update script (for --doctor), and the panel (in Python). They
+# have to read the same string the same way, or the panel shows one thing while
+# cron runs another — and the only symptom is a host that reboots on a week it
+# should not have.
+echo "== schedule format is parsed the same everywhere =="
+SCHED_A=$(sed -n '/^parse_schedules() {/,/^}/p' install.sh)
+SCHED_B=$(sed -n '/^parse_schedules() {/,/^}/p' update-everything.sh)
+if [ -z "${SCHED_A}" ] || [ -z "${SCHED_B}" ]; then
+    fail "parse_schedules() missing from install.sh or update-everything.sh"
+elif [ "${SCHED_A}" != "${SCHED_B}" ]; then
+    fail "the two shell copies of parse_schedules() have drifted apart"
+else
+    ok "install.sh and update-everything.sh share one parse_schedules()"
+fi
+
+if have_python3; then
+    if python3 - <<'PYCHECK'
+import io, re, sys
+src = io.open('webui/pve-autoupdate-ui', encoding='utf-8').read()
+ns = {'re': re}
+for pat in [r'^SCHEDULE_MODES = .*$',
+            r'^def parse_schedules\(raw, legacy_cron=""\):\n(?:(?: |\t).*\n|\n)*?(?=\n\n)',
+            r'^def format_schedules\(items\):\n(?:(?: |\t).*\n|\n)*?(?=\n\n)']:
+    m = re.search(pat, src, re.M)
+    if not m:
+        sys.exit("panel is missing " + pat[:30])
+    exec(m.group(0), ns)
+P, F = ns['parse_schedules'], ns['format_schedules']
+raw = "0 23 * * 5|no|Weekly;0 3 1 * *|only|Window;0 4 * * 0|yes|Sunday"
+items = P(raw)
+if [i['mode'] for i in items] != ['no', 'only', 'yes']:
+    sys.exit("panel parsed %r wrongly: %r" % (raw, items))
+if F(items) != raw:
+    sys.exit("round-trip changed the value: %r" % F(items))
+# A bare expression, and the pre-1.9 fallback, must both still work.
+if P("0 4 * * 1")[0]['mode'] != 'yes':
+    sys.exit("a bare cron expression must default to updating and rebooting")
+if P("", "0 9 * * 1") != [{"cron": "0 9 * * 1", "mode": "yes", "label": "Updates"}]:
+    sys.exit("legacy UPDATE_SCHEDULE_CRON fallback is broken")
+# An unrecognised mode must fall back to the safe one, never be passed through
+# to a crontab line as a flag.
+if P("0 4 * * 1|banana|x")[0]['mode'] != 'yes':
+    sys.exit("an unknown mode must fall back to 'yes'")
+PYCHECK
+    then
+        ok "the panel parses the same format, and round-trips it unchanged"
+    else
+        fail "the panel's schedule parsing disagrees with the shell copies"
+    fi
+else
+    ok "python3 not available — skipped (CI always has it)"
+fi
+
+# Every mode has to reach cron as the right flag, and the updater has to
+# understand every flag the writers can emit — otherwise a schedule silently
+# does something other than what the panel says it does.
+FLAG_OK=1
+for flag in --no-reboot --reboot-window; do
+    for f in update-everything.sh install.sh webui/pve-autoupdate-ui; do
+        grep -q -- "${flag}" "${f}" || { fail "${flag} is missing from ${f}"; FLAG_OK=0; }
+    done
+done
+[ "${FLAG_OK}" -eq 1 ] && ok "--no-reboot and --reboot-window are emitted and understood"
 
 # --- 3e. No faint text -------------------------------------------------------
 # \033[2m is rendered at very low contrast by xterm.js, which is what the

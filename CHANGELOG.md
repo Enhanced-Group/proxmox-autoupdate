@@ -12,6 +12,87 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.9.0 — 2026-08-12
+
+### Added
+
+- **Multiple schedules, each with its own reboot policy.** Updates are safe to
+  apply weekly; the reboot a new kernel needs is the part that costs an outage.
+  A schedule now says which of three things it is for:
+
+  | Mode | Cron line | What it does |
+  | --- | --- | --- |
+  | Update · reboot if needed | *(no flag)* | The old behaviour. |
+  | Update · never reboot | `--no-reboot` | Installs everything, including the kernel; leaves the host on the old one. |
+  | Reboot window · no updates | `--reboot-window` | Installs nothing. Reboots only if a reboot is already owed. |
+
+  Set it up in the installer or on the panel's **Schedule** tab, where each row
+  has its own mode. Up to ten schedules.
+
+- **A held reboot is handed over, not lost.** This is what makes the split work
+  at all. The reboot decision only ever fires when *this* run installed a
+  kernel — so a weekly no-reboot run would install one, and the monthly run
+  would find nothing to install, conclude nothing was needed, and leave the host
+  on the old kernel forever. A held reboot is now recorded in
+  `/var/lib/proxmox-autoupdate/reboot-pending` and taken by the next run that is
+  allowed to take it. The record clears as soon as the host is seen running the
+  newest installed kernel, however it got there.
+
+  Reports say **Reboot Pending** rather than *No Reboot Needed*, so a host is
+  never quietly out of date.
+
+- `--reboot-window` and `--no-reboot` on the command line, and a
+  `--doctor` warning when *no* schedule may reboot — a configuration where a
+  kernel installs and then waits indefinitely.
+
+### Fixed
+
+- **The installer reported a panel that was not running as a success.** The unit
+  is `Type=simple`, so `systemctl is-active` says "active" the moment the
+  process forks — before it has read a certificate or bound a port. A panel that
+  started, threw and was restarted five seconds later looked perfectly healthy.
+  The installer now makes an actual HTTPS request to the port, and on failure
+  prints `systemctl status` and the last lines of the service log inline instead
+  of suggesting you go and find them.
+
+- **The toolbar button could silently never appear.** It was anchored solely to
+  the *Documentation* button; any layout where that is renamed, moved out of a
+  toolbar or loses its `onlineHelp` property left the injected code polling for
+  two minutes and then giving up without a word — indistinguishable from a
+  failed install. It now tries several anchors, logs to the browser console when
+  none match, and falls back to a floating button so the panel is always
+  reachable.
+
+- **The installer never checked that the patch landed.** It trusted the
+  patcher's exit code; it now reads `pvemanagerlib.js` back and confirms the
+  block is there.
+
+- **"I installed it and nothing happened" is usually browser cache.** The
+  installer now says so explicitly, with the hard-refresh shortcut, rather than
+  as a dim aside at the end.
+
+- `--doctor` diagnoses all of the above: whether the port answers (not just
+  whether systemd is happy), whether the button is present in
+  `pvemanagerlib.js`, and whether the apt hook that survives a `pve-manager`
+  upgrade is installed.
+
+- The installer's own failure diagnostics could abort the install. Under
+  `set -euo pipefail`, a missing `journalctl` made the diagnostic exit 127 and
+  took the installer down with it — turning "the panel did not start" into "the
+  install failed".
+
+- A re-install no longer flattens a multi-schedule setup. It lists what is
+  configured and offers to keep it, which matters most for the panel's own
+  unattended self-update, where nobody is at the keyboard.
+
+### Changed
+
+- The reboot-time prompt and the schedule prompts explain what they are for, and
+  the installer warns when the schedules it just wrote can never reboot.
+- `README.md` documents the schedule modes, the handoff, and the cron
+  day-of-month/day-of-week trap that makes "first Sunday of the month" fire
+  weekly.
+
 ## 1.8.1 — 2026-08-12
 
 Six defects that every automated check passed. They pass `bash -n`, they pass

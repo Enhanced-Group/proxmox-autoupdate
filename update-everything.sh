@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="1.8.1"
+PAU_VERSION="1.9.0"
 
 set -u
 set -o pipefail
@@ -20,6 +20,8 @@ ONLY_IDS=""
 SEND_EMAIL="true"
 DETACH="false"
 DOCTOR="false"
+ALLOW_REBOOT="true"
+REBOOT_WINDOW="false"
 RAW_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -42,6 +44,18 @@ while [ $# -gt 0 ]; do
         --no-email)
             SEND_EMAIL="false"
             ;;
+        --reboot-window)
+            REBOOT_WINDOW="true"
+            ;;
+        --no-reboot)
+            # Apply everything, but never book the reboot.
+            #
+            # This is what lets one machine have more than one schedule: a
+            # weekly run that installs updates and leaves the new kernel
+            # waiting, and a monthly run — same script, without this flag —
+            # that is allowed to take the host down for it.
+            ALLOW_REBOOT="false"
+            ;;
         -h|--help)
             cat <<'USAGE'
 Usage: update-everything.sh [options]
@@ -56,6 +70,20 @@ Usage: update-everything.sh [options]
 
   --no-email        Do not send any notification for this run. Useful when the
                     output is already being watched live.
+
+  --reboot-window   Reboot the host if — and only if — a reboot is already
+                    owed: a newer kernel is installed than the one running.
+                    Updates nothing. This is the other half of --no-reboot:
+                    schedule the updates as often as you like, and schedule the
+                    outage separately, on its own terms. Does nothing at all,
+                    quietly, when no reboot is owed.
+
+  --no-reboot       Install everything as normal, but never schedule a reboot,
+                    however much the kernel changed. Pair a frequent run
+                    carrying this flag with an occasional one that does not, and
+                    updates land weekly while the host only goes down monthly.
+                    The report says a reboot is being held rather than that none
+                    is needed.
 
   --doctor          Check this installation and report what would stop it
                     working, without changing anything. Run this first if a
@@ -158,6 +186,67 @@ cfg_read() {
         | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
 }
 
+# --- Schedules -----------------------------------------------------------
+#
+# UPDATE_SCHEDULES holds one or more schedules, ';'-separated, each of them
+# '<5-field cron>|<mode>|<label>', where mode is one of:
+#
+#   yes    update, and reboot if this run installs a kernel   (no flag)
+#   no     update, never reboot                               (--no-reboot)
+#   only   do not update; reboot if one is owed               (--reboot-window)
+#
+# For example:
+#
+#   UPDATE_SCHEDULES='0 23 * * 5|no|Weekly updates;0 3 1 * *|only|Reboot window'
+#
+# which installs updates every Friday night, leaving any new kernel waiting, and
+# takes the host down for it on the first of the month without touching a
+# package. 'only' is the schedule to use when the outage needs its own slot
+# rather than riding along with an update run.
+#
+# Empty means a pre-1.9 install: one schedule, taken from UPDATE_SCHEDULE_CRON,
+# allowed to reboot, which is what that config always meant.
+#
+# Emits one tab-separated 'cron<TAB>reboot<TAB>label' line per schedule.
+parse_schedules() {
+    local raw="$1" entry rest cron reboot label
+    if [ -z "${raw}" ]; then
+        if [ -n "${UPDATE_SCHEDULE_CRON:-}" ]; then
+            printf '%s\tyes\tUpdates\n' "${UPDATE_SCHEDULE_CRON}"
+        fi
+        return 0
+    fi
+    local OLD_IFS="${IFS}"
+    IFS=';'
+    # shellcheck disable=SC2086
+    set -- ${raw}
+    IFS="${OLD_IFS}"
+    for entry in "$@"; do
+        [ -n "${entry}" ] || continue
+        case "${entry}" in
+            *\|*)
+                cron="${entry%%|*}"
+                rest="${entry#*|}"
+                reboot="${rest%%|*}"
+                case "${rest}" in
+                    *\|*) label="${rest#*|}" ;;
+                    *)    label="" ;;
+                esac
+                ;;
+            *)
+                # A bare cron expression, from a hand-edited config.
+                cron="${entry}"; reboot="yes"; label=""
+                ;;
+        esac
+        case "${reboot}" in
+            no|only) : ;;
+            *)       reboot="yes" ;;
+        esac
+        [ -n "${cron}" ] || continue
+        printf '%s\t%s\t%s\n' "${cron}" "${reboot}" "${label}"
+    done
+}
+
 # Escape a string for embedding in a JSON string literal.
 #
 # The slurp (:a N $!ba) has to come first. sed applies commands in order within
@@ -247,6 +336,82 @@ _d_ok()   { echo "  [ ok ] $1"; }
 _d_warn() { echo "  [warn] $1"; DOC_WARN=$((DOC_WARN + 1)); }
 _d_fail() { echo "  [FAIL] $1"; DOC_FAIL=$((DOC_FAIL + 1)); }
 _d_head() { echo ""; echo "── $1"; }
+
+# Where run history and the pending-reboot marker live, so a report can say
+# "this guest has failed 3 runs" instead of treating every run as the first.
+#
+# Defined up here rather than with the rest of the config because --doctor reads
+# it and returns long before that block is reached; under `set -u` a later
+# definition is not a subtle bug, it is an immediate abort.
+STATE_DIR="/var/lib/proxmox-autoupdate"
+STATE_FILE="${STATE_DIR}/state.json"
+REBOOT_PENDING_FILE="${STATE_DIR}/reboot-pending"
+
+# The newest kernel image on disk, by version.
+#
+# `ls -t` orders by mtime, which is not version order: reinstalling or pinning
+# an older kernel — routine after a NIC or GPU driver problem, and what a /boot
+# restore does — made that older image look like the newest, so the running
+# kernel never matched and the host rebooted after every single run, forever.
+# linux-version (from linux-base) knows how to order kernel versions; sort -V is
+# the fallback.
+latest_installed_kernel() {
+    local list newest=""
+    list=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' || true)
+    [ -n "${list}" ] || return 0
+    if command -v linux-version >/dev/null 2>&1; then
+        newest=$(echo "${list}" | linux-version sort --reverse 2>/dev/null | head -1)
+    fi
+    [ -n "${newest}" ] || newest=$(echo "${list}" | sort -V | tail -1)
+    echo "${newest}"
+}
+
+# --- Reboot window -----------------------------------------------------------
+#
+# Takes a reboot that is already owed, and does nothing else. Pairs with
+# --no-reboot: the update schedules install kernels without ever taking the host
+# down, and this decides when the host actually goes down for them.
+#
+# "Owed" is deliberately the same test the update path uses — a newer kernel is
+# installed than the one booted — so this never reboots a host that has nothing
+# to gain from it. The marker file only carries the reason across for the
+# report; it is not what makes the decision, so clearing it by hand or losing
+# /var/lib cannot strand a host on an old kernel.
+run_reboot_window() {
+    local running latest reason=""
+    running=$(uname -r)
+    latest=$(latest_installed_kernel)
+
+    if [ -z "${latest}" ] || [ "${running}" = "${latest}" ]; then
+        rm -f "${REBOOT_PENDING_FILE}" 2>/dev/null || true
+        echo "Reboot window: nothing owed — running the newest installed kernel (${running})."
+        return 0
+    fi
+
+    if [ -r "${REBOOT_PENDING_FILE}" ]; then
+        reason=$(head -c 500 "${REBOOT_PENDING_FILE}" 2>/dev/null | tr -d '"""+BS+"r"+BS+"""n')
+    fi
+    [ -n "${reason}" ] || reason="Kernel ${latest} is installed; the host is running ${running}"
+
+    if [ "${DRY_RUN}" = "true" ]; then
+        echo "Reboot window (dry run): would reboot now. ${reason}"
+        return 0
+    fi
+
+    echo "Reboot window: rebooting. ${reason}"
+    # notify_fatal is the one-line "send this sentence to every configured
+    # channel" helper; the name is about how little it does, not severity. A
+    # host going down unattended is worth a message.
+    notify_fatal "Rebooting into ${latest} — ${reason}" || true
+    rm -f "${REBOOT_PENDING_FILE}" 2>/dev/null || true
+    # A minute's grace so anyone watching, and any guest still shutting down,
+    # has a moment. `shutdown -r now` from cron has no such courtesy.
+    shutdown -r +1 "Scheduled reboot window: ${reason}" 2>/dev/null || {
+        echo "shutdown(8) refused the reboot — is this a container rather than the host?" >&2
+        return 1
+    }
+    return 0
+}
 
 run_doctor() {
     echo ""
@@ -387,10 +552,42 @@ run_doctor() {
         _d_fail "no cron daemon is running — nothing will ever trigger a scheduled run"
         _d_fail "  → systemctl enable --now cron"
     fi
-    if crontab -l 2>/dev/null | grep -q 'update-everything.sh'; then
-        _d_ok "crontab entry present: $(crontab -l 2>/dev/null | grep 'update-everything.sh' | head -1)"
+    CRON_LINES=$(crontab -l 2>/dev/null | grep 'update-everything.sh' || true)
+    if [ -n "${CRON_LINES}" ]; then
+        CRON_N=$(echo "${CRON_LINES}" | wc -l | tr -d ' ')
+        _d_ok "${CRON_N} crontab entr$([ "${CRON_N}" = "1" ] && echo y || echo ies):"
+        echo "${CRON_LINES}" | while IFS= read -r _line; do
+            _d_ok "  ${_line}"
+        done
+        # The whole point of splitting schedules is that one of them can reboot.
+        # If none may, a kernel update installs and then waits forever, and the
+        # only symptom is a host quietly running an old kernel.
+        if ! echo "${CRON_LINES}" | grep -qv -- '--no-reboot'; then
+            _d_warn "every schedule runs with --no-reboot, so a new kernel will never be booted"
+            _d_warn "  → give one schedule permission to reboot, in the panel or the installer"
+        fi
     else
         _d_warn "no crontab entry for update-everything.sh"
+    fi
+
+    # A reboot one schedule installed a kernel for and was not allowed to take.
+    # Worth surfacing: from the outside the machine just looks like it is
+    # running an old kernel for no reason.
+    if [ -r "${STATE_DIR}/reboot-pending" ]; then
+        _d_warn "a reboot is pending: $(head -c 200 "${STATE_DIR}/reboot-pending" 2>/dev/null | tr -d '\r\n')"
+        _d_warn "  → the next schedule that allows a reboot will take it, or reboot by hand"
+    fi
+
+    # The crontab is what actually runs; the config is what the panel edits.
+    # They are written together, so a difference means one of them was
+    # hand-edited and the other was not.
+    CFG_SCHEDULES=$(cfg_read UPDATE_SCHEDULES)
+    if [ -n "${CFG_SCHEDULES}" ]; then
+        CFG_N=$(UPDATE_SCHEDULE_CRON="" parse_schedules "${CFG_SCHEDULES}" | wc -l | tr -d ' ')
+        if [ -n "${CRON_LINES}" ] && [ "${CFG_N}" != "${CRON_N:-0}" ]; then
+            _d_warn "the config lists ${CFG_N} schedule(s) but the crontab has ${CRON_N:-0}"
+            _d_warn "  → re-save the schedule in the panel to put them back in step"
+        fi
     fi
 
     _d_head "Runtime state"
@@ -427,15 +624,45 @@ run_doctor() {
     local uiport
     uiport=$(cfg_read WEB_UI_PORT); uiport="${uiport:-8007}"
     if [ "$(cfg_read ENABLE_WEB_UI)" = "true" ]; then
-        if systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
-            _d_ok "panel service is running on port ${uiport}"
+        # Ask the port, not systemd. Type=simple reports "active" as soon as the
+        # process forks, so a panel that starts and immediately dies looks
+        # healthy for the five seconds before Restart=on-failure notices.
+        local http=""
+        if command -v curl >/dev/null 2>&1; then
+            http=$(curl -s -k -m 5 -o /dev/null -w '%{http_code}'                    "https://127.0.0.1:${uiport}/" 2>/dev/null || echo 000)
+        fi
+        if [ -n "${http}" ] && [ "${http}" != "000" ]; then
+            _d_ok "panel is answering on port ${uiport} (HTTP ${http})"
+        elif systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
+            _d_fail "the panel service is running but port ${uiport} does not answer"
+            _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
         else
             _d_fail "panel is enabled in the config but the service is not running"
+            _d_fail "  → systemctl status pve-autoupdate-ui"
             _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
             if command -v ss >/dev/null 2>&1 && ss -lntH 2>/dev/null | grep -q ":${uiport} "; then
                 _d_fail "  → port ${uiport} is already in use by something else"
                 _d_fail "     (Proxmox Backup Server uses 8007 — pick another port)"
             fi
+        fi
+
+        # Is the toolbar button actually in the file the browser loads? This is
+        # the other half of "I installed it and nothing appeared": the service
+        # can be perfectly healthy while pvemanagerlib.js was never patched, or
+        # was replaced by a pve-manager upgrade and the apt hook did not re-run.
+        local pvejs="/usr/share/pve-manager/js/pvemanagerlib.js"
+        if [ ! -f "${pvejs}" ]; then
+            _d_warn "${pvejs} not found — no toolbar button on this node"
+        elif grep -qF 'BEGIN proxmox-autoupdate button' "${pvejs}" 2>/dev/null; then
+            _d_ok "toolbar button is present in pvemanagerlib.js"
+            _d_ok "  if you cannot see it, hard-refresh the Proxmox UI (Ctrl+Shift+R)"
+        else
+            _d_fail "the toolbar button is NOT in pvemanagerlib.js"
+            _d_fail "  → /usr/local/bin/pve-autoupdate-patch-webui apply"
+        fi
+        if [ ! -f /etc/apt/apt.conf.d/99-proxmox-autoupdate-webui ]; then
+            _d_warn "the apt hook is missing — the button will vanish on the next"
+            _d_warn "  pve-manager upgrade and not come back. Re-run install.sh."
         fi
     else
         _d_ok "web panel not enabled"
@@ -559,6 +786,24 @@ run_doctor() {
 if [ "${DOCTOR}" = "true" ]; then
     LOCKFILE="/var/run/proxmox-autoupdate.lock"
     run_doctor
+    exit $?
+fi
+
+# The reboot window updates nothing, so it runs before the preflight, the
+# lockfile and the whole update machinery. It does need root — shutdown(8) does
+# — and it must not fire while a real update run is still going, or it would
+# take the host down mid-dpkg.
+if [ "${REBOOT_WINDOW}" = "true" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "[!] FATAL: --reboot-window must run as root." >&2
+        exit 1
+    fi
+    DRY_RUN="${CLI_DRY_RUN:-false}"
+    if [ -e "${LOCKFILE:-/var/run/proxmox-autoupdate.lock}" ]        && command -v fuser >/dev/null 2>&1        && fuser "${LOCKFILE:-/var/run/proxmox-autoupdate.lock}" >/dev/null 2>&1; then
+        echo "Reboot window: an update run is in progress — not rebooting."
+        exit 0
+    fi
+    run_reboot_window
     exit $?
 fi
 
@@ -1075,10 +1320,6 @@ KEEP_LOGS="${KEEP_LOGS:-true}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 LOG_DIR="${LOG_DIR:-/var/log/proxmox-autoupdate}"
 
-# Where run history lives, so a report can say "this guest has failed 3 runs"
-# instead of treating every run as the first.
-STATE_DIR="/var/lib/proxmox-autoupdate"
-STATE_FILE="${STATE_DIR}/state.json"
 
 # Normalise booleans so a stray "TRUE"/"yes" in the config still behaves.
 normalise_bool() {
@@ -1120,6 +1361,7 @@ for _NUM_VAR in SNAPSHOT_KEEP LOG_RETENTION_DAYS; do
         exit 1
     fi
 done
+
 
 # REBOOT_TIME is used both to compute a delay and as a fallback argument to
 # shutdown(8). A malformed value made `date -d` fail, which silently disabled
@@ -3754,14 +3996,7 @@ RUNNING_KERNEL=$(uname -r)
 #
 # linux-version (from linux-base) knows how to order kernel versions properly;
 # sort -V is the fallback.
-KERNEL_LIST=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' || true)
-LATEST_KERNEL=""
-if [ -n "${KERNEL_LIST}" ]; then
-    if command -v linux-version >/dev/null 2>&1; then
-        LATEST_KERNEL=$(echo "${KERNEL_LIST}" | linux-version sort --reverse 2>/dev/null | head -1)
-    fi
-    [ -z "${LATEST_KERNEL}" ] && LATEST_KERNEL=$(echo "${KERNEL_LIST}" | sort -V | tail -1)
-fi
+LATEST_KERNEL=$(latest_installed_kernel)
 
 # Did this run actually install a kernel? A version difference that predates the
 # run is a pre-existing skew (a pinned kernel, a stock Debian image pulled in as
@@ -3794,8 +4029,55 @@ if [ -z "${ONLY_IDS}" ] && [ -f /var/run/reboot-required ]; then
     [ -z "${REBOOT_REASON}" ] && REBOOT_REASON="System flagged reboot-required"
 fi
 
+# A reboot held by one schedule has to be taken by the next one that is allowed
+# to take it.
+#
+# Without this the whole point of --no-reboot collapses. The reboot decision
+# above only fires when *this* run installed a kernel, so the weekly no-reboot
+# run would install it, hold the reboot, and the monthly run would then find
+# nothing to install, conclude no reboot was needed, and the host would sit on
+# the old kernel forever. The hold is recorded on disk instead, and cleared as
+# soon as the machine is seen running the newest kernel — whether it got there
+# through this tool or someone rebooting it by hand.
+REBOOT_PENDING_FILE="${STATE_DIR}/reboot-pending"
+
+if [ -n "${LATEST_KERNEL}" ] && [ "${RUNNING_KERNEL}" = "${LATEST_KERNEL}" ]; then
+    rm -f "${REBOOT_PENDING_FILE}" 2>/dev/null || true
+elif [ "${REBOOT_NEEDED}" != true ] && [ -z "${ONLY_IDS}" ] \
+     && [ -r "${REBOOT_PENDING_FILE}" ]; then
+    HELD_REASON=$(head -c 500 "${REBOOT_PENDING_FILE}" 2>/dev/null | tr -d '\r\n')
+    REBOOT_NEEDED=true
+    REBOOT_REASON="${HELD_REASON:-A previous run installed a kernel and was not allowed to reboot}"
+fi
+
+REBOOT_HELD=false
+if [ "${ALLOW_REBOOT}" != "true" ] && [ "${REBOOT_NEEDED}" = true ]; then
+    # Deliberately distinct from "no reboot needed". A run started with
+    # --no-reboot has installed a kernel the host is not running, and saying
+    # nothing about it would leave the machine looking up to date while it waits
+    # for whichever schedule is allowed to take it down.
+    REBOOT_NEEDED=false
+    REBOOT_HELD=true
+    # Record the plain reason, before it is dressed up for the report. Writing
+    # the decorated string re-wrapped itself on every held run, so by the third
+    # week the report read "Reboot HELD — Reboot HELD — Reboot HELD — ...".
+    if [ "${DRY_RUN}" != "true" ]; then
+        mkdir -p "${STATE_DIR}" 2>/dev/null || true
+        printf '%s\n' "${REBOOT_REASON:-A reboot is required}"             > "${REBOOT_PENDING_FILE}" 2>/dev/null || true
+    fi
+    REBOOT_REASON="Reboot HELD — ${REBOOT_REASON:-a reboot is required}. This schedule runs with --no-reboot; the next schedule that allows a reboot will take it."
+    print_warn "Reboot held: this schedule does not reboot. The host is running ${RUNNING_KERNEL} with ${LATEST_KERNEL:-a newer kernel} installed."
+elif [ "${ALLOW_REBOOT}" != "true" ]; then
+    if [ -n "${REBOOT_REASON}" ]; then
+        REBOOT_REASON="${REBOOT_REASON} (this schedule runs with --no-reboot in any case)"
+    else
+        REBOOT_REASON="No reboot needed — and this schedule would not have rebooted in any case"
+    fi
+fi
+
 if [ "${HOST_UPDATE_FAILED}" = true ]; then
     REBOOT_NEEDED=false
+    REBOOT_HELD=false
     REBOOT_REASON="Reboot SKIPPED — host update failed"
 elif [ "${GUESTS_MID_UPDATE}" -gt 0 ]; then
     # Guests were left running because their upgrade had not finished. Taking
@@ -3810,6 +4092,8 @@ fi
 
 if [ "${REBOOT_NEEDED}" = true ]; then
     REBOOT_STATUS_HTML="<span class='status-badge badge-warning'>Reboot Scheduled</span> at ${REBOOT_TIME}<br><em>${REBOOT_REASON}</em>"
+elif [ "${REBOOT_HELD}" = true ]; then
+    REBOOT_STATUS_HTML="<span class='status-badge badge-warning'>Reboot Pending</span><br><em>${REBOOT_REASON}</em>"
 else
     REBOOT_STATUS_HTML="<span class='status-badge badge-no-updates'>No Reboot Needed</span>"
     [ -n "${REBOOT_REASON}" ] && REBOOT_STATUS_HTML="${REBOOT_STATUS_HTML}<br><em>${REBOOT_REASON}</em>"
@@ -3971,6 +4255,7 @@ fi
 if [ "${REBOOT_NEEDED}" = true ]; then
     echo ""
     print_warn "Scheduling reboot at ${REBOOT_TIME} (${REBOOT_REASON})"
+    rm -f "${REBOOT_PENDING_FILE}" 2>/dev/null || true
     CURRENT_EPOCH=$(date +%s)
     TARGET_EPOCH=$(date -d "today ${REBOOT_TIME}" +%s 2>/dev/null || echo "0")
     if [ "${TARGET_EPOCH}" -le "${CURRENT_EPOCH}" ]; then
