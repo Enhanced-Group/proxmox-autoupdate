@@ -46,6 +46,7 @@ fi
 # the tunnel forwards 8006 and nothing else, so the button pointed at a port
 # that does not exist from where the browser is sitting and timed out.
 UI_PUBLIC_URL=""
+UI_PUBLIC_URL_BAD=""
 if [ -r "${CONFIG_FILE}" ]; then
     # Strip the key, then the quotes and any stray whitespace. No capture
     # group, because the value is a URL and every character class that could
@@ -56,6 +57,10 @@ if [ -r "${CONFIG_FILE}" ]; then
     # string is interpolated into JavaScript in pvemanagerlib.js.
     if echo "${CONFIGURED_URL}" | grep -qE '^https?://[A-Za-z0-9._~:@/-]+$'; then
         UI_PUBLIC_URL="${CONFIGURED_URL%/}"
+    elif [ -n "${CONFIGURED_URL}" ]; then
+        # Silently ignoring this was a trap: the button kept pointing at the
+        # node's own address, the config looked right, and nothing said why.
+        UI_PUBLIC_URL_BAD="${CONFIGURED_URL}"
     fi
 fi
 
@@ -103,6 +108,24 @@ ok()   { echo -e "  ${C_GREEN}✓${C_NC} $1"; }
 fail() { echo -e "  ${C_RED}✗${C_NC} $1"; }
 warn() { echo -e "  ${C_YELLOW}⚠${C_NC} $1"; }
 act()  { echo -e "  ${C_CYAN}▶${C_NC} $1"; }
+
+# Where the injected button will send a browser, and why.
+#
+# Without this, "already up to date" was the entire output — indistinguishable
+# from "I read your new WEB_UI_PUBLIC_URL and applied it". Anyone editing that
+# setting has no other way to confirm it was picked up.
+report_panel_url() {
+    if [ -n "${UI_PUBLIC_URL_BAD}" ]; then
+        warn "WEB_UI_PUBLIC_URL is not a plain http(s) address, so it was ignored:"
+        warn "  ${UI_PUBLIC_URL_BAD}"
+        warn "  Expected something like https://proxmox.example.com/pau"
+    fi
+    if [ -n "${UI_PUBLIC_URL}" ]; then
+        ok "Panel URL: ${UI_PUBLIC_URL}/ ${C_DIM}(from WEB_UI_PUBLIC_URL)${C_NC}"
+    else
+        ok "Panel URL: ${C_DIM}https://<this node>:${UI_PORT}/ (default)${C_NC}"
+    fi
+}
 
 require_target() {
     if [ ! -f "${TARGET}" ]; then
@@ -995,7 +1018,10 @@ do_apply() {
     # exact block we would write is already in place there is nothing to do —
     # and nothing should touch a 5 MB file that the whole web UI depends on.
     if is_current; then
-        [ "${1:-}" = "--quiet" ] || ok "Toolbar button already up to date"
+        if [ "${1:-}" != "--quiet" ]; then
+            ok "Toolbar button already up to date"
+            report_panel_url
+        fi
         return 0
     fi
 
@@ -1062,6 +1088,7 @@ do_apply() {
     atomic_replace "${tmp}" "${TARGET}" || { fail "Could not replace ${TARGET}"; cleanup_stage; return 1; }
     _STAGE=""
     ok "Button added to the Proxmox toolbar"
+    report_panel_url
     echo -e "     ${C_DIM}Hard-refresh the Proxmox UI (Ctrl+Shift+R) to see it.${C_NC}"
     return 0
 }
@@ -1271,6 +1298,7 @@ do_status() {
     require_target
     if is_patched; then
         ok "Toolbar button is installed"
+        report_panel_url
         return 0
     fi
     warn "Toolbar button is NOT installed"

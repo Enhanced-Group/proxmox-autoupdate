@@ -12,6 +12,23 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.12.1 — 2026-08-12
+
+### Fixed
+
+- **`patch-webui.sh apply` never said where the button points.** Change
+  `WEB_UI_PUBLIC_URL`, re-run it, and the entire output was
+  `✓ Toolbar button already up to date` — indistinguishable from "I read your
+  new setting and applied it". Both `apply` and `status` now print the URL the
+  button will actually use, and whether it came from `WEB_UI_PUBLIC_URL` or the
+  default.
+
+- **An unparseable `WEB_UI_PUBLIC_URL` was dropped in silence.** A value missing
+  its scheme — `proxmox.example.com/pau` rather than `https://proxmox.example.com/pau`
+  — failed validation and was discarded with no message, leaving the button on
+  the node's own address while the config file looked correct. It now says so,
+  and shows the expected form.
+
 ## 1.12.0 — 2026-08-12
 
 ### Added
