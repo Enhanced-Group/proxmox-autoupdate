@@ -12,6 +12,28 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.12.2 — 2026-08-12
+
+### Fixed
+
+- **A notification channel that can never deliver is now called out.** An
+  install that was configured for email on a version predating 1.8.1 — where
+  the installer asked for SMTP settings and then never wrote them — ends up
+  with `NOTIFY_METHODS="email"` and an empty `SMTP_HOST`. Every run since has
+  reported nothing, and the config looks configured.
+
+  `--doctor` had no Notifications section at all, which is the worst place for
+  this gap: it is the command people run precisely when something is not
+  working. It now checks every enabled channel for the credentials it needs and
+  names the missing keys.
+
+  The installer's summary printed `Email:      :587` — a line that reads as
+  set up until you notice the server is missing — and finished with
+  "Deployment successful". It now says the channel is incomplete and will never
+  send.
+
+  The run itself already warned, but only into `cron.log`.
+
 ## 1.12.1 — 2026-08-12
 
 ### Fixed

@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="1.12.1"
+PAU_VERSION="1.12.2"
 
 set -u
 set -o pipefail
@@ -619,6 +619,55 @@ run_doctor() {
             || _d_ok "${avail_boot} MB free on /boot"; }
     fi
     _d_ok "timezone: $(date +%Z) (reboot times are interpreted in this zone)"
+
+    # A channel that is switched on but missing its credentials sends nothing,
+    # for ever, and looks configured the whole time. The run itself warns about
+    # this, but that warning goes into cron.log, which is exactly the place
+    # nobody reads — and --doctor, the tool people actually run when something
+    # is wrong, said nothing at all.
+    _d_head "Notifications"
+    local methods
+    methods=$(cfg_read NOTIFY_METHODS)
+    if [ -z "${methods}" ] || [ "${methods}" = "none" ]; then
+        _d_ok "no channels configured — runs happen quietly"
+    else
+        local m missing
+        for m in $(echo "${methods}" | tr ',' ' '); do
+            missing=""
+            case "${m}" in
+                email)
+                    if [ -n "$(cfg_read MAILGUN_API_KEY)" ]                        && [ "$(cfg_read EMAIL_TRANSPORT)" != "smtp" ]; then
+                        [ -n "$(cfg_read MAILGUN_DOMAIN)" ] || missing="MAILGUN_DOMAIN"
+                    else
+                        [ -n "$(cfg_read SMTP_HOST)" ] || missing="SMTP_HOST"
+                    fi
+                    [ -n "$(cfg_read SENDER_EMAIL)" ]    || missing="${missing:+${missing}, }SENDER_EMAIL"
+                    [ -n "$(cfg_read RECIPIENT_EMAIL)" ] || missing="${missing:+${missing}, }RECIPIENT_EMAIL"
+                    ;;
+                discord)
+                    [ -n "$(cfg_read DISCORD_WEBHOOK_URL)" ]                         || [ -n "$(cfg_read DISCORD_BOT_TOKEN)" ]                         || missing="DISCORD_WEBHOOK_URL"
+                    ;;
+                slack)    [ -n "$(cfg_read SLACK_WEBHOOK_URL)" ]   || missing="SLACK_WEBHOOK_URL" ;;
+                teams)    [ -n "$(cfg_read TEAMS_WEBHOOK_URL)" ]   || missing="TEAMS_WEBHOOK_URL" ;;
+                ntfy)     [ -n "$(cfg_read NTFY_URL)" ]            || missing="NTFY_URL" ;;
+                gotify)
+                    [ -n "$(cfg_read GOTIFY_URL)" ]   || missing="GOTIFY_URL"
+                    [ -n "$(cfg_read GOTIFY_TOKEN)" ] || missing="${missing:+${missing}, }GOTIFY_TOKEN"
+                    ;;
+                telegram)
+                    [ -n "$(cfg_read TELEGRAM_BOT_TOKEN)" ] || missing="TELEGRAM_BOT_TOKEN"
+                    [ -n "$(cfg_read TELEGRAM_CHAT_ID)" ]   || missing="${missing:+${missing}, }TELEGRAM_CHAT_ID"
+                    ;;
+                webhook)  [ -n "$(cfg_read GENERIC_WEBHOOK_URL)" ] || missing="GENERIC_WEBHOOK_URL" ;;
+            esac
+            if [ -n "${missing}" ]; then
+                _d_fail "${m} is enabled but will never send — missing: ${missing}"
+                _d_fail "  → set it in the panel, or re-run install.sh and choose Custom"
+            else
+                _d_ok "${m} is configured"
+            fi
+        done
+    fi
 
     _d_head "Web panel"
     local uiport

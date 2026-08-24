@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.12.1"
+PAU_FALLBACK_REF="v1.12.2"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -2169,8 +2169,20 @@ echo -e "  ${C_CYAN}Notify:${C_NC}     ${NOTIFY_METHODS:-none}"
 if echo ",${NOTIFY_METHODS}," | grep -q ",email,"; then
     if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
         echo -e "  ${C_CYAN}Email:${C_NC}      Mailgun ${MAILGUN_REGION}, ${SENDER_EMAIL} → ${RECIPIENT_EMAIL}"
+        if [ -z "${MAILGUN_API_KEY}" ] || [ -z "${MAILGUN_DOMAIN}" ]; then
+            print_fail "Email is enabled but Mailgun is not configured — no report will be sent."
+            print_fail "Re-run this installer and choose Custom to set it up."
+        fi
     else
-        echo -e "  ${C_CYAN}Email:${C_NC}      ${SMTP_HOST}:${SMTP_PORT} (${SMTP_SECURITY}), ${SENDER_EMAIL} → ${RECIPIENT_EMAIL}"
+        echo -e "  ${C_CYAN}Email:${C_NC}      ${SMTP_HOST:-<no server>}:${SMTP_PORT} (${SMTP_SECURITY}), ${SENDER_EMAIL:-<no sender>} → ${RECIPIENT_EMAIL:-<no recipient>}"
+        # Printing "Email:      :587" and calling it a success was how somebody
+        # ended up with a channel that had never delivered anything: the line
+        # looks configured until you notice the host is missing.
+        if [ -z "${SMTP_HOST}" ] || [ -z "${SENDER_EMAIL}" ] || [ -z "${RECIPIENT_EMAIL}" ]; then
+            print_fail "Email is enabled but incomplete — no report will ever be sent."
+            print_fail "Re-run this installer and choose Custom to finish setting it up,"
+            print_fail "or set SMTP_HOST in ${CONFIG_FILE}."
+        fi
     fi
 fi
 echo -e "  ${C_CYAN}Excluded:${C_NC}   ${EXCLUDE_IDS:-none}"
