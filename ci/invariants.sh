@@ -113,8 +113,13 @@ for key in ${PANEL_KEYS}; do
     case " ${PANEL_ONLY} " in *" ${key} "*) continue ;; esac
     # Either assigned with a default (KEY="${KEY:-x}") or simply referenced
     # (${KEY:-}). Only checking for an assignment missed the second form.
-    if ! grep -qE "^\s*${key}=" update-everything.sh \
-       && ! grep -qE "\\\$\{${key}[:}]" update-everything.sh; then
+    # Either assigned with a default (KEY="${KEY:-x}"), simply referenced
+    # (${KEY:-}), or pulled out with cfg_read. Checking only for an assignment
+    # missed the second form; checking only those two missed the third, and
+    # reported WEB_UI_PORT as unread when --doctor reads it on every run.
+    if ! grep -qE "^[[:space:]]*${key}=" update-everything.sh \
+       && ! grep -qE "[$]\{${key}[:}]" update-everything.sh \
+       && ! grep -qE "cfg_read ${key}([^A-Z_]|$)" update-everything.sh; then
         fail "${key} is editable in the panel but never read by update-everything.sh"
         PARITY_OK=0
     fi
@@ -134,6 +139,17 @@ if grep -q 'WEB_UI_PUBLIC_URL' webui/patch-webui.sh; then
     ok "WEB_UI_PUBLIC_URL is consumed by the toolbar patcher"
 else
     fail "WEB_UI_PUBLIC_URL is panel-only but nothing reads it"
+fi
+
+# The panel is used inside the Proxmox UI, in the iframe the toolbar button
+# opens. A new tab is not a fallback for anything: a browser will not render a
+# certificate interstitial inside a frame, so the tab was a bootstrap step for
+# accepting a self-signed certificate. That is fixed by trusting the cluster CA
+# instead, which covers every port at once, so nothing needs to leave Proxmox.
+if grep -q 'window\.open' webui/patch-webui.sh; then
+    fail "the injected block opens a new tab again"
+else
+    ok "the injected block never leaves the Proxmox UI"
 fi
 
 # --- 3b. Shared JS only touches elements both pages have ---------------------
@@ -474,8 +490,7 @@ fi
 # what someone who administers the box through that UI does not have to hand.
 #
 # It shipped. Two string literals in the block contained real newlines instead
-# of 
-, from an editing slip that `bash -n` cannot see — the shell is happy,
+# of `\n`, from an editing slip that `bash -n` cannot see — the shell is happy,
 # because to the shell it is just text inside a heredoc. Nothing checked the
 # JavaScript, so nothing caught it.
 echo "== injected JavaScript parses =="
@@ -510,6 +525,63 @@ else
         fail "patch-webui.sh apply failed against a stub pvemanagerlib.js"
     fi
     rm -rf "${JS_TMP}"
+fi
+
+# --- 3d-septies. The panel's own JavaScript parses ---------------------------
+# PAGE_TEMPLATE and GUEST_TEMPLATE each carry a script block, and SHARED_JS is
+# spliced into both. None of it was ever parsed by anything: a stray token would
+# ship, the service would stay healthy, the port would keep answering 200, and
+# the page would be blank. That is the pvemanagerlib failure again, one file
+# over.
+echo "== panel JavaScript parses =="
+if ! command -v node >/dev/null 2>&1; then
+    warn "node not available — skipped (CI installs it)"
+elif ! have_python3; then
+    ok "python3 not available — skipped (CI always has it)"
+else
+    JS_OUT=$(mktemp -d)
+    if python3 - "${JS_OUT}" <<'PYEXTRACT'
+import io, os, re, sys
+
+out_dir = sys.argv[1]
+src = io.open("webui/pve-autoupdate-ui", encoding="utf-8").read()
+
+
+def block(name):
+    i = src.index(name + ' = r"""')
+    j = src.index('"""', i + len(name) + 8)
+    return src[i + len(name) + 8:j]
+
+
+shared = block("SHARED_JS")
+for tpl in ("PAGE_TEMPLATE", "GUEST_TEMPLATE"):
+    page = (block(tpl)
+            .replace("{{JS}}", shared)
+            .replace("{{CONFIRM_UPDATES}}", "true")
+            .replace("{{CSRF}}", "t").replace("{{USER}}", "root@pam")
+            .replace("{{BASE}}", "").replace("{{VMID}}", "101")
+            .replace("{{NAME}}", "guest").replace("{{CSS}}", ""))
+    js = "\n".join(re.findall(r"<script>(.*?)</script>", page, re.S))
+    if not js.strip():
+        sys.exit("no script block found in " + tpl)
+    io.open(os.path.join(out_dir, tpl + ".js"), "w", encoding="utf-8").write(js)
+PYEXTRACT
+    then
+        JS_OK=1
+        for tpl in PAGE_TEMPLATE GUEST_TEMPLATE; do
+            if node --check "${JS_OUT}/${tpl}.js" 2>"${JS_OUT}/err"; then
+                ok "${tpl} JavaScript parses"
+            else
+                fail "${tpl} JavaScript does NOT parse — the panel would load blank:"
+                sed 's/^/         /' "${JS_OUT}/err" | head -5
+                JS_OK=0
+            fi
+        done
+        [ "${JS_OK}" -eq 1 ] || true
+    else
+        fail "could not extract the panel's script blocks"
+    fi
+    rm -rf "${JS_OUT}"
 fi
 
 # --- 3e. No faint text -------------------------------------------------------

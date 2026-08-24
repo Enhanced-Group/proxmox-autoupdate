@@ -174,7 +174,7 @@ The first question is the only one a normal install has to answer:
 | --- | --- |
 | Schedule | Fridays at 23:00. Reboot at 02:00, and only if that run installed a kernel. |
 | Guests | Stopped containers and Linux VMs are started, updated and put back as they were. Windows VMs are left alone — Windows Update can run well over half an hour. |
-| Web panel | Installed on port 8007, with the **Update Everything** button added to the Proxmox toolbar. |
+| Web panel | Installed on port 8010, with the **Update Everything** button added to the Proxmox toolbar. The panel opens *inside* the Proxmox UI. Its port is opened in the Proxmox firewall, pinned to this node's own address. |
 | Notifications | **Off.** |
 | Snapshots | Off. |
 | Logs | Kept in `/var/log/proxmox-autoupdate/` for 90 days. |
@@ -235,6 +235,17 @@ At the end, it offers to run immediately:
 | **Skip** | Waits for the scheduled run |
 
 If a notification channel is configured, both run modes deliver the report through it, so either one verifies the channel end to end. With no channel configured the run is simply quiet — the full output is on screen and in the log directory.
+
+### Installer options
+
+| Flag | What it does |
+|------|--------------|
+| `--port N` | Port for the web control panel. Default **8010**. Refused if it is below 1024, above 65535, already listening, or a common service port — 8006, 8007, 3128, 8080, 5900-5999 and 60000-60050 among them. Validated before anything is written. |
+| `--firewall-source CIDR` | Narrow the rule's source to this network. By default each rule is pinned with `--dest` to one of the node's own addresses and sourced from that address's own network; this replaces the source, never the destination. |
+| `--no-firewall` | Do not touch the Proxmox firewall at all. You are then responsible for opening the port, or the panel is reachable only from the node itself. |
+| `--unattended` | Reuse the existing configuration and ask nothing. This is what the panel's own self-update uses. |
+
+An install that already exists **keeps the port it is on**, in every mode including Typical. A port is infrastructure rather than a preference — firewall rules, bookmarks and reverse-proxy configuration all point at it — so a re-install never moves it out from under them. Only a genuinely fresh install gets 8010.
 
 ---
 
@@ -534,6 +545,22 @@ qm rollback <vmid> autoupdate_20260731_230014     # VMs
 pct rollback <ctid> autoupdate_20260731_230014    # containers
 ```
 
+### Seeing what has accumulated
+
+**Settings → Snapshots** in the panel lists every snapshot on the node, marks
+which ones this tool took, and lets you delete those. Snapshots you took
+yourself are listed for context — so the count describes the node honestly —
+but have no checkbox and are refused by the server if one is ever requested.
+Removing more than one at a time is typed, not clicked.
+
+Proxmox does not report what a snapshot costs on disk through its API: that is a
+property of the storage (ZFS, LVM-thin, qcow2), not of the snapshot. The panel
+says so rather than showing an invented figure — check the storage itself.
+
+Uninstalling now **asks** whether to remove them. It used to leave them behind
+and say so, which reads as safe until you notice that the thing which knew to
+prune them to `SNAPSHOT_KEEP` is the thing being deleted.
+
 ---
 
 ## Notifications
@@ -660,6 +687,10 @@ Clicking opens a panel with seven tabs:
 
 ### Per-guest updates
 
+**Guests** on the Overview tab lists every VM and container with an
+**Update…** action, which opens that guest on its own — check what is pending,
+or update just it. It works for a guest that scheduled runs skip.
+
 A per-guest run:
 
 - touches **only** that guest — the Proxmox host is not updated
@@ -679,7 +710,7 @@ update-everything.sh --only 101 --dry-run    # check without installing
 The panel is a **standalone service**, not a modification of Proxmox's backend:
 
 ```
-Toolbar button  ──►  https://<host>:8007/  (pve-autoupdate-ui.service)
+Toolbar button  ──►  https://<host>:8010/  (pve-autoupdate-ui.service)
 (appended to                                      │
  pvemanagerlib.js)                                ▼
                                     /usr/local/bin/update-everything.sh
@@ -774,7 +805,7 @@ protections are inherited by child processes, and `ProtectSystem` would break th
 ### Certificates
 
 The panel runs on its own port, and browsers scope certificate exceptions **per
-port**. Trusting `:8006` does not trust `:8007`. What that means depends on which
+port**. Trusting `:8006` does not trust `:8010`. What that means depends on which
 certificate your node uses — the installer detects this and tells you which case
 you're in.
 
@@ -784,15 +815,23 @@ trusted immediately. Renewals are picked up automatically — the service watche
 the certificate file and reloads it in place, so an ACME renewal doesn't leave it
 serving an expired cert until someone restarts it.
 
-**If your node still uses the Proxmox self-signed certificate,** pick one:
+**If your node still uses the Proxmox self-signed certificate,** it has to be
+made *trusted*, not *accepted*.
+
+The panel opens **inside** the Proxmox UI, in a frame — and no browser will
+render a certificate interstitial inside a frame. Chrome, Firefox, Edge and
+Safari all refuse, deliberately: a page that could prompt you to trust arbitrary
+origins in a subframe is a phishing primitive. The frame simply fails, with
+nothing to click. That is why there is no "open in a new tab" button anywhere in
+the injected UI.
 
 | | Approach | Effort | Scope |
 |---|---|---|---|
-| **a** | Click through the warning once at `https://host:8007/` | 10 seconds | That one browser, that one machine |
-| **b** | Set up ACME: **Datacenter → ACME**, then **Node → Certificates → Order Certificate** | One-time, ~5 min | Every browser, forever — *also removes the warning on the Proxmox UI itself* |
-| **c** | Install `/etc/pve/pve-root-ca.pem` into your computer's trust store | One-time | Every browser on that machine — also fixes `:8006` |
+| **a** | Set up ACME: **Datacenter → ACME**, then **Node → Certificates → Order Certificate** | One-time, ~5 min | Every browser, forever, through a tunnel — *also removes the warning on the Proxmox UI itself* |
+| **b** | Install `/etc/pve/pve-root-ca.pem` into your computer's trust store | One-time, per workstation | Every port on that machine — also fixes `:8006` |
+| **c** | Open `https://host:8010/` in a tab yourself and accept the warning | 10 seconds | That one browser, that one machine, that one port — and again if the port changes |
 
-**(b) is the real fix.** It's Proxmox's own built-in feature, it eliminates the
+**(a) is the real fix.** It's Proxmox's own built-in feature, it eliminates the
 problem for good rather than papering over it, and it removes the certificate
 warning you're already clicking through on the main UI.
 
@@ -860,7 +899,7 @@ there:** the injected code could not find the toolbar to attach to. Open the
 browser's developer console (F12) and look for a `proxmox-autoupdate:` warning —
 it says so explicitly. In that case a floating **Update Everything** button
 appears in the bottom-right corner instead, and the panel is always reachable
-directly at `https://<node>:8007/`. Please
+directly at `https://<node>:8010/`. Please
 [open an issue](https://github.com/Enhanced-Group/proxmox-autoupdate/issues)
 with your Proxmox version.
 
@@ -868,7 +907,7 @@ with your Proxmox version.
 
 If you reach Proxmox through Cloudflare Tunnel, nginx, Traefik or Tailscale,
 that hostname forwards the Proxmox port and nothing else. The toolbar button
-builds its link as `https://<the host in your address bar>:8007`, which from
+builds its link as `https://<the host in your address bar>:8010`, which from
 your browser's point of view does not exist — you get `ERR_CONNECTION_TIMED_OUT`
 and the status dot never turns green.
 
@@ -897,7 +936,7 @@ Cloudflare Tunnel that is one extra route on the tunnel you already have:
 | --- | --- |
 | Public hostname | `proxmox.example.com` |
 | Path | `pau/*` |
-| Service | `https://localhost:8007` |
+| Service | `https://localhost:8010` |
 | Additional settings → **No TLS Verify** | **on** (the node uses its own self-signed certificate) |
 
 ```bash
@@ -930,7 +969,7 @@ button's status request stops being a cross-origin credentialed one, the
 certificate is the one you already trust, and there is no second hostname to put
 behind an access policy.
 
-Direct access on `https://<node>:8007/` keeps working, so `--doctor` and the
+Direct access on `https://<node>:8010/` keeps working, so `--doctor` and the
 installer's health probe are unaffected.
 
 #### Option 2 — a hostname of its own
@@ -938,7 +977,7 @@ installer's health probe are unaffected.
 | Field | Value |
 | --- | --- |
 | Public hostname | `panel.example.com` |
-| Service | `https://localhost:8007` |
+| Service | `https://localhost:8010` |
 | Additional settings → **No TLS Verify** | **on** |
 
 ```bash
@@ -952,8 +991,8 @@ Either way, the panel authenticates with your existing Proxmox session cookie,
 so put that address behind the same access policy as Proxmox itself. Anyone who
 can reach it and log in can update, and reboot, the host.
 
-> **Cloudflare specifically:** you cannot simply forward port 8007. Cloudflare's
-> proxy only accepts HTTPS on 443, 2053, 2083, 2087, 2096 and 8443 — 8007 is not
+> **Cloudflare specifically:** you cannot simply forward port 8010. Cloudflare's
+> proxy only accepts HTTPS on 443, 2053, 2083, 2087, 2096 and 8443 — 8010 is not
 > one of them — so it has to be a tunnel route regardless.
 
 There is no way to serve the panel on port 8006 itself: `pveproxy` has no
@@ -973,16 +1012,34 @@ journalctl -u pve-autoupdate-ui -n 50  # the actual error
 
 The three things that account for almost all of it:
 
-- **The port is taken.** 8007 is Proxmox Backup Server's. If PBS is on the same
-  node, pick another port — re-run the installer, or edit `WEB_UI_PORT` in
-  `/etc/proxmox-autoupdate.conf` and `systemctl restart pve-autoupdate-ui`.
+- **The port is taken.** The default is 8010; 8007 was the default before
+  1.13.0 and is Proxmox Backup Server's, which is why it moved. If something
+  else owns your chosen port, pick another — re-run the installer, or edit
+  `WEB_UI_PORT` in `/etc/proxmox-autoupdate.conf` and
+  `systemctl restart pve-autoupdate-ui`. The installer refuses ports below
+  1024, ports already listening, and a list of common service ports.
 - **No certificate.** The panel reuses the node's own Proxmox certificate from
   `/etc/pve/local/`. If `/etc/pve` is not mounted — pmxcfs not started, or the
   node is not part of a working cluster filesystem — it exits saying so.
 - **A firewall.** The service can be listening while the Proxmox firewall drops
-  the connection. `curl -k https://127.0.0.1:8007/` from the node itself
+  the connection. `curl -k https://127.0.0.1:8010/` from the node itself
   distinguishes the two: if that answers and your browser does not, it is the
   firewall.
+
+  Since 1.13.0 the installer opens the port for you and `--doctor` checks it,
+  so this should not happen on a fresh install. It is still worth knowing what
+  it looks like: **an empty rule list under Node → Firewall does not mean the
+  firewall is off.** While it is enabled, the default input policy drops
+  anything it has no rule for, and the rules Proxmox writes for itself cover
+  8006, 22, 3128 and 5900-5999 only. `pve-firewall status` is the thing to
+  read. A dropped packet produces `ERR_CONNECTION_TIMED_OUT`; a service that
+  is simply down produces an immediate connection error instead.
+
+  To open it by hand:
+
+  ```bash
+  pvesh create /nodes/<node>/firewall/rules --type in --action ACCEPT --proto tcp --dport 8010 --source 192.168.0.0/24 --enable 1 --comment 'proxmox-autoupdate panel'
+  ```
 
 Note that `systemctl is-active` is not a reliable check here on its own — the
 unit is `Type=simple`, so systemd reports "active" as soon as the process forks,
@@ -1011,7 +1068,7 @@ systemctl status pve-autoupdate-ui
 journalctl -u pve-autoupdate-ui -n 50
 ```
 
-The most common cause is a port collision: **Proxmox Backup Server also uses 8007**. If you run both on one machine, re-run the installer and choose a different port.
+Since 1.13.0 the most common cause is the **Proxmox firewall**, not a port collision — see [The panel's port is not listening after installing](#the-panels-port-is-not-listening-after-installing) above. If you are on 8007 from an older install, note that **Proxmox Backup Server also uses 8007**; re-run the installer and choose another port.
 
 The panel serves TLS using the node's own certificate, so if you trust `:8006` in your browser you will trust this port too. On the default self-signed certificate you get the usual warning once per port.
 
@@ -1089,13 +1146,21 @@ Or, from a checkout:
 ```
 
 It removes the update script, the cron entry, the web control panel and its
-service, the apt hook, and the Proxmox UI patch — restoring `pvemanagerlib.js`
-byte for byte.
+service, the apt hook, the Proxmox firewall rule it added for the panel's port,
+and the Proxmox UI patch — restoring `pvemanagerlib.js` byte for byte. Only
+firewall rules carrying its own comment are touched; anything you added by hand
+is left alone.
 
-By default it **keeps** `/etc/proxmox-autoupdate.conf` (it holds your Mailgun
-API key) and `/var/log/proxmox-autoupdate/` (your update history). Pass
-`--purge` to delete both. Re-running `install.sh` afterwards reuses the kept
-config.
+It **asks** whether to delete `/etc/proxmox-autoupdate.conf` (which holds your
+notification credentials) and `/var/log/proxmox-autoupdate/` (your update
+history). Answer no and they are kept, and re-running `install.sh` afterwards
+offers to reuse them. `--purge` answers yes up front; `--yes` skips every
+prompt and therefore keeps them unless `--purge` is also given.
+
+> Before 1.13.0 there was no such question and `--purge` was the only way to
+> say yes — so an uninstall left the config behind, and the next install
+> opened with "Keep my current settings" for an install you had deliberately
+> removed.
 
 Two safety behaviours worth knowing:
 

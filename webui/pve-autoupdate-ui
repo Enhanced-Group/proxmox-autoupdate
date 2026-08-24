@@ -16,11 +16,13 @@ Standard library only — Proxmox ships Python 3 but no extra packages.
 import fcntl
 import html
 import io
+import ipaddress
 import json
 import os
 import re
 import shlex
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -36,8 +38,31 @@ from secrets import compare_digest, token_urlsafe
 
 # --- Paths and constants ------------------------------------------------------
 
-LISTEN_PORT = int(os.environ.get("PAU_UI_PORT", "8007"))
+# 8010 since 1.13.0: 8007 is Proxmox Backup Server's, which is a documented
+# co-install on a PVE host, so the old default collided with it. The unit's
+# drop-in sets PAU_UI_PORT from the config, so an existing install keeps
+# whatever port it is already on.
+LISTEN_PORT = int(os.environ.get("PAU_UI_PORT", "8010"))
 LISTEN_ADDR = os.environ.get("PAU_UI_ADDR", "0.0.0.0")
+
+# Bounds on a single connection, and the depth of the accept queue behind them.
+#
+# All three exist because of one bug: the TLS handshake used to run inside
+# accept(), on the only thread that accepts, with no deadline on it. A client
+# that completed the TCP connection and then sent no ClientHello blocked every
+# other connection for as long as it stayed open — and Chrome opens exactly
+# that connection when it speculatively pre-connects to a host:port, as does
+# any LAN port scanner. The panel answered on 127.0.0.1 and timed out in the
+# browser, which reads as a firewall and is impossible to tell apart from one.
+#
+# HANDSHAKE_TIMEOUT bounds how long a client may take to complete the
+# handshake, IDLE_TIMEOUT how long an established keep-alive connection may sit
+# without sending a request, and LISTEN_BACKLOG replaces socketserver's default
+# of 5 — small enough that a handful of half-open connections filled it and the
+# kernel dropped further SYNs, which also presents as a timeout, not a refusal.
+HANDSHAKE_TIMEOUT = 10
+IDLE_TIMEOUT = 65
+LISTEN_BACKLOG = 128
 
 UPDATE_SCRIPT = "/usr/local/bin/update-everything.sh"
 UI_PATCHER = "/usr/local/bin/pve-autoupdate-patch-webui"
@@ -208,6 +233,204 @@ def _v_public_url(v):
     return True
 
 
+
+# --- Changing the panel's own port ------------------------------------------
+#
+# The unit takes its port from a systemd drop-in, not from the config file, so
+# writing WEB_UI_PORT alone changes nothing until someone restarts the service
+# by hand. Doing it properly also means opening the new port in the Proxmox
+# firewall, closing the old one so a port with nothing behind it is not left
+# open, and re-pointing the toolbar button that is baked into
+# pvemanagerlib.js. All of it, or the setting is a trap.
+UI_SERVICE_DROPIN = "/etc/systemd/system/pve-autoupdate-ui.service.d/10-port.conf"
+UI_UNIT = "pve-autoupdate-ui.service"
+PORT_CHANGE_UNIT = "pve-autoupdate-portchange"
+FW_RULE_COMMENT = "proxmox-autoupdate panel"
+
+# Kept in step with UI_PORT_RESERVED in install.sh.
+RESERVED_UI_PORTS = {
+    1433, 1521, 2049, 3128, 3306, 3389, 5432, 6379, 8000, 8006, 8007, 8008,
+    8080, 8081, 8443, 8888, 9000, 9090, 10000, 11211, 27017,
+}
+
+
+def _port_in_use(port):
+    """Bind to it. Parsing `ss` is a second implementation to get wrong."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("0.0.0.0", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        probe.close()
+
+
+def ui_port_problem(value):
+    """Why this port cannot be used, or "" if it can."""
+    value = (value or "").strip()
+    if not value.isdigit():
+        return "not a number"
+    port = int(value)
+    # The port already in use is always allowed: it is the current one.
+    if port == LISTEN_PORT:
+        return ""
+    if port < 1024:
+        return "below 1024 - privileged, and reserved for well-known services"
+    if port > 65535:
+        return "above 65535 - not a port"
+    if 5900 <= port <= 5999:
+        return "inside 5900-5999, which Proxmox uses for VNC consoles"
+    if 60000 <= port <= 60050:
+        return "inside 60000-60050, which Proxmox uses for live migration"
+    if port in RESERVED_UI_PORTS:
+        if port == 8006:
+            return "the Proxmox web UI's own port"
+        if port == 8007:
+            return "Proxmox Backup Server's port"
+        return "a port another service commonly uses"
+    if _port_in_use(port):
+        return "already in use on this node"
+    return ""
+
+
+def _v_ui_port(v):
+    return ui_port_problem(v) == ""
+
+
+def _run(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _node_name():
+    res = _run(["hostname", "-s"], timeout=5)
+    if res and res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    return os.uname().nodename.split(".")[0]
+
+
+def _pve_firewall_on():
+    res = _run(["pve-firewall", "status"], timeout=10)
+    return bool(res and res.returncode == 0 and "enabled" in res.stdout.lower())
+
+
+def _node_addr_networks():
+    """[(address, network)] for every global IPv4 address on this node."""
+    out, seen = [], set()
+    res = _run(["ip", "-4", "-o", "addr", "show", "scope", "global"], timeout=10)
+    if not res or res.returncode != 0:
+        return out
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        for i, token in enumerate(parts):
+            if token != "inet" or i + 1 >= len(parts):
+                continue
+            cidr = parts[i + 1]
+            addr = cidr.partition("/")[0]
+            if addr.startswith("127.") or addr.startswith("169.254.") or addr in seen:
+                break
+            try:
+                network = str(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                break
+            seen.add(addr)
+            out.append((addr, network))
+            break
+    return out
+
+
+def _fw_rules():
+    res = _run(["pvesh", "get", "/nodes/%s/firewall/rules" % _node_name(),
+                "--output-format", "json"], timeout=20)
+    if not res or res.returncode != 0:
+        return []
+    try:
+        data = json.loads(res.stdout)
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _fw_close_port(port):
+    """Remove only our own rules for a port, highest position first.
+
+    Descending, because deleting a rule renumbers every rule below it.
+    """
+    positions = [r["pos"] for r in _fw_rules()
+                 if isinstance(r, dict)
+                 and r.get("comment") == FW_RULE_COMMENT
+                 and str(r.get("dport", "")) == str(port)
+                 and r.get("pos") is not None]
+    for pos in sorted(positions, reverse=True):
+        _run(["pvesh", "delete",
+              "/nodes/%s/firewall/rules/%s" % (_node_name(), pos)], timeout=20)
+    return len(positions)
+
+
+def _fw_open_port(port):
+    added = 0
+    node = _node_name()
+    for addr, network in _node_addr_networks():
+        res = _run(["pvesh", "create", "/nodes/%s/firewall/rules" % node,
+                    "--type", "in", "--action", "ACCEPT", "--proto", "tcp",
+                    "--dport", str(port), "--dest", addr, "--source", network,
+                    "--enable", "1", "--comment", FW_RULE_COMMENT], timeout=20)
+        if res and res.returncode == 0:
+            added += 1
+    return added
+
+
+def apply_ui_port(new_port):
+    """Move the panel to a new port. Returns (ok, detail)."""
+    new_port = int(new_port)
+    old_port = LISTEN_PORT
+    if new_port == old_port:
+        return True, ""
+
+    try:
+        os.makedirs(os.path.dirname(UI_SERVICE_DROPIN), exist_ok=True)
+        with open(UI_SERVICE_DROPIN, "w") as handle:
+            handle.write("# Managed by the proxmox-autoupdate panel. Safe to edit.\n"
+                         "[Service]\nEnvironment=PAU_UI_PORT=%d\n" % new_port)
+        os.chmod(UI_SERVICE_DROPIN, 0o644)
+    except OSError as exc:
+        return False, "could not write %s (%s)" % (UI_SERVICE_DROPIN, exc)
+
+    res = _run(["systemctl", "daemon-reload"], timeout=30)
+    if not res or res.returncode != 0:
+        return False, "systemctl daemon-reload failed"
+
+    notes = []
+    if _pve_firewall_on():
+        opened = _fw_open_port(new_port)
+        closed = _fw_close_port(old_port)
+        if opened:
+            notes.append("opened %d firewall rule(s) for %d" % (opened, new_port))
+        else:
+            notes.append("WARNING: no firewall rule could be added for %d, so the "
+                         "panel may be unreachable on it" % new_port)
+        if closed:
+            notes.append("removed %d stale rule(s) for %d" % (closed, old_port))
+
+    if os.path.isfile(UI_PATCHER):
+        res = _run([UI_PATCHER, "apply", "--quiet"], timeout=60)
+        if not res or res.returncode != 0:
+            notes.append("WARNING: the toolbar button still points at %d - run "
+                         "'pve-autoupdate-patch-webui apply' on the node" % old_port)
+
+    # Detached and delayed, so this response is delivered before the socket
+    # serving it goes away.
+    ok, detail = run_detached("sleep 3; systemctl restart %s" % UI_UNIT,
+                              PORT_CHANGE_UNIT)
+    if not ok:
+        return False, ("everything is in place but the restart could not be "
+                       "started (%s) - run 'systemctl restart %s'" % (detail, UI_UNIT))
+    return True, "; ".join(notes)
+
+
 def _v_schedules(v):
     """';'-separated '<cron>|<yes|no>|<label>' entries, or empty.
 
@@ -366,6 +589,7 @@ EDITABLE_KEYS = {
     "LOG_RETENTION_DAYS": _v_int,
     "UPDATE_SCHEDULE_CRON": _v_cron,
     "UPDATE_SCHEDULES": _v_schedules,
+    "WEB_UI_PORT": _v_ui_port,
     "WEB_UI_PUBLIC_URL": _v_public_url,
     "REBOOT_TIME": _v_time,
 }
@@ -1656,7 +1880,12 @@ def parse_schedules(raw, legacy_cron=""):
         entry = entry.strip()
         if not entry:
             continue
-        parts = entry.split("|")
+        # Split at most twice, so a label that still contains a separator is
+        # kept whole rather than truncated at the first one. format_schedules
+        # strips separators on the way out, but a hand-edited config can carry
+        # them in - and the shell parser keeps everything after the second
+        # pipe, so anything else here is a disagreement.
+        parts = entry.split("|", 2)
         cron = parts[0].strip()
         if not cron:
             continue
@@ -1742,10 +1971,19 @@ def safe_log_path(name):
     """Resolve a log name to a path inside the log directory, or None if it escapes."""
     if not name or "/" in name or "\\" in name or name.startswith("."):
         return None
-    path = os.path.realpath(os.path.join(resolve_log_dir(), name))
-    if os.path.dirname(path) != os.path.realpath(resolve_log_dir()):
+    # A NUL in the name makes the path calls below raise ValueError rather than
+    # return anything, and an uncaught one here is a dropped request and a
+    # traceback in the journal instead of a clean rejection. Everything that
+    # cannot be a path is simply not a log name.
+    if chr(0) in name:
         return None
-    return path if os.path.isfile(path) else None
+    try:
+        path = os.path.realpath(os.path.join(resolve_log_dir(), name))
+        if os.path.dirname(path) != os.path.realpath(resolve_log_dir()):
+            return None
+        return path if os.path.isfile(path) else None
+    except (ValueError, OSError):
+        return None
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\r")
@@ -1753,6 +1991,101 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\r")
 
 def strip_ansi(text):
     return ANSI_RE.sub("", text)
+
+
+
+# --- Snapshots ----------------------------------------------------------------
+#
+# update-everything.sh creates "autoupdate_<YYYYMMDD>_<HHMMSS>" before updating
+# a guest, and prunes its own to SNAPSHOT_KEEP. Only names matching that exact
+# shape are ever offered for deletion here: a snapshot somebody took by hand is
+# listed for context - so the counts on screen are the truth about the node -
+# and refused if it is ever asked for.
+SNAPSHOT_PREFIX = "autoupdate"
+OURS_RE = re.compile(r"\Aautoupdate_\d{8}_\d{6}\Z")
+
+
+def _snap_api_path(node, vmid, kind):
+    return "/nodes/%s/%s/%s/snapshot" % (node, "lxc" if kind == "lxc" else "qemu", vmid)
+
+
+def list_snapshots():
+    """Snapshots per guest: [{vmid, name, type, node, snapshots: [...]}].
+
+    Proxmox does not report a per-snapshot size through this API - what a
+    snapshot costs is a property of the storage (ZFS, LVM-thin, qcow2), not of
+    the snapshot object. Rather than invent a figure, size is reported as
+    unknown and the UI says why.
+    """
+    guests, err = list_guests()
+    if err:
+        return [], err
+
+    out = []
+    for guest in guests:
+        node = guest.get("node") or _node_name()
+        path = _snap_api_path(node, guest["vmid"], guest["type"])
+        res = _run(["pvesh", "get", path, "--output-format", "json"], timeout=20)
+        if not res or res.returncode != 0:
+            # A guest whose snapshots cannot be read is reported as such, not
+            # silently shown as having none.
+            out.append(dict(guest, snapshots=None,
+                            error=(res.stderr.strip() if res else "pvesh did not run")))
+            continue
+        try:
+            raw = json.loads(res.stdout)
+        except ValueError:
+            out.append(dict(guest, snapshots=None, error="unreadable snapshot list"))
+            continue
+
+        snaps = []
+        for item in raw if isinstance(raw, list) else []:
+            name = item.get("name") or ""
+            # "current" is the running state, not a snapshot.
+            if not name or name == "current":
+                continue
+            snaps.append({
+                "name": name,
+                "ours": bool(OURS_RE.match(name)),
+                "snaptime": item.get("snaptime"),
+                "description": (item.get("description") or "").strip(),
+                "parent": item.get("parent") or "",
+            })
+        snaps.sort(key=lambda x: x.get("snaptime") or 0)
+        out.append(dict(guest, snapshots=snaps, error=None))
+    return out, None
+
+
+def delete_snapshots(targets):
+    """Delete only snapshots this tool created. Returns (deleted, failures).
+
+    Every name is re-checked here rather than trusted from the request: the
+    client is the wrong place to enforce which snapshots may be destroyed.
+    """
+    deleted, failures = [], []
+    known = {g["vmid"]: g for g in (list_guests()[0] or [])}
+    for target in targets:
+        vmid = str(target.get("vmid", ""))
+        name = str(target.get("name", ""))
+        guest = known.get(vmid)
+        if guest is None:
+            failures.append({"vmid": vmid, "name": name, "error": "no such guest"})
+            continue
+        if not OURS_RE.match(name):
+            failures.append({"vmid": vmid, "name": name,
+                             "error": "not a snapshot created by this tool"})
+            continue
+        node = guest.get("node") or _node_name()
+        res = _run(["pvesh", "delete",
+                    "%s/%s" % (_snap_api_path(node, vmid, guest["type"]), name)],
+                   timeout=60)
+        if res and res.returncode == 0:
+            deleted.append({"vmid": vmid, "name": name})
+        else:
+            failures.append({"vmid": vmid, "name": name,
+                             "error": (res.stderr.strip() if res else "pvesh did not run")
+                                      or "delete failed"})
+    return deleted, failures
 
 
 # --- Authentication -----------------------------------------------------------
@@ -1875,6 +2208,13 @@ def check_csrf(token, user):
 class Handler(BaseHTTPRequestHandler):
     server_version = "ProxmoxAutoUpdateUI/1.0"
     protocol_version = "HTTP/1.1"
+    # HTTP/1.1 means keep-alive, so a browser leaves the connection open
+    # after a response. Without a timeout the read for the next request line
+    # blocks forever and the thread behind it is never freed. Applied by
+    # StreamRequestHandler.setup(); it bounds individual socket operations,
+    # not how long a handler may take, so the slow endpoints that shell out
+    # for up to three minutes are unaffected.
+    timeout = IDLE_TIMEOUT
 
     # -- plumbing --
 
@@ -1884,7 +2224,7 @@ class Handler(BaseHTTPRequestHandler):
     def _allowed_origin(self):
         """Echo the Origin back only when it is this same host on another port.
 
-        The Proxmox UI runs on :8006 and this panel on :8007, so the status dot
+        The Proxmox UI runs on :8006 and this panel on its own port, so the status dot
         is a cross-origin credentialed request. Credentialed CORS forbids '*',
         and reflecting arbitrary origins would let any site read run status
         using the visitor's cookie — so the hostname must match exactly.
@@ -2016,6 +2356,21 @@ class Handler(BaseHTTPRequestHandler):
             token = issue_csrf(user)
             self._send(200, render_guest_page(user, token, vmid, name),
                        "text/html; charset=utf-8")
+        elif path == "/api/snapshots":
+            snaps, err = list_snapshots()
+            if err:
+                self._json(500, {"error": "Could not list snapshots: %s" % err})
+                return
+            ours = sum(len([x for x in (g["snapshots"] or []) if x["ours"]]) for g in snaps)
+            other = sum(len([x for x in (g["snapshots"] or []) if not x["ours"]]) for g in snaps)
+            self._json(200, {"guests": snaps, "ours": ours, "other": other})
+        elif path == "/api/schedules":
+            # A read, and the page fetches it with GET. It used to be registered
+            # under do_POST only, so loadSchedules() got a 404 and the Schedule
+            # tab showed "Not found" with no schedules listed at all - the whole
+            # screen was dead, and nothing in CI or the config-parity checks
+            # looks at which HTTP method serves a route.
+            self._json(200, {"schedules": current_schedules()})
         elif path == "/api/guests":
             guests, err = list_guests()
             if err:
@@ -2221,12 +2576,12 @@ class Handler(BaseHTTPRequestHandler):
             self._run_guest(body, user)
         elif path == "/api/exclusions":
             self._save_exclusions(body)
+        elif path == "/api/snapshots/delete":
+            self._delete_snapshots(body, user)
         elif path == "/api/config":
             self._save_config(body)
         elif path == "/api/theme":
             self._save_theme(body)
-        elif path == "/api/schedules":
-            self._json(200, {"schedules": current_schedules()})
         elif path == "/api/schedule":
             self._save_schedule(body)
         elif path == "/api/notify/test":
@@ -2407,6 +2762,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, {"started": True, "log": detail, "dry_run": dry, "vmid": vmid})
 
+    def _delete_snapshots(self, body, user):
+        targets = body.get("targets")
+        if not isinstance(targets, list) or not targets:
+            self._json(400, {"error": "Nothing selected."})
+            return
+        if len(targets) > 500:
+            self._json(400, {"error": "Too many snapshots in one request."})
+            return
+        # Deleting more than one at a time is typed, not clicked - the same bar
+        # as a full update run and as uninstalling.
+        if len(targets) > 1 and str(body.get("confirm", "")).strip() != "DELETE":
+            self._json(400, {"error": 'Type DELETE to remove more than one snapshot.'})
+            return
+        deleted, failures = delete_snapshots(targets)
+        sys.stderr.write("[ui] %s deleted %d snapshot(s), %d failed\n"
+                         % (user, len(deleted), len(failures)))
+        self._json(200, {"deleted": deleted, "failures": failures})
+
     def _save_exclusions(self, body):
         ids = body.get("excluded")
         if not isinstance(ids, list):
@@ -2498,7 +2871,13 @@ class Handler(BaseHTTPRequestHandler):
             if key in SENSITIVE_KEYS and set(value) == {"*"}:
                 continue
             if not EDITABLE_KEYS[key](value):
-                errors.append("%s: invalid value" % key)
+                # "invalid value" for a port is useless: the whole point is
+                # which of eight rules it broke.
+                if key == "WEB_UI_PORT":
+                    errors.append("WEB_UI_PORT: %s" % (ui_port_problem(value)
+                                                       or "invalid value"))
+                else:
+                    errors.append("%s: invalid value" % key)
                 continue
             updates[key] = value
 
@@ -2511,6 +2890,45 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "Could not write config: %s" % exc})
             return
 
+        # Moving the panel's own port touches the drop-in, the firewall, the
+        # toolbar button and this very service. Done after write_config(), so
+        # the patcher below reads the new value.
+        notice = ""
+        if "WEB_UI_PORT" in updates and int(updates["WEB_UI_PORT"]) != LISTEN_PORT:
+            moved_to = int(updates["WEB_UI_PORT"])
+            ok, detail = apply_ui_port(moved_to)
+            if not ok:
+                self._json(500, {"error": "The port was saved to the config but not "
+                                          "applied: %s" % detail})
+                return
+            notice = ("Moving to port %d. This service restarts in a few seconds, so "
+                      "this page will stop responding - reopen the panel on the new "
+                      "port. Hard-refresh the Proxmox UI (Ctrl+Shift+R) so the toolbar "
+                      "button picks it up, and note that a self-signed certificate has "
+                      "to be trusted again for a new port." % moved_to)
+            if detail:
+                notice += " [" + detail + "]"
+
+        # The panel's external address is baked into pvemanagerlib.js by the
+        # patcher, not read live. Writing the config alone would leave the
+        # toolbar button pointing at the old address, which is a setting that
+        # appears to save and silently does nothing -- and the reason this was
+        # a config-file-only setting was that it needed a shell to apply.
+        if "WEB_UI_PUBLIC_URL" in updates and os.path.isfile(UI_PATCHER):
+            try:
+                res = subprocess.run([UI_PATCHER, "apply", "--quiet"],
+                                     capture_output=True, text=True, timeout=30)
+                if res.returncode != 0:
+                    self._json(500, {
+                        "error": "Config saved, but the toolbar button could not be "
+                                 "re-applied: %s" % (res.stderr or res.stdout or
+                                                     "exit %d" % res.returncode)})
+                    return
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._json(500, {"error": "Config saved, but re-applying the toolbar "
+                                          "button failed: %s" % exc})
+                return
+
         # The cron expression lives in both the config and the crontab.
         if "UPDATE_SCHEDULE_CRON" in updates:
             try:
@@ -2520,7 +2938,7 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 self._json(500, {"error": "Config saved, but crontab update failed: %s" % exc})
                 return
-        self._json(200, {"saved": sorted(updates)})
+        self._json(200, {"saved": sorted(updates), "notice": notice})
 
     def _save_schedule(self, body):
         # Accepts either a list of schedules, or the single "cron" key an older
@@ -2934,6 +3352,20 @@ SHARED_CSS = r"""  .sched-row {
   .sub { color: var(--muted); margin-bottom: 16px; font-size: 12px; }
   .card { background: var(--panel); border: 1px solid var(--border);
           border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+
+  /* Group heading inside the configuration form. Spans the grid so the two
+     columns below it start clean. */
+  .field-group { grid-column: 1 / -1; margin: 14px 0 2px; font-size: 11px;
+                 text-transform: uppercase; letter-spacing: .08em;
+                 color: var(--muted); border-bottom: 1px solid var(--border);
+                 padding-bottom: 6px; }
+  .field-group:first-child { margin-top: 0; }
+
+  /* Keyboard focus was never styled, so it fell back to whatever the browser
+     draws - which on this dark panel is often a thin ring with almost no
+     contrast against the surface it sits on. */
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px;
+                   border-radius: 3px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   button { font: inherit; padding: 7px 14px; border-radius: 4px;
            border: 1px solid var(--border); background: var(--btn);
@@ -3056,7 +3488,7 @@ SHARED_CSS = r"""  .sched-row {
   button.preset { padding: 5px 10px; font-size: 12px; }
 
   /* --- Dialogs -------------------------------------------------------------
-     Browser confirm()/prompt() render as "An embedded page at host:8007 says",
+     Browser confirm()/prompt() render as "An embedded page at host:8010 says",
      which looks nothing like Proxmox and announces the iframe. These match the
      ExtJS dialogs instead. */
   .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.55);
@@ -3216,6 +3648,21 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div id="runProgress" class="progress"><div></div></div>
   </div>
   <div class="card">
+    <h2>Guests</h2>
+    <div class="hint" style="margin-bottom:10px">
+      <strong>Update…</strong> opens that guest on its own: check what is
+      pending, or update just it, without touching anything else. Works for a
+      guest the schedule skips.
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th style="width:70px">ID</th><th class="wrap">Name</th>
+      <th style="width:80px">Type</th><th style="width:90px">Status</th>
+      <th style="width:104px">Action</th></tr></thead>
+      <tbody id="runGuestList"><tr><td colspan="5">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <div class="card">
     <h2>Live output <span id="liveTag" class="pill run hidden">live</span>
       <span id="runTimer" class="hint hidden" style="margin:0"></span>
       <span id="logSource" class="hint" style="margin:0"></span></h2>
@@ -3233,6 +3680,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
           aria-controls="tab-schedule" tabindex="-1">Schedule</button>
   <button data-tab="notify" role="tab" aria-selected="false"
           aria-controls="tab-notify" tabindex="-1">Notifications</button>
+  <button data-tab="snapshots" role="tab" aria-selected="false"
+          aria-controls="tab-snapshots" tabindex="-1">Snapshots</button>
   <button data-tab="config" role="tab" aria-selected="false"
           aria-controls="tab-config" tabindex="-1">Configuration</button>
 </div>
@@ -3242,6 +3691,11 @@ PAGE_TEMPLATE = r"""<!doctype html>
   <div id="unsaved-exclusions" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="exclusions">Discard them</button></div>
   <div class="card">
     <h2>Guests excluded from scheduled updates</h2>
+      <div class="hint" style="margin-bottom:10px">
+        Ticked guests are skipped by scheduled runs. To update one guest on its
+        own — including one that is skipped here — use <strong>Guests</strong> on
+        the Run tab.
+      </div>
     <div class="hint" style="margin-bottom:10px">
       Ticked guests are skipped by the scheduled run. You can still update an
       excluded guest by hand with its <strong>Update Now</strong> button in the
@@ -3538,6 +3992,41 @@ PAGE_TEMPLATE = r"""<!doctype html>
 </section>
 
 <!-- CONFIG -->
+<section id="tab-snapshots" class="hidden">
+  <div class="card">
+    <h2>Snapshots taken before updates</h2>
+    <div class="hint" style="margin-bottom:10px">
+      With <strong>Snapshot before update</strong> on, a snapshot named
+      <code>autoupdate_&lt;date&gt;_&lt;time&gt;</code> is taken before each guest is
+      updated, and this tool prunes its own to <strong>Snapshots to keep</strong>.
+      Only those are listed as removable here — anything you took by hand is shown
+      for context and cannot be deleted from this page.
+    </div>
+    <div class="hint" style="margin-bottom:10px">
+      Proxmox does not report what a snapshot costs on disk: that belongs to the
+      storage layer (ZFS, LVM-thin, qcow2), not to the snapshot. Check usage on
+      the storage itself rather than trusting a number invented here.
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <button id="btnReloadSnaps">Reload</button>
+      <span id="snapSummary" class="hint" style="margin:0"></span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr>
+        <th style="width:44px">Del</th><th style="width:70px">Guest</th>
+        <th class="wrap">Snapshot</th><th style="width:150px">Taken</th>
+        <th class="wrap">Description</th>
+      </tr></thead>
+      <tbody id="snapList"><tr><td colspan="5">Loading…</td></tr></tbody>
+    </table></div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnDeleteSnaps" class="danger">Delete selected…</button>
+      <span id="snapSelCount" class="hint" style="margin:0"></span>
+    </div>
+    <div id="snapMsg" class="msg"></div>
+  </div>
+</section>
+
 <section id="tab-config" class="hidden">
   <div id="unsaved-config" class="unsaved hidden">You have unsaved changes on this tab.<button type="button" class="linkish" data-discard="config">Discard them</button></div>
   <div class="card">
@@ -3633,6 +4122,11 @@ PAGE_TEMPLATE = r"""<!doctype html>
   <div class="card">
     <h2>Past reports</h2>
     <div class="row" style="margin-bottom:10px">
+      <input id="logFilter" type="search" placeholder="Filter by file name…"
+             aria-label="Filter the log list by file name" style="max-width:280px">
+      <span id="logFilterCount" class="hint" style="margin:0"></span>
+    </div>
+    <div class="row" style="margin-bottom:10px">
       <a id="btnDownloadAll" class="btnlink"
          href="{{BASE}}/api/log/download?name=all"
          download="proxmox-autoupdate-logs.tar.gz">Download all as .tar.gz</a>
@@ -3647,6 +4141,12 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <h2>Selected log <span id="logFileName" class="hint" style="margin:0"></span></h2>
     <div class="row" style="margin-bottom:8px">
       <a id="btnDownloadOne" class="btnlink hidden" href="#" download>Download this log</a>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <input id="logSearch" type="search" placeholder="Search in this log…"
+             aria-label="Search within the selected log" style="max-width:280px"
+             disabled>
+      <span id="logSearchCount" class="hint" style="margin:0"></span>
     </div>
     <pre id="logFile">Select a log above.</pre>
   </div>
@@ -3747,6 +4247,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div id="confirmMsg" class="msg"></div>
   </div>
 
+  </div>
+
   <div class="card">
     <h2>Recent runs</h2>
     <div class="table-wrap"><table>
@@ -3789,6 +4291,11 @@ const CSRF = "{{CSRF}}";
 // What is left here is the set of settings with no dedicated screen of their
 // own — including three added in 1.0.0 that had no UI at all.
 const FIELDS = [
+  // A single-element entry is a group heading, not a setting. Fourteen
+  // unrelated fields in one flat column meant the panel's own port sat
+  // directly below "Snapshots to keep", and nothing said where one subject
+  // ended and the next began.
+  ["— Guest update timeouts"],
   ["WINDOWS_UPDATE_TIMEOUT",  "Windows update timeout (s)",   "number",
    "How long a Windows guest gets to install updates. Cumulative updates often need more than an hour."],
   ["WINDOWS_SHUTDOWN_TIMEOUT","Windows shutdown wait (s)",    "number",
@@ -3801,14 +4308,22 @@ const FIELDS = [
    "How long apt waits for the dpkg lock inside a guest. Ubuntu's unattended-upgrades holds it regularly."],
   ["AGENT_ERROR_GRACE",       "Guest agent grace (s)",        "number",
    "How long guest-agent errors are tolerated mid-update. A guest upgrading its own agent restarts it."],
+  ["— Stopped guests"],
   ["START_STOPPED_LXC",       "Start stopped containers",     "select", ["true", "false"]],
   ["START_STOPPED_LINUX_VMS", "Start stopped Linux VMs",      "select", ["true", "false"]],
   ["START_STOPPED_WINDOWS",   "Start stopped Windows VMs",    "select", ["true", "false"]],
+  ["— Snapshots"],
   ["SNAPSHOT_BEFORE_UPDATE",  "Snapshot before update",       "select", ["true", "false"],
    "Needs snapshot-capable storage (ZFS, LVM-thin, qcow2)."],
   ["SNAPSHOT_KEEP",           "Snapshots to keep",            "number"],
+  ["— This node"],
   ["PAU_TZ",                  "Timezone",                     "text",
    "Leave empty to use this host's own timezone. Affects timestamps and the reboot time."],
+  ["— This panel"],
+  ["WEB_UI_PORT",             "Panel port",                   "number",
+   "The port this panel listens on. Changing it rewrites the service's systemd drop-in, opens the new port in the Proxmox firewall and closes the old one, re-points the toolbar button, then restarts this service - so this page will stop responding and has to be reopened on the new port. Ports below 1024, ports already in use, and common service ports (8006, 8007, 3128, 8080, 5900-5999, 60000-60050) are refused."],
+  ["WEB_UI_PUBLIC_URL",       "Panel address (external)",     "text",
+   "Leave empty unless you reach Proxmox through a reverse proxy or tunnel — Cloudflare Tunnel, nginx, Traefik, Tailscale. Those forward the Proxmox port and nothing else, so the toolbar button would point at a port your browser cannot open. Publish this panel through the same proxy and give its address here, e.g. https://panel.example.com. A path is allowed (https://proxmox.example.com/pau) and mounts the panel under it. Saving re-applies the toolbar button for you."],
 ];
 
 {{JS}}
@@ -3819,13 +4334,15 @@ const FIELDS = [
 // Notifications and Configuration are all "set this up once", so they live
 // together under Settings, while Overview and Logs are the day-to-day.
 const TOP_TABS = ["run", "settings", "logs", "maint"];
-const SUB_TABS = ["exclusions", "schedule", "notify", "config"];
+const SUB_TABS = ["exclusions", "schedule", "notify", "snapshots", "config"];
 
 function loadFor(name) {
+  if (name === "run")        { loadRunGuests(); }
   if (name === "logs")       { loadLogList(); loadLogCfg(); }
   if (name === "exclusions") { loadGuests(); }
   if (name === "schedule")   { loadSchedules(); }
   if (name === "notify")     { loadNotify(); }
+  if (name === "snapshots")  { loadSnapshots(); }
   if (name === "config")     { loadConfig(); }
   if (name === "maint")      { loadMaint(); }
 }
@@ -4421,6 +4938,7 @@ async function loadGuests() {
         if (val === "stopped") cell.style.color = "var(--muted)";
         tr.appendChild(cell);
       });
+
       tbody.appendChild(tr);
     });
     updateExclCount();
@@ -4789,6 +5307,14 @@ function buildConfigForm(cfg, sensitive) {
   const form = $("configForm");
   form.innerHTML = "";
   FIELDS.forEach(([key, label, type, optionsOrHint, maybeHint]) => {
+    // A group heading: no key, no input, just a divider with a name on it.
+    if (label === undefined) {
+      const head = document.createElement("div");
+      head.className = "field-group";
+      head.textContent = key.replace(/^\u2014\s*/, "");
+      form.appendChild(head);
+      return;
+    }
     // The fourth element is the option list for a select and the help text for
     // anything else; a select can carry help text in the fifth.
     const isSelect = type === "select";
@@ -4851,8 +5377,237 @@ $("btnSaveConfig").onclick = async () => {
   try {
     const res = await post("/api/config", {config: cfg});
     markClean("config");
-    msg($("configMsg"), "Saved: " + res.saved.join(", "), true);
+    // A port change says something the user has to act on, so it replaces the
+    // usual "Saved: ..." rather than scrolling past above it.
+    msg($("configMsg"), res.notice || ("Saved: " + res.saved.join(", ")), true);
   } catch (e) { msg($("configMsg"), e.message, false); }
+};
+
+// --- log filtering and search ------------------------------------------------
+// Ninety days of retention is the default, so the list is long by design, and a
+// single run prints a block per guest. Both needed a way in.
+function applyLogFilter() {
+  const q = ($("logFilter").value || "").trim().toLowerCase();
+  const rows = Array.from($("logList").querySelectorAll("tr"));
+  let shown = 0;
+  rows.forEach((tr) => {
+    // The placeholder row has no name cell to match on; leave it alone.
+    const nameCell = tr.querySelector("td.wrap");
+    if (!nameCell) { return; }
+    const hit = !q || nameCell.textContent.toLowerCase().indexOf(q) !== -1;
+    tr.classList.toggle("hidden", !hit);
+    if (hit) shown++;
+  });
+  $("logFilterCount").textContent =
+    q ? shown + " of " + rows.filter((r) => r.querySelector("td.wrap")).length + " shown" : "";
+}
+
+// The whole log is already in the browser, so searching it is a string match
+// rather than another request. Rebuilt as text nodes plus <mark>, never
+// innerHTML: this content came off the filesystem and includes guest output.
+let LOG_TEXT = "";
+
+function applyLogSearch() {
+  const pre = $("logFile");
+  const q = ($("logSearch").value || "");
+  if (!LOG_TEXT) { $("logSearchCount").textContent = ""; return; }
+  if (!q) {
+    pre.textContent = LOG_TEXT;
+    $("logSearchCount").textContent = "";
+    return;
+  }
+  const needle = q.toLowerCase();
+  const hay = LOG_TEXT.toLowerCase();
+  pre.textContent = "";
+  let from = 0, hits = 0, first = null;
+  for (;;) {
+    const at = hay.indexOf(needle, from);
+    if (at === -1) { break; }
+    pre.appendChild(document.createTextNode(LOG_TEXT.slice(from, at)));
+    const mark = document.createElement("mark");
+    mark.textContent = LOG_TEXT.slice(at, at + q.length);
+    pre.appendChild(mark);
+    if (!first) first = mark;
+    hits++;
+    from = at + q.length;
+    if (hits > 5000) { break; }   // a runaway search must not hang the page
+  }
+  pre.appendChild(document.createTextNode(LOG_TEXT.slice(from)));
+  $("logSearchCount").textContent =
+    hits ? hits + (hits > 5000 ? "+" : "") + " match" + (hits === 1 ? "" : "es") : "no matches";
+  if (first && first.scrollIntoView) { first.scrollIntoView({block: "center"}); }
+}
+
+$("logFilter").oninput = applyLogFilter;
+$("logSearch").oninput = applyLogSearch;
+
+// --- guests, on the Run tab --------------------------------------------------
+// The only list of guests used to live under Settings → Exclusions, so the
+// per-guest page was reachable only by going into a settings screen about
+// something else. Running one guest is a run.
+async function loadRunGuests() {
+  const tbody = $("runGuestList");
+  try {
+    const data = await api("/api/guests");
+    tbody.innerHTML = "";
+    if (!data.guests.length) {
+      tbody.innerHTML = "<tr><td colspan='5'>No guests found.</td></tr>";
+      return;
+    }
+    data.guests.forEach((g) => {
+      const tr = document.createElement("tr");
+      [g.vmid, g.name, g.type === "lxc" ? "LXC" : "VM", g.status].forEach((val) => {
+        const cell = document.createElement("td");
+        cell.textContent = val;
+        if (val === "stopped") cell.style.color = "var(--muted)";
+        tr.appendChild(cell);
+      });
+      if (g.excluded) {
+        tr.children[1].appendChild(document.createTextNode(" "));
+        const tag = document.createElement("span");
+        tag.className = "pill idle";
+        tag.textContent = "skipped";
+        tag.title = "Excluded from scheduled runs";
+        tr.children[1].appendChild(tag);
+      }
+      const actionCell = document.createElement("td");
+      const link = document.createElement("a");
+      // BASE, not a bare "/guest": with a path in WEB_UI_PUBLIC_URL the panel
+      // is mounted under a prefix, and an absolute link would leave it.
+      link.href = BASE + "/guest?vmid=" + encodeURIComponent(g.vmid) +
+                  "&name=" + encodeURIComponent(g.name || "");
+      link.textContent = "Update\u2026";
+      link.className = "btnlink";
+      link.title = "Check or update " + (g.name || g.vmid) + " on its own";
+      actionCell.appendChild(link);
+      tr.appendChild(actionCell);
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    tbody.innerHTML = "<tr><td colspan='5'>" + e.message + "</td></tr>";
+  }
+}
+
+// --- snapshots ---------------------------------------------------------------
+// Only snapshots this tool created may be selected. The others are rendered so
+// the totals on screen describe the node honestly, but without a checkbox -
+// this page has no business deleting a restore point somebody made by hand.
+let SNAP_ROWS = [];
+
+function snapWhen(epoch) {
+  if (!epoch) return "unknown";
+  const d = new Date(epoch * 1000);
+  return d.toLocaleString();
+}
+
+function updateSnapSelCount() {
+  const n = document.querySelectorAll("#snapList input[type=checkbox]:checked").length;
+  $("snapSelCount").textContent = n ? n + " selected" : "";
+  $("btnDeleteSnaps").disabled = n === 0;
+}
+
+async function loadSnapshots() {
+  setTimeout(() => markClean('snapshots'), 0);
+  const tbody = $("snapList");
+  try {
+    const data = await api("/api/snapshots");
+    SNAP_ROWS = [];
+    tbody.innerHTML = "";
+    let rows = 0;
+    (data.guests || []).forEach((g) => {
+      if (g.snapshots === null) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 5;
+        td.textContent = g.vmid + " (" + g.name + ") — could not read snapshots: " +
+                         (g.error || "unknown error");
+        td.style.color = "var(--warn)";
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        rows++;
+        return;
+      }
+      (g.snapshots || []).forEach((snap) => {
+        rows++;
+        const tr = document.createElement("tr");
+
+        const cbCell = document.createElement("td");
+        if (snap.ours) {
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.style.width = "auto";
+          box.dataset.vmid = g.vmid;
+          box.dataset.name = snap.name;
+          box.onchange = updateSnapSelCount;
+          cbCell.appendChild(box);
+          SNAP_ROWS.push({vmid: g.vmid, name: snap.name});
+        } else {
+          cbCell.textContent = "—";
+          cbCell.style.color = "var(--muted)";
+          cbCell.title = "Not created by this tool";
+        }
+        tr.appendChild(cbCell);
+
+        [g.vmid + " " + (g.name || ""), snap.name, snapWhen(snap.snaptime),
+         snap.description || ""].forEach((val) => {
+          const cell = document.createElement("td");
+          cell.textContent = val;
+          if (!snap.ours) cell.style.color = "var(--muted)";
+          tr.appendChild(cell);
+        });
+        tbody.appendChild(tr);
+      });
+    });
+    if (!rows) {
+      tbody.innerHTML = "<tr><td colspan='5'>No snapshots on any guest.</td></tr>";
+    }
+    $("snapSummary").textContent =
+      data.ours + " taken by this tool, " + data.other + " taken elsewhere";
+    updateSnapSelCount();
+  } catch (e) {
+    tbody.innerHTML = "<tr><td colspan='5'>" + e.message + "</td></tr>";
+  }
+}
+
+$("btnReloadSnaps").onclick = loadSnapshots;
+
+$("btnDeleteSnaps").onclick = async () => {
+  const targets = Array.from(
+    document.querySelectorAll("#snapList input[type=checkbox]:checked")
+  ).map((el) => ({vmid: el.dataset.vmid, name: el.dataset.name}));
+  if (!targets.length) return;
+
+  const many = targets.length > 1;
+  const go = await dialog({
+    title: "Delete " + targets.length + " snapshot" + (many ? "s" : ""),
+    message:
+      "This removes " + (many ? "these snapshots" : "this snapshot") +
+      " permanently. The guests themselves are untouched, but you lose the " +
+      "restore point" + (many ? "s" : "") + ":<br><br><pre style=\"white-space:pre-wrap\">" +
+      targets.map((t) => t.vmid + "  " + t.name).join("\n") + "</pre>",
+    okText: "Delete", danger: true,
+    // The dialog renders its own "Type DELETE to confirm" label and gates OK
+    // on it, so more than one at a time is typed rather than clicked.
+    requireText: many ? "DELETE" : null,
+  });
+  if (!go) return;
+
+  try {
+    const res = await post("/api/snapshots/delete",
+                           many ? {targets: targets, confirm: "DELETE"}
+                                : {targets: targets});
+    const okN = (res.deleted || []).length;
+    const bad = res.failures || [];
+    if (bad.length) {
+      msg($("snapMsg"),
+          "Removed " + okN + ". Failed: " +
+          bad.map((f) => f.vmid + "/" + f.name + " (" + f.error + ")").join("; "),
+          false);
+    } else {
+      msg($("snapMsg"), "Removed " + okN + " snapshot" + (okN === 1 ? "" : "s") + ".", true);
+    }
+    loadSnapshots();
+  } catch (e) { msg($("snapMsg"), e.message, false); }
 };
 
 // --- appearance ---
@@ -4964,6 +5719,7 @@ async function loadLogList() {
     tbody.innerHTML = "";
     if (!data.logs.length) {
       tbody.innerHTML = "<tr><td colspan='4'>No logs yet. They appear here after the first run.</td></tr>";
+      $("logFilterCount").textContent = "";
       return;
     }
     data.logs.forEach((entry) => {
@@ -4995,6 +5751,9 @@ async function loadLogList() {
       tr.append(nameCell, whenCell, sizeCell, dlCell);
       tbody.appendChild(tr);
     });
+    // Re-apply whatever is typed in the filter: the list is rebuilt on every
+    // load, and without this a reload silently un-filters it.
+    applyLogFilter();
   } catch (e) { $("logList").innerHTML = "<tr><td>" + e.message + "</td></tr>"; }
 }
 
@@ -5013,8 +5772,16 @@ async function showLog(name) {
       offset = data.offset;
       if (data.eof) break;
     }
-    $("logFile").textContent = text || "(empty)";
-  } catch (e) { $("logFile").textContent = e.message; }
+    LOG_TEXT = text || "(empty)";
+    $("logFile").textContent = LOG_TEXT;
+    $("logSearch").disabled = false;
+    applyLogSearch();
+  } catch (e) {
+    LOG_TEXT = "";
+    $("logSearch").disabled = true;
+    $("logSearchCount").textContent = "";
+    $("logFile").textContent = e.message;
+  }
 }
 
 // Say where a report will actually go, rather than assuming email. With no
@@ -5160,6 +5927,9 @@ loadConfig();
 loadSchedules();
 describeChannels();
 loadSummary();
+// Startup calls the loaders directly rather than going through loadFor(), so a
+// loader wired only into loadFor() never runs for the tab the page opens on.
+loadRunGuests();
 poll();
 showLastRunLog();
 setInterval(poll, 2000);
@@ -5388,6 +6158,69 @@ def watch_cert(ctx, cert, key, interval=300):
             sys.stderr.write("[ui] certificate reload failed (%s) — keeping previous\n" % exc)
 
 
+class TLSServer(ThreadingHTTPServer):
+    """HTTPS server that runs the TLS handshake in the worker thread.
+
+    ThreadingHTTPServer accepts on one thread and serves on many.
+    `ctx.wrap_socket(httpd.socket, server_side=True)` — the obvious way to make
+    it speak HTTPS, and what this did up to and including 1.12.4 — puts the
+    wrong side of that split: accept() then returns an already-negotiated
+    socket, so the handshake happens in the accept loop and nothing else is
+    accepted until it finishes. There was no deadline on it either, so a single
+    client that completed the TCP connection and then sent no ClientHello
+    stopped the entire panel for as long as it stayed connected, and it
+    recovered the moment that client went away.
+
+    That is indistinguishable from a firewall from the outside: the port
+    answers locally, the browser times out. Chrome's speculative pre-connect
+    and any LAN port scanner both produce exactly that connection.
+
+    Here accept() returns a plain socket under a deadline, and the handshake
+    happens in the thread that will serve the request, so a slow or abandoned
+    client can only ever delay itself.
+    """
+
+    daemon_threads = True
+    request_queue_size = LISTEN_BACKLOG
+    ssl_context = None
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        # Covers the handshake performed in finish_request() below.
+        sock.settimeout(HANDSHAKE_TIMEOUT)
+        return sock, addr
+
+    def finish_request(self, request, client_address):
+        try:
+            tls = self.ssl_context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError, ValueError):
+            # A browser declining the self-signed certificate, something
+            # speaking plain HTTP at an HTTPS port, a scanner, or a client that
+            # walked away mid-handshake. All routine, none worth a traceback in
+            # the journal, and none of them can now affect another connection.
+            return
+        try:
+            self.RequestHandlerClass(tls, client_address, self)
+        finally:
+            # wrap_socket() detaches the socket it is given, so the teardown
+            # socketserver runs after this returns finds a file descriptor of
+            # -1 and the real one would leak. Close what we actually opened.
+            try:
+                tls.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            tls.close()
+
+    def handle_error(self, request, client_address):
+        # A client vanishing mid-response is normal on a LAN and the default
+        # implementation prints a traceback for every one, which buries real
+        # errors. Anything else still gets reported.
+        exc = sys.exc_info()[1]
+        if exc is not None and isinstance(exc, (ConnectionError, TimeoutError, ssl.SSLError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("This service must run as root — it drives pct/qm and writes /etc.")
@@ -5396,13 +6229,15 @@ def main():
     if not cert:
         sys.exit("No Proxmox TLS certificate found in /etc/pve/local/. Is this a PVE node?")
 
-    httpd = ThreadingHTTPServer((LISTEN_ADDR, LISTEN_PORT), Handler)
-    httpd.daemon_threads = True
-
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(cert, key)
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+
+    httpd = TLSServer((LISTEN_ADDR, LISTEN_PORT), Handler)
+    # Read per connection, in the worker thread. watch_cert() below reloads
+    # this same context in place, so a renewed certificate is picked up without
+    # a restart.
+    httpd.ssl_context = ctx
 
     threading.Thread(target=watch_cert, args=(ctx, cert, key), daemon=True).start()
 

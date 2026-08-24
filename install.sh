@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.12.4"
+PAU_FALLBACK_REF="v1.13.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -245,6 +245,156 @@ sq() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# --- Panel port ----------------------------------------------------------
+#
+# 8007 was the default until 1.13.0, and it was the wrong choice: it is Proxmox
+# Backup Server's port, and co-installing PBS on a PVE host is a documented
+# setup. The default collided with it, and the installer's own advice when it
+# did was "choose another port".
+#
+# An existing install keeps whatever port it is already on. A port is
+# infrastructure, not a preference — firewall rules, bookmarks and reverse
+# proxy config all point at it — so moving one silently on a re-install breaks
+# all three at once.
+DEFAULT_UI_PORT="8010"
+
+# Ports this refuses to put the panel on.
+#
+# Everything below 1024 is privileged and spoken for. These are the ones above
+# it that something on a Proxmox host, or on the network in front of it, is
+# likely to already own. Losing that race is not loud: whichever service binds
+# first wins, and the other is simply missing.
+UI_PORT_RESERVED="1433 1521 2049 3128 3306 3389 5432 6379 8000 8006 8007 8008 8080 8081 8443 8888 9000 9090 10000 11211 27017"
+
+# Why a port cannot be used, or empty if it can. A function rather than inline,
+# so the prompt, the --port flag and the unattended path all reject identically.
+ui_port_problem() {
+    local p="$1"
+    case "${p}" in
+        ''|*[!0-9]*) echo "not a number"; return ;;
+    esac
+    # Strip leading zeros, or 08080 is compared as a different port from 8080.
+    p=$((10#${p}))
+    # The port this node already runs on is always allowed. It works, and
+    # refusing it here would move a working panel away from the firewall rule,
+    # the toolbar button and every bookmark pointing at it.
+    if [ -n "${PREV_WEBUI_PORT:-}" ] && [ "${p}" = "${PREV_WEBUI_PORT}" ]; then
+        echo ""; return
+    fi
+    if [ "${p}" -lt 1024 ]; then
+        echo "below 1024 - privileged, and reserved for well-known services"; return
+    fi
+    if [ "${p}" -gt 65535 ]; then
+        echo "above 65535 - not a port"; return
+    fi
+    if [ "${p}" -ge 5900 ] && [ "${p}" -le 5999 ]; then
+        echo "inside 5900-5999, which Proxmox uses for VNC consoles"; return
+    fi
+    if [ "${p}" -ge 60000 ] && [ "${p}" -le 60050 ]; then
+        echo "inside 60000-60050, which Proxmox uses for live migration"; return
+    fi
+    case " ${UI_PORT_RESERVED} " in
+        *" ${p} "*)
+            case "${p}" in
+                8006) echo "the Proxmox web UI's own port" ;;
+                8007) echo "Proxmox Backup Server's port" ;;
+                3128) echo "the Proxmox SPICE proxy's port" ;;
+                *)    echo "a common service port" ;;
+            esac
+            return ;;
+    esac
+    # Something already listening is a harder no than any list: it wins the
+    # bind, and the panel is the one that goes missing.
+    if command -v ss >/dev/null 2>&1 \
+       && ss -lntH "( sport = :${p} )" 2>/dev/null | grep -q .; then
+        if ! systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
+            echo "already in use on this node"; return
+        fi
+    fi
+    echo ""
+}
+
+# --- Reaching the panel from anywhere but the node -----------------------
+#
+# The panel listens on its own port and the Proxmox firewall knows nothing
+# about it. When that firewall is on, its default input policy is to drop, and
+# the rules it writes for itself cover 8006, 22, 3128 and 5900-5999 - nothing
+# else. So a fresh install put a working panel behind a closed port: it
+# answered on 127.0.0.1, --doctor called it healthy, the installer reported it
+# as answering, and every browser on the LAN timed out.
+#
+# A dropped packet is silent by definition. There is no error in any log to
+# find, and a timeout looks exactly like a certificate the browser refused.
+# This opens the port - scoped to the networks the node itself is on, never to
+# everything - and says exactly what it did.
+FW_RULE_COMMENT="proxmox-autoupdate panel"
+
+pve_node_name() { hostname -s 2>/dev/null || hostname; }
+
+# "enabled/running" is the only state in which anything is actually dropped.
+pve_firewall_on() {
+    command -v pve-firewall >/dev/null 2>&1 || return 1
+    pve-firewall status 2>/dev/null | grep -qi 'Status: *enabled'
+}
+
+# 192.168.50.200/24 -> 192.168.50.0/24. Announcing a rule as covering a subnet
+# while writing a single host address would make the output a lie.
+network_of() {
+    local cidr="$1" addr bits o1 o2 o3 o4 n mask net
+    addr="${cidr%%/*}"; bits="${cidr##*/}"
+    case "${bits}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${bits}" -ge 1 ] && [ "${bits}" -le 32 ] || return 1
+    IFS=. read -r o1 o2 o3 o4 <<<"${addr}"
+    case "${o1}${o2}${o3}${o4}" in ''|*[!0-9]*) return 1 ;; esac
+    n=$(( (o1 << 24) | (o2 << 16) | (o3 << 8) | o4 ))
+    mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    net=$(( n & mask ))
+    printf '%d.%d.%d.%d/%d' $(( (net >> 24) & 255 )) $(( (net >> 16) & 255 )) \
+                            $(( (net >> 8) & 255 ))  $(( net & 255 )) "${bits}"
+}
+
+# Every global IPv4 address on this node, paired with the network it sits on:
+#
+#   192.168.50.200 192.168.50.0/24
+#   10.20.0.7 10.20.0.0/16
+#
+# One rule is written per pair, pinned with --dest to that address and sourced
+# from that address's own network. That is narrower than a rule on the port
+# alone, which would accept the port on every address the node holds now or
+# later, including one added long after this ran.
+#
+# Loopback and link-local are skipped: neither is somewhere a browser connects
+# from.
+node_addr_subnets() {
+    local cidr addr net seen=""
+    command -v ip >/dev/null 2>&1 || return 0
+    while read -r cidr; do
+        [ -n "${cidr}" ] || continue
+        case "${cidr}" in 127.*|169.254.*) continue ;; esac
+        addr="${cidr%%/*}"
+        net=$(network_of "${cidr}") || continue
+        case " ${seen} " in *" ${addr} "*) continue ;; esac
+        seen="${seen} ${addr}"
+        echo "${addr} ${net}"
+    done <<<"$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}')"
+}
+
+# Ask the compiled ruleset, not the config: an administrator may already have
+# opened this port by hand or through a security group, and a second rule
+# saying the same thing is noise.
+port_permitted_by_firewall() {
+    local p="$1"
+    if command -v nft >/dev/null 2>&1 \
+       && nft list ruleset 2>/dev/null | grep -qE "dports?[^0-9]+${p}([^0-9]|$)"; then
+        return 0
+    fi
+    if command -v iptables-save >/dev/null 2>&1 \
+       && iptables-save 2>/dev/null | grep -qE -- "--dports? ${p}([,: ]|$)"; then
+        return 0
+    fi
+    return 1
+}
+
 # --- Schedules -----------------------------------------------------------
 #
 # UPDATE_SCHEDULES holds one or more schedules, ';'-separated, each of them
@@ -297,6 +447,12 @@ parse_schedules() {
                 cron="${entry}"; reboot="yes"; label=""
                 ;;
         esac
+        # Trim whitespace around the expression. A hand-edited config often has
+        # some, and the panel trims it, so without this the two describe the
+        # same schedule differently and --doctor reports the config and the
+        # crontab as out of step.
+        cron="${cron#"${cron%%[![:space:]]*}"}"
+        cron="${cron%"${cron##*[![:space:]]}"}"
         case "${reboot}" in
             no|only) : ;;
             *)       reboot="yes" ;;
@@ -404,16 +560,42 @@ print_box_line() {
 # --unattended reuses the existing configuration and asks nothing. Used by the
 # web panel's self-update, where there is no terminal to prompt on.
 UNATTENDED=false
-for ARG in "$@"; do
-    case "${ARG}" in
+CLI_UI_PORT=""
+CLI_FIREWALL_SOURCE=""
+FIREWALL_MODE="auto"
+# A while loop rather than `for ARG in "$@"`, so --port and --firewall-source
+# accept their value as a separate word as well as after an "=".
+while [ $# -gt 0 ]; do
+    case "$1" in
         --unattended) UNATTENDED=true ;;
+        --no-firewall) FIREWALL_MODE="off" ;;
+        --port)  CLI_UI_PORT="${2:-}"; if [ $# -gt 1 ]; then shift; fi ;;
+        --port=*) CLI_UI_PORT="${1#*=}" ;;
+        --firewall-source)  CLI_FIREWALL_SOURCE="${2:-}"; if [ $# -gt 1 ]; then shift; fi ;;
+        --firewall-source=*) CLI_FIREWALL_SOURCE="${1#*=}" ;;
         -h|--help)
-            echo "Usage: install.sh [--unattended]"
-            echo "  --unattended  Reuse the existing config, prompt for nothing."
+            echo "Usage: install.sh [--unattended] [--port N]"
+            echo "                  [--firewall-source CIDR] [--no-firewall]"
+            echo "  --unattended         Reuse the existing config, prompt for nothing."
+            echo "  --port N             Port for the web control panel."
+            echo "                       Default ${DEFAULT_UI_PORT}; an existing install keeps its own."
+            echo "  --firewall-source    Restrict the firewall rule to this CIDR. Defaults to"
+            echo "                       the networks this node already has an address on."
+            echo "  --no-firewall        Do not touch the Proxmox firewall at all."
             exit 0
             ;;
     esac
+    shift
 done
+
+# Reject a bad --port before anything is written, not halfway through.
+if [ -n "${CLI_UI_PORT}" ]; then
+    CLI_PORT_WHY=$(ui_port_problem "${CLI_UI_PORT}")
+    if [ -n "${CLI_PORT_WHY}" ]; then
+        echo "install.sh: --port ${CLI_UI_PORT} is ${CLI_PORT_WHY}."
+        exit 1
+    fi
+fi
 
 # Prompts read from fd 3 rather than stdin, because stdin is the script itself
 # under `curl | bash`. In unattended mode every prompt must return immediately
@@ -638,7 +820,9 @@ apply_typical_profile() {
     SNAPSHOT_BEFORE_UPDATE="false"
     SNAPSHOT_KEEP="3"
     ENABLE_WEB_UI="true"
-    WEB_UI_PORT="8007"
+    # Preserved, not reset: see DEFAULT_UI_PORT above. Typical resets
+    # preferences, and a port is not one.
+    WEB_UI_PORT="${PREV_WEBUI_PORT:-${DEFAULT_UI_PORT}}"
     WEB_UI_PUBLIC_URL="${PREV_WEBUI_PUBLIC_URL}"
     KEEP_LOGS="true"
     LOG_RETENTION_DAYS="90"
@@ -670,7 +854,7 @@ apply_keep_profile() {
     SNAPSHOT_BEFORE_UPDATE="${PREV_SNAPSHOT:-false}"
     SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
     ENABLE_WEB_UI="${PREV_WEBUI:-false}"
-    WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
+    WEB_UI_PORT="${PREV_WEBUI_PORT:-${DEFAULT_UI_PORT}}"
     WEB_UI_PUBLIC_URL="${PREV_WEBUI_PUBLIC_URL}"
     KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
     LOG_RETENTION_DAYS="${PREV_LOG_RETENTION:-90}"
@@ -693,7 +877,7 @@ print_typical_profile() {
     echo -e "  ${C_CYAN}Guests${C_NC}         Stopped containers and Linux VMs are started, updated"
     echo -e "                 and put back as they were. Windows VMs are left alone —"
     echo -e "                 Windows Update can run for well over half an hour."
-    echo -e "  ${C_CYAN}Web panel${C_NC}      Installed on port ${C_BOLD}8007${C_NC}, with the Update Everything"
+    echo -e "  ${C_CYAN}Web panel${C_NC}      Installed on port ${C_BOLD}${WEB_UI_PORT}${C_NC}, with the Update Everything"
     echo -e "                 button added to the Proxmox toolbar."
     echo -e "  ${C_CYAN}Notifications${C_NC}  ${C_BOLD}Off.${C_NC} Updates run quietly. Add email, Discord, Slack,"
     echo -e "                 Teams, ntfy, Gotify, Telegram or a webhook later from"
@@ -710,7 +894,18 @@ print_typical_profile() {
 
 if [ "${UNATTENDED}" = true ]; then
     # The panel's self-update path. Reuse everything; ask nothing.
-    INSTALL_MODE="keep"
+    #
+    # Keep mode takes every value from the existing config, so it needs one to
+    # exist. Driven by automation on a machine that has never had this
+    # installed, it would run with every PREV_* empty -- which silently means
+    # no web panel and the fallback schedule, on the one path where nobody is
+    # watching the output. "Install this without asking me anything" means
+    # Typical when there is nothing to keep.
+    if [ -f "${CONFIG_FILE}" ]; then
+        INSTALL_MODE="keep"
+    else
+        INSTALL_MODE="typical"
+    fi
 else
     echo ""
     print_box_top
@@ -764,6 +959,12 @@ esac
 # True only when the installer should be putting questions to a human. Every
 # prompt block below is gated on this, so Typical and the panel's unattended
 # self-update take exactly the same path through the rest of the script.
+# --port overrides whichever profile was just applied. Custom mode consumes it
+# at the prompt instead, so it is never asked for something already answered.
+if [ -n "${CLI_UI_PORT}" ] && [ "${INSTALL_MODE}" != "custom" ]; then
+    WEB_UI_PORT="${CLI_UI_PORT}"
+fi
+
 asking() { [ "${INSTALL_MODE}" = "custom" ]; }
 
 # 1b. Dependencies
@@ -1302,10 +1503,37 @@ DEFAULT_WEBUI="${PREV_WEBUI:-true}"
         *) ENABLE_WEB_UI="${DEFAULT_WEBUI}" ;;
     esac
 
-    WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
-    if [ "${ENABLE_WEB_UI}" = "true" ]; then
-        ask INPUT_WEBUI_PORT "  Port for the control panel [Enter for ${WEB_UI_PORT}]: "
-        WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
+    WEB_UI_PORT="${PREV_WEBUI_PORT:-${DEFAULT_UI_PORT}}"
+    if [ "${ENABLE_WEB_UI}" = "true" ] && [ -n "${CLI_UI_PORT}" ]; then
+        WEB_UI_PORT="${CLI_UI_PORT}"
+        print_ok "Panel port: ${C_BOLD}${WEB_UI_PORT}${C_NC} ${C_DIM}(from --port)${C_NC}"
+    elif [ "${ENABLE_WEB_UI}" = "true" ]; then
+        # Anything the answer collides with is refused here rather than at bind
+        # time. A port clash is not loud: whichever service binds first wins and
+        # the other is simply missing, which reads as "the panel never started".
+        echo ""
+        echo -e "  ${C_DIM}Any free port above 1024. Ports belonging to something else are${C_NC}"
+        echo -e "  ${C_DIM}refused: 8006 is the Proxmox UI, 8007 is Proxmox Backup Server,${C_NC}"
+        echo -e "  ${C_DIM}5900-5999 are VNC consoles, and anything already listening is out.${C_NC}"
+        UI_PORT_TRIES=0
+        while :; do
+            ask INPUT_WEBUI_PORT "  Port for the control panel [Enter for ${WEB_UI_PORT}]: "
+            INPUT_WEBUI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
+            UI_PORT_WHY=$(ui_port_problem "${INPUT_WEBUI_PORT}")
+            if [ -z "${UI_PORT_WHY}" ]; then
+                WEB_UI_PORT="${INPUT_WEBUI_PORT}"
+                break
+            fi
+            print_fail "Port ${INPUT_WEBUI_PORT} is ${UI_PORT_WHY}."
+            UI_PORT_TRIES=$((UI_PORT_TRIES + 1))
+            # With no terminal every ask returns empty immediately, so an
+            # unconditional loop here would spin forever instead of installing.
+            if [ "${UI_PORT_TRIES}" -ge 3 ]; then
+                WEB_UI_PORT="${DEFAULT_UI_PORT}"
+                print_action "Falling back to ${WEB_UI_PORT}."
+                break
+            fi
+        done
 
         # Reaching Proxmox through a proxy or a tunnel?
         #
@@ -1982,7 +2210,12 @@ elif [ "${ENABLE_WEB_UI}" = "true" ]; then
     done
 
     if [ "${UI_UP}" = true ]; then
-        print_ok "Panel is answering on ${C_BOLD}https://$(hostname -f 2>/dev/null || hostname):${WEB_UI_PORT}/${C_NC} ${C_DIM}(HTTP ${UI_CODE})${C_NC}"
+        # Name the address that was contacted, not one that was not. This
+        # used to report the node's own hostname, which it had never tried
+        # - so an install behind a closed firewall port signed off by
+        # asserting the single thing that was untrue. Whether anything but
+        # this node can reach it is settled just below.
+        print_ok "Panel is listening on port ${C_BOLD}${WEB_UI_PORT}${C_NC} ${C_DIM}(HTTP ${UI_CODE} on 127.0.0.1)${C_NC}"
     else
         print_fail "The panel is not answering on port ${WEB_UI_PORT}."
         # Print the reason here rather than telling the user to go and find it.
@@ -2004,6 +2237,79 @@ elif [ "${ENABLE_WEB_UI}" = "true" ]; then
         fi
         echo ""
         print_fail "Updates from cron are unaffected — only the panel is down."
+    fi
+
+    # --- Can anything but this node open that port? ---
+    #
+    # The loopback probe above cannot answer this, and neither can a probe from
+    # the node itself: traffic to its own address goes over lo, which the
+    # Proxmox firewall accepts unconditionally. So ask the ruleset instead of
+    # pretending to measure it.
+    if [ "${FIREWALL_MODE}" = "off" ]; then
+        print_skip "Proxmox firewall left alone (--no-firewall)."
+        print_skip "  Allow tcp/${WEB_UI_PORT} yourself, or the panel is unreachable off this node."
+    elif ! pve_firewall_on; then
+        print_ok "Proxmox firewall is off ${C_DIM}(nothing is dropping port ${WEB_UI_PORT})${C_NC}"
+    elif port_permitted_by_firewall "${WEB_UI_PORT}"; then
+        print_ok "Port ${WEB_UI_PORT} is already allowed through the Proxmox firewall"
+    else
+        FW_PAIRS=$(node_addr_subnets || true)
+        if [ -z "${FW_PAIRS}" ]; then
+            # Never widen to "any" as a fallback. This port is equivalent to a
+            # root shell; failing to work out the subnet is not a reason to
+            # open it to everything that can route here.
+            print_fail "The Proxmox firewall is on and port ${WEB_UI_PORT} is not allowed through."
+            print_fail "This node's own addresses could not be determined, so no rule was added."
+            print_fail "Add one pinned to this node and scoped to your network:"
+            echo -e "    ${C_CYAN}pvesh create /nodes/$(pve_node_name)/firewall/rules --type in --action ACCEPT --proto tcp --dport ${WEB_UI_PORT} --dest <this-node-ip> --source 192.0.2.0/24 --enable 1 --comment '${FW_RULE_COMMENT}'${C_NC}"
+        else
+            FW_ADDED=""
+            FW_FAILED=""
+            # A herestring, not a pipe: `... | while read` runs the loop in a
+            # subshell, and FW_ADDED would come back empty every time.
+            while read -r FW_DEST FW_NET; do
+                [ -n "${FW_DEST}" ] || continue
+                # An explicit --firewall-source replaces the network, never the
+                # destination: the rule stays pinned to this node's address.
+                FW_SRC="${CLI_FIREWALL_SOURCE:-${FW_NET}}"
+                if pvesh create "/nodes/$(pve_node_name)/firewall/rules" \
+                        --type in --action ACCEPT --proto tcp \
+                        --dport "${WEB_UI_PORT}" --dest "${FW_DEST}" \
+                        --source "${FW_SRC}" \
+                        --enable 1 --comment "${FW_RULE_COMMENT}" >/dev/null 2>&1; then
+                    FW_ADDED="${FW_ADDED} ${FW_SRC}>${FW_DEST}"
+                else
+                    FW_FAILED="${FW_FAILED} ${FW_SRC}>${FW_DEST}"
+                fi
+            done <<<"${FW_PAIRS}"
+            if [ -n "${FW_ADDED}" ]; then
+                print_ok "Opened tcp/${WEB_UI_PORT} in the Proxmox firewall:"
+                for FW_ONE in ${FW_ADDED}; do
+                    print_ok "  to ${C_BOLD}${FW_ONE#*>}:${WEB_UI_PORT}${C_NC} from ${C_BOLD}${FW_ONE%%>*}${C_NC}"
+                done
+                print_ok "  Pinned to this node's own address, not to the port on every"
+                print_ok "  address it holds. Narrow the source further with:"
+                echo -e "    ${C_CYAN}--firewall-source <your-workstation-ip>/32${C_NC}"
+                # Ask the compiled ruleset whether it took effect rather than
+                # trusting an exit code: pve-firewall applies on its own cycle.
+                FW_LIVE=false
+                for _FW_TRY in 1 2 3 4 5 6 7 8 9 10; do
+                    if port_permitted_by_firewall "${WEB_UI_PORT}"; then FW_LIVE=true; break; fi
+                    sleep 1
+                done
+                if [ "${FW_LIVE}" = true ]; then
+                    print_ok "  Live in the compiled ruleset."
+                else
+                    print_action "  Written, but not in the compiled ruleset yet - pve-firewall"
+                    print_action "  applies changes on its own cycle. Give it a moment."
+                fi
+            fi
+            if [ -n "${FW_FAILED}" ]; then
+                print_fail "Could not add a firewall rule for:${FW_FAILED}"
+                print_fail "  Add it in Datacenter or Node -> Firewall, or the panel stays"
+                print_fail "  unreachable from anywhere but this node."
+            fi
+        fi
     fi
 
     # --- Certificate situation ---
@@ -2212,18 +2518,25 @@ if [ "${ENABLE_WEB_UI}" = "true" ]; then
         echo -e "  ${C_DIM}Renewals are picked up automatically without restarting the service.${C_NC}"
     else
         echo -e "  ${C_YELLOW}Certificate:${C_NC} this node uses the Proxmox self-signed certificate."
-        echo -e "  Browsers scope certificate exceptions per port, so port ${WEB_UI_PORT} needs"
-        echo -e "  approving once even though you already trust port 8006."
+        echo -e "  Certificate exceptions are scoped per host ${C_BOLD}and port${C_NC}, so this port is"
+        echo -e "  not covered by having already trusted 8006."
         echo ""
-        echo -e "  ${C_BOLD}Pick one:${C_NC}"
-        echo -e "    ${C_CYAN}a)${C_NC} Open ${PANEL_URL} once and accept the warning."
-        echo -e "       ${C_DIM}Per browser, per machine. The UI prompts you if you skip this.${C_NC}"
-        echo -e "    ${C_CYAN}b)${C_NC} Set up ACME: ${C_BOLD}Datacenter → ACME${C_NC}, then Node → Certificates → Order."
-        echo -e "       ${C_DIM}Permanent, applies to every browser, and also removes the${C_NC}"
-        echo -e "       ${C_DIM}warning on the Proxmox UI itself. This service picks the new${C_NC}"
-        echo -e "       ${C_DIM}certificate up automatically when it renews.${C_NC}"
-        echo -e "    ${C_CYAN}c)${C_NC} Install the Proxmox root CA on your computer:"
-        echo -e "       ${C_DIM}/etc/pve/pve-root-ca.pem → your OS trust store. Also fixes 8006.${C_NC}"
+        echo -e "  The panel opens ${C_BOLD}inside${C_NC} the Proxmox UI, in a frame — and a browser will"
+        echo -e "  ${C_BOLD}not${C_NC} show a certificate prompt inside a frame. So this has to be made"
+        echo -e "  trusted rather than accepted:"
+        echo ""
+        echo -e "    ${C_CYAN}a)${C_NC} ${C_BOLD}Recommended — set up ACME:${C_NC} Datacenter → ACME, then"
+        echo -e "       Node → Certificates → Order."
+        echo -e "       ${C_DIM}Nothing to accept, on any machine or through a tunnel. Also${C_NC}"
+        echo -e "       ${C_DIM}removes the warning on the Proxmox UI itself, and this service${C_NC}"
+        echo -e "       ${C_DIM}picks the new certificate up automatically when it renews.${C_NC}"
+        echo -e "    ${C_CYAN}b)${C_NC} No public DNS name? Trust the cluster CA instead:"
+        echo -e "       ${C_CYAN}cat /etc/pve/pve-root-ca.pem${C_NC}"
+        echo -e "       ${C_DIM}Import into your OS or browser trust store. Once per workstation,${C_NC}"
+        echo -e "       ${C_DIM}covers every port, survives a reinstall, and also fixes 8006.${C_NC}"
+        echo -e "    ${C_CYAN}c)${C_NC} Last resort: open ${PANEL_URL} in a tab and accept it."
+        echo -e "       ${C_DIM}Works, but per browser, per machine, per port — and it has to be${C_NC}"
+        echo -e "       ${C_DIM}redone whenever the port changes. (a) or (b) are permanent.${C_NC}"
     fi
     echo ""
     echo -e "  ${C_DIM}Hard-refresh the Proxmox UI (Ctrl+Shift+R) to see the new button.${C_NC}"

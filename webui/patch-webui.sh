@@ -30,11 +30,25 @@ END_MARKER="/* ==== END proxmox-autoupdate button ==== */"
 
 # The port the control panel listens on. Read from the config so the button and
 # the service can never disagree; falls back to the default.
-UI_PORT="8007"
+UI_PORT="8010"
 if [ -r "${CONFIG_FILE}" ]; then
-    CONFIGURED_PORT=$(sed -n 's/^[[:space:]]*WEB_UI_PORT[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9]\{1,\}\)"\{0,1\}.*/\1/p' \
-        "${CONFIG_FILE}" | tail -1)
-    [ -n "${CONFIGURED_PORT}" ] && UI_PORT="${CONFIGURED_PORT}"
+    # Strip the key, then whatever quoting is around the value.
+    #
+    # This used to match an optional DOUBLE quote around the digits. Config
+    # values are written by sq(), which emits SINGLE quotes, so
+    # WEB_UI_PORT='8011' matched nothing here and the port fell back to the
+    # default -- while the service listened on the configured one. The injected
+    # button then pointed at a port with nothing on it, and the symptom was an
+    # unreachable panel, with the config, the service and --doctor all agreeing
+    # on a port this file had never seen.
+    #
+    # Quote-agnostic now, the same way WEB_UI_PUBLIC_URL is read below.
+    CONFIGURED_PORT=$(sed -n 's/^[[:space:]]*WEB_UI_PORT[[:space:]]*=[[:space:]]*//p' \
+        "${CONFIG_FILE}" | tail -1 | tr -d "\"'" | tr -d "[:space:]")
+    case "${CONFIGURED_PORT}" in
+        ''|*[!0-9]*) : ;;
+        *)           UI_PORT="${CONFIGURED_PORT}" ;;
+    esac
 fi
 
 # Where the browser should reach the panel, when that is not simply
@@ -391,53 +405,88 @@ JSBLOCK_HEAD
     }
 
     /* Why the panel could not be reached.
-       
-       This used to be titled "One-time certificate step" and state, flatly,
-       that the node's self-signed certificate needed approving. probePanel()
-       cannot know that: a no-cors fetch rejects identically for a rejected
-       certificate, a refused connection, a timeout and a DNS failure. So
-       somebody reaching Proxmox through a Cloudflare tunnel that forwards 8006
-       and nothing else was told to go and accept a certificate, clicked OK,
-       and got ERR_CONNECTION_TIMED_OUT on a port their browser can never
-       reach. The dialog now names both causes and does not pretend to know
-       which one it is. */
+
+       probePanel() cannot know. A no-cors fetch rejects identically for a
+       refused connection, a dropped packet, a timeout, a rejected certificate
+       and a DNS failure, so this names the causes and claims to know none of
+       them.
+
+       There is deliberately no "open it in a new tab" button any more. It used
+       to be the way to accept a self-signed certificate, because a browser will
+       not render a certificate interstitial inside an iframe - Chrome, Firefox,
+       Edge and Safari all refuse, since a page able to prompt for trust in a
+       subframe is a phishing primitive. That made the tab a genuine bootstrap
+       step rather than a convenience.
+
+       Removing it means the certificate has to be trusted rather than accepted,
+       which is better anyway: an exception is per host AND port, so it has to be
+       clicked again for every port, while trusting the cluster CA covers 8006
+       and this panel at once and survives a reinstall. So the dialog leads with
+       that, and the tab is gone. */
     function showUnreachableHelp(url) {
-        var viaProxy = window.location.port !== String(OPEN_PORT) &&
-                       window.location.port !== '8006' &&
-                       window.location.port !== '';
         Ext.Msg.show({
             title: 'Cannot reach the Auto-Update panel',
             message:
                 'The panel should be at <b>' + panelBase() + '/</b>, and this ' +
-                'browser cannot open it.<br><br>' +
-                '<b>1. A certificate that has not been approved yet.</b><br>' +
-                'The panel is on its own port, which your browser treats as a ' +
-                'separate site, and a self-signed certificate has to be accepted ' +
-                'once per site. <b>Click OK</b> to open it in a new tab — if you ' +
-                'get a certificate warning, accept it, close the tab and try ' +
-                'again.<br><br>' +
-                '<b>2. You are reaching Proxmox through a proxy or tunnel.</b><br>' +
+                'browser cannot open it. In order of likelihood:<br><br>' +
+
+                '<b>1. Your browser does not trust this node\'s certificate.</b><br>' +
+                'The panel is on its own port, and a certificate exception is ' +
+                'recorded per host <i>and port</i> - so trusting ' +
+                '<code>:8006</code> does not trust this one. It cannot be ' +
+                'accepted from in here either: browsers refuse to show a ' +
+                'certificate prompt inside a frame, which is why there is no ' +
+                '"open in a new tab" button.<br>' +
+                '<b>The fix is to give this node a certificate that needs no ' +
+                'accepting:</b> Proxmox <i>Datacenter &rarr; ACME</i>, which is ' +
+                'built in. That works for every admin machine at once, through a ' +
+                'tunnel, and removes the warning on :8006 as well.<br>' +
+                'On a LAN with no public DNS name, trust the cluster CA instead ' +
+                '- once per workstation, and it also covers every port:<br>' +
+                '<pre style="margin:6px 0;white-space:pre-wrap">' +
+                'cat /etc/pve/pve-root-ca.pem</pre>' +
+                'Import that into your operating system or browser trust store, ' +
+                'then reload Proxmox.<br><br>' +
+
+                '<b>2. The Proxmox firewall is dropping port ' + OPEN_PORT +
+                '.</b><br>' +
+                'While the firewall is enabled it drops anything it has no rule ' +
+                'for, and it writes rules for 8006, 22, 3128 and 5900-5999 only. ' +
+                '<b>An empty rule list under Node &rarr; Firewall does not mean ' +
+                'the firewall is off.</b> The installer adds this rule; if it was ' +
+                'run with --no-firewall, on the node:<br>' +
+                '<pre style="margin:6px 0;white-space:pre-wrap">' +
+                'pvesh create /nodes/&lt;node&gt;/firewall/rules --type in ' +
+                '--action ACCEPT --proto tcp --dport ' + OPEN_PORT +
+                " --dest &lt;this-node-ip&gt; --source &lt;your-lan&gt;/24 --enable 1 --comment 'proxmox-autoupdate panel'</pre>" +
+
+                '<b>3. The panel is not running.</b><br>' +
+                'On the node: <code>systemctl status pve-autoupdate-ui</code>, ' +
+                'and <code>journalctl -u pve-autoupdate-ui -n 50</code> for the ' +
+                'actual error.<br><br>' +
+
+                '<b>4. You reach Proxmox through a proxy or tunnel.</b><br>' +
                 'Cloudflare Tunnel, nginx, Traefik and Tailscale forward the ' +
                 'Proxmox port and nothing else, so port ' + OPEN_PORT + ' does ' +
-                'not exist from where your browser is sitting. If OK gives you a ' +
-                'timeout rather than a certificate warning, this is what has ' +
-                'happened. Publish the panel through the same proxy, then set ' +
-                'its address on the node:<br>' +
+                'not exist from where your browser is sitting. Publish the panel ' +
+                'through the same proxy, then name its address on the node:<br>' +
                 '<pre style="margin:6px 0;white-space:pre-wrap">' +
                 "WEB_UI_PUBLIC_URL='https://panel.example.com'</pre>" +
                 'in <code>/etc/proxmox-autoupdate.conf</code>, and run ' +
-                '<code>pve-autoupdate-patch-webui apply</code>.' +
-                (viaProxy
-                    ? '<br><br><b>You are on port ' + window.location.port +
+                '<code>pve-autoupdate-patch-webui apply</code>. The button then ' +
+                'uses that instead of this node\'s own address.' +
+                (window.location.port !== String(OPEN_PORT) &&
+                 window.location.port !== '8006' && window.location.port !== ''
+                    ? '<br><b>You are on port ' + window.location.port +
                       ', so a proxy is likely.</b>'
                     : '') +
                 '<br><br><span style="opacity:.75">' +
-                '<code>update-everything.sh --doctor</code> on the node says ' +
-                'whether the panel is actually running and listening.</span>',
-            buttons: Ext.Msg.OKCANCEL,
-            buttonText: {ok: 'Open it in a new tab', cancel: 'Close'},
+                '<code>update-everything.sh --doctor</code> on the node checks ' +
+                'these and says which one it is.</span>',
+            buttons: Ext.Msg.OK,
+            buttonText: {ok: 'Close'},
             fn: function (btn) {
-                if (btn === 'ok') { window.open(url, '_blank', 'noopener'); }
+                void btn;
             }
         });
     }
@@ -456,10 +505,10 @@ JSBLOCK_HEAD
                 html: '<iframe src="' + url + '" style="width:100%;height:100%;border:0"' +
                       ' referrerpolicy="no-referrer"></iframe>'
             }],
+            /* No "open in a new tab" button. The panel is meant to be used
+               inside Proxmox, and a second button offering to leave it made
+               the containment optional. */
             buttons: [{
-                text: 'Open in new tab',
-                handler: function () { window.open(url, '_blank', 'noopener'); }
-            }, {
                 text: 'Close',
                 handler: function () { win.close(); }
             }],

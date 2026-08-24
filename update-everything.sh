@@ -6,7 +6,7 @@
 
 # Read by the web panel's "check for updates" and shown in its footer. Keep the
 # literal assignment on one line — it is grepped, not sourced.
-PAU_VERSION="1.12.4"
+PAU_VERSION="1.13.0"
 
 set -u
 set -o pipefail
@@ -238,6 +238,12 @@ parse_schedules() {
                 cron="${entry}"; reboot="yes"; label=""
                 ;;
         esac
+        # Trim whitespace around the expression. A hand-edited config often has
+        # some, and the panel trims it, so without this the two describe the
+        # same schedule differently and --doctor reports the config and the
+        # crontab as out of step.
+        cron="${cron#"${cron%%[![:space:]]*}"}"
+        cron="${cron%"${cron##*[![:space:]]}"}"
         case "${reboot}" in
             no|only) : ;;
             *)       reboot="yes" ;;
@@ -411,6 +417,53 @@ run_reboot_window() {
         return 1
     }
     return 0
+}
+
+# --- Is the panel's port actually open? --------------------------------------
+#
+# A loopback probe cannot answer this, and neither can a probe from this node:
+# traffic to its own address goes over lo, which the Proxmox firewall accepts
+# unconditionally. The honest test is the ruleset, not a request.
+#
+# This matters because the failure is completely silent. With the Proxmox
+# firewall on, its default input policy is to drop, and the rules it writes for
+# itself cover 8006, 22, 3128 and 5900-5999 - not the panel's port. The service
+# is healthy, the port answers locally, and every browser on the LAN times out
+# with nothing written to any log to explain it.
+_pve_firewall_on() {
+    command -v pve-firewall >/dev/null 2>&1 || return 1
+    pve-firewall status 2>/dev/null | grep -qi 'Status: *enabled'
+}
+
+_port_permitted_by_firewall() {
+    local p="$1"
+    if command -v nft >/dev/null 2>&1 \
+       && nft list ruleset 2>/dev/null | grep -qE "dports?[^0-9]+${p}([^0-9]|$)"; then
+        return 0
+    fi
+    if command -v iptables-save >/dev/null 2>&1 \
+       && iptables-save 2>/dev/null | grep -qE -- "--dports? ${p}([,: ]|$)"; then
+        return 0
+    fi
+    return 1
+}
+
+# ==============================================================================
+# HELPER: Read a single field from `qm config` / `pct config`
+# ==============================================================================
+# Keeps values that contain spaces intact, unlike `awk '{print $2}'`.
+#
+# Defined up here, not down with the other guest helpers, because run_doctor()
+# below calls it and --doctor is dispatched near the top of the script. Bash
+# binds function names as it reads the file, so with the definition further
+# down every --doctor run printed "config_field: command not found" once per
+# guest - and, because the failed call returned nothing, decided that no
+# container was a template. Templates were neither counted nor skipped.
+config_field() {
+    local cmd="$1" id="$2" key="$3"
+    "${cmd}" config "${id}" 2>/dev/null \
+        | sed -n "s/^${key}:[[:space:]]*//p" \
+        | head -1
 }
 
 run_doctor() {
@@ -671,7 +724,10 @@ run_doctor() {
 
     _d_head "Web panel"
     local uiport
-    uiport=$(cfg_read WEB_UI_PORT); uiport="${uiport:-8007}"
+    # 8010 since 1.13.0. 8007 is Proxmox Backup Server's, and was the
+    # default here long enough that plenty of installs are still on it -
+    # which is why this reads the config first and only then falls back.
+    uiport=$(cfg_read WEB_UI_PORT); uiport="${uiport:-8010}"
     if [ "$(cfg_read ENABLE_WEB_UI)" = "true" ]; then
         # Ask the port, not systemd. Type=simple reports "active" as soon as the
         # process forks, so a panel that starts and immediately dies looks
@@ -681,18 +737,79 @@ run_doctor() {
             http=$(curl -s -k -m 5 -o /dev/null -w '%{http_code}'                    "https://127.0.0.1:${uiport}/" 2>/dev/null || echo 000)
         fi
         if [ -n "${http}" ] && [ "${http}" != "000" ]; then
-            _d_ok "panel is answering on port ${uiport} (HTTP ${http})"
-        elif systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
-            _d_fail "the panel service is running but port ${uiport} does not answer"
-            _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
-        else
-            _d_fail "panel is enabled in the config but the service is not running"
-            _d_fail "  → systemctl status pve-autoupdate-ui"
-            _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
-            if command -v ss >/dev/null 2>&1 && ss -lntH 2>/dev/null | grep -q ":${uiport} "; then
-                _d_fail "  → port ${uiport} is already in use by something else"
-                _d_fail "     (Proxmox Backup Server uses 8007 — pick another port)"
+            _d_ok "panel is answering on 127.0.0.1:${uiport} (HTTP ${http})"
+            # Answering locally is half the question. The other half went
+            # unasked, so a panel behind a closed firewall port passed this
+            # self-check cleanly while no browser on the network could open it.
+            if ! _pve_firewall_on; then
+                _d_ok "Proxmox firewall is off — nothing is dropping tcp/${uiport}"
+            elif _port_permitted_by_firewall "${uiport}"; then
+                _d_ok "the Proxmox firewall allows tcp/${uiport}"
+            else
+                _d_fail "the Proxmox firewall is ON and does not allow tcp/${uiport}"
+                _d_fail "  the panel is running, and unreachable from anywhere but this node"
+                _d_fail "  an empty rule list in the GUI does not mean the firewall is off:"
+                _d_fail "  while it is enabled, the default input policy drops what is not listed"
+                _d_fail "  → pvesh create /nodes/$(hostname -s 2>/dev/null || hostname)/firewall/rules --type in --action ACCEPT --proto tcp --dport ${uiport} --source <your-lan>/24 --enable 1 --comment 'proxmox-autoupdate panel'"
             fi
+        else
+            if systemctl is-active --quiet pve-autoupdate-ui.service 2>/dev/null; then
+                _d_fail "the panel service is running but port ${uiport} does not answer"
+                _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
+            else
+                _d_fail "panel is enabled in the config but the service is not running"
+                _d_fail "  → systemctl status pve-autoupdate-ui"
+                _d_fail "  → journalctl -u pve-autoupdate-ui -n 50"
+            fi
+            # Checked whichever of those two it was.
+            #
+            # The unit is Type=simple, so systemd reports "active" for the five
+            # seconds a crash-looping service spends forked-but-dying - which is
+            # exactly what a port clash looks like. Reporting the clash only in
+            # the not-running branch withheld the one useful line precisely when
+            # it was most likely to be true.
+            if command -v ss >/dev/null 2>&1 && ss -lntH 2>/dev/null | grep -q ":${uiport} "; then
+                _d_fail "  → something else is already listening on port ${uiport}:"
+                _d_fail "     $(ss -lntpH 2>/dev/null | grep ":${uiport} " | head -1 | tr -s ' ')"
+                _d_fail "     (Proxmox Backup Server uses 8007 — pick another port;"
+                _d_fail "      8010 is the default for new installs)"
+            fi
+        fi
+
+        # Which certificate is served, and therefore whether anything has to be
+        # trusted before the panel will render. The panel opens in a frame
+        # inside the Proxmox UI, and a browser will not show a certificate
+        # prompt inside a frame - so on a self-signed node the certificate has
+        # to be made trusted rather than accepted, or the frame stays blank
+        # with nothing to click.
+        local certpath="" certissuer=""
+        for certpath in /etc/pve/local/pveproxy-ssl.pem /etc/pve/local/pve-ssl.pem; do
+            [ -f "${certpath}" ] && break
+            certpath=""
+        done
+        if [ -z "${certpath}" ]; then
+            _d_fail "no TLS certificate in /etc/pve/local/ - the panel cannot start"
+        elif command -v openssl >/dev/null 2>&1; then
+            certissuer=$(openssl x509 -in "${certpath}" -noout -issuer 2>/dev/null || true)
+            case "${certissuer}" in
+                "")
+                    # openssl failed, or the file is not readable as a
+                    # certificate. Saying "CA-signed, nothing to accept" here
+                    # would be asserting the one thing not established - the
+                    # same false reassurance as reporting a loopback probe as
+                    # proof the panel is reachable.
+                    _d_warn "could not read ${certpath} - certificate type unknown"
+                    ;;
+                *"Proxmox Virtual Environment"*)
+                    _d_warn "certificate is the Proxmox self-signed one"
+                    _d_warn "  a frame cannot prompt to accept it, so make it trusted instead:"
+                    _d_warn "  → Datacenter → ACME, then Node → Certificates → Order   (recommended)"
+                    _d_warn "  → or trust the cluster CA: cat /etc/pve/pve-root-ca.pem"
+                    ;;
+                *)
+                    _d_ok "certificate is CA-signed — nothing to accept"
+                    ;;
+            esac
         fi
 
         # Is the toolbar button actually in the file the browser loads? This is
@@ -1512,17 +1629,6 @@ is_targeted() {
     [ -z "${ONLY_IDS}" ] && return 0
     echo ",${ONLY_IDS}," | grep -qF ",${id}," && return 0
     return 1
-}
-
-# ==============================================================================
-# HELPER: Read a single field from `qm config` / `pct config`
-# ==============================================================================
-# Keeps values that contain spaces intact, unlike `awk '{print $2}'`.
-config_field() {
-    local cmd="$1" id="$2" key="$3"
-    "${cmd}" config "${id}" 2>/dev/null \
-        | sed -n "s/^${key}:[[:space:]]*//p" \
-        | head -1
 }
 
 # ==============================================================================

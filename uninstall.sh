@@ -70,10 +70,12 @@ Proxmox UI patch.
 
 Usage: uninstall.sh [--yes] [--purge]
 
-  -y, --yes     Don't prompt for confirmation.
+  -y, --yes     Don't prompt for confirmation. Implies keeping the config
+                and logs unless --purge is also given.
       --purge   Also delete /etc/proxmox-autoupdate.conf and the log
-                directory. Without this they are kept, because they hold
-                your Mailgun credentials and your update history.
+                directory. Without this you are asked, and answering no
+                keeps them - they hold your notification credentials and
+                your update history.
   -h, --help    Show this message.
 USAGE
             exit 0
@@ -96,6 +98,35 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# Whether to take the configuration and history with it.
+#
+# --purge used to be the only way to say yes, and nothing ever mentioned it at
+# the prompt. Somebody who ran the documented command and answered "y" to
+# "Proceed?" had every reason to believe they had removed the tool - and the
+# config file survived, so the next install greeted them with "Keep my current
+# settings", offering to reuse an install they had deliberately deleted.
+if [ "${PURGE}" != true ] && [ "${ASSUME_YES}" != true ] \
+   && { [ -e "${CONFIG_FILE}" ] || [ -d "${LOG_DIR}" ]; }; then
+    echo ""
+    echo -e "${C_BOLD}── Settings and history ────────────────────────────────────${C_NC}"
+    echo ""
+    echo -e "  ${CONFIG_FILE} ${C_DIM}(notification credentials, schedule)${C_NC}"
+    echo -e "  ${LOG_DIR}/ ${C_DIM}(every past update report)${C_NC}"
+    echo ""
+    echo -e "  ${C_DIM}Answer no to keep them, so re-installing later can reuse them.${C_NC}"
+    echo ""
+    PURGE_ANS=""
+    # Printed rather than passed to `read -p`, for the same reason as every
+    # other prompt here: bash only shows a -p prompt when stdin is a terminal,
+    # and under `curl -fsSL ... | bash` stdin is the script itself.
+    printf '  Delete these too? (y/N): '
+    if read -r PURGE_ANS < /dev/tty 2>/dev/null; then
+        if [[ "${PURGE_ANS}" =~ ^[Yy]$ ]]; then
+            PURGE=true
+        fi
+    fi
+fi
+
 # --- Show what will happen before doing any of it ---
 echo ""
 echo -e "${C_BOLD}── Will remove ─────────────────────────────────────────────${C_NC}"
@@ -108,8 +139,12 @@ echo -e "  the uninstaller itself"
 if [ "${PURGE}" = true ]; then
     echo -e "  ${C_YELLOW}${CONFIG_FILE}${C_NC} ${C_DIM}(your credentials and settings)${C_NC}"
     echo -e "  ${C_YELLOW}${LOG_DIR}/${C_NC} ${C_DIM}(every past update report)${C_NC}"
-    echo -e "  ${C_YELLOW}${STATE_DIR}/${C_NC} ${C_DIM}(run history)${C_NC}"
 fi
+# Listed unconditionally, because it is removed unconditionally - it holds the
+# pristine pvemanagerlib.js backup, which has to go with the patcher that knows
+# how to use it. Listing it only under --purge meant a plain uninstall deleted
+# the run history after promising to keep it.
+echo -e "  ${STATE_DIR}/ ${C_DIM}(run history, and the pvemanagerlib.js backup)${C_NC}"
 echo ""
 echo -e "${C_BOLD}── Will keep ───────────────────────────────────────────────${C_NC}"
 echo ""
@@ -125,8 +160,9 @@ else
     echo -e "  ${C_DIM}Pass --purge to delete these too.${C_NC}"
 fi
 echo ""
-echo -e "  ${C_DIM}Guest snapshots named autoupdate_* are never touched — remove them${C_NC}"
-echo -e "  ${C_DIM}yourself with 'qm delsnapshot' / 'pct delsnapshot' if you want them gone.${C_NC}"
+echo -e "  ${C_DIM}Snapshots named autoupdate_* — taken before updates by this tool —${C_NC}"
+echo -e "  ${C_DIM}are counted below and you are asked before any are removed. Snapshots${C_NC}"
+echo -e "  ${C_DIM}you took yourself are never candidates.${C_NC}"
 echo ""
 
 if [ "${ASSUME_YES}" != true ]; then
@@ -260,6 +296,125 @@ fi
 # lets the next invocation create a fresh inode and take its own flock, so two
 # runs end up driving pct and qm at once. It is a zero-byte file; leaving it is
 # harmless.
+
+# --- 6b. The Proxmox firewall rule the installer added for the panel ---
+#
+# Matched on the comment the installer writes, so only rules this tool created
+# are touched. Anything an administrator added by hand is left alone: there is
+# no way to know what else it covers.
+FW_COMMENT="proxmox-autoupdate panel"
+if ! command -v pvesh >/dev/null 2>&1; then
+    : # Not a Proxmox node, or pvesh is gone. Nothing of ours to find.
+elif ! command -v python3 >/dev/null 2>&1; then
+    # Say so rather than skipping in silence: the rule opens a root-equivalent
+    # port, and leaving it behind without a word is the wrong kind of quiet.
+    print_skip "python3 is missing, so the firewall rule could not be removed"
+    print_skip "  Remove it by hand: Datacenter or Node -> Firewall, the rule"
+    print_skip "  commented '"'"'proxmox-autoupdate panel'"'"'"
+elif true; then
+    FW_NODE=$(hostname -s 2>/dev/null || hostname)
+    FW_JSON=$(pvesh get "/nodes/${FW_NODE}/firewall/rules" --output-format json 2>/dev/null || true)
+    FW_POSITIONS=""
+    if [ -n "${FW_JSON}" ]; then
+        # Descending, because deleting a rule renumbers every rule below it -
+        # ascending order would delete the wrong ones after the first.
+        FW_POSITIONS=$(FW_COMMENT="${FW_COMMENT}" python3 -c '
+import json, os, sys
+try:
+    rules = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+want = os.environ["FW_COMMENT"]
+for r in rules:
+    if isinstance(r, dict) and r.get("comment") == want and r.get("pos") is not None:
+        print(r["pos"])
+' <<<"${FW_JSON}" 2>/dev/null | sort -rn || true)
+    fi
+    FW_REMOVED=0
+    for FW_POS in ${FW_POSITIONS}; do
+        if pvesh delete "/nodes/${FW_NODE}/firewall/rules/${FW_POS}" >/dev/null 2>&1; then
+            FW_REMOVED=$((FW_REMOVED + 1))
+        fi
+    done
+    if [ "${FW_REMOVED}" -gt 0 ]; then
+        print_ok "Removed ${FW_REMOVED} Proxmox firewall rule(s) opening the panel's port"
+    else
+        print_skip "No Proxmox firewall rule of ours to remove"
+    fi
+fi
+
+# --- 6c. Snapshots this tool took ---
+#
+# Only "autoupdate_<YYYYMMDD>_<HHMMSS>" - the exact shape update-everything.sh
+# creates. A snapshot somebody took by hand is never a candidate, whatever it
+# is called.
+#
+# These used to be left behind with a note saying so. That is defensible until
+# you notice the consequence: the tool that took them, and the only thing that
+# knew to prune them to SNAPSHOT_KEEP, is being deleted. Nothing would ever
+# clean them up again.
+SNAP_REMOVED=0
+if command -v pvesh >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    SNAP_LIST=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | python3 -c '
+import json, re, subprocess, sys
+
+OURS = re.compile(r"\Aautoupdate_\d{8}_\d{6}\Z")
+try:
+    guests = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for g in guests if isinstance(guests, list) else []:
+    vmid = g.get("vmid")
+    node = g.get("node")
+    if vmid is None or not node:
+        continue
+    kind = "lxc" if g.get("type") == "lxc" else "qemu"
+    path = "/nodes/%s/%s/%s/snapshot" % (node, kind, vmid)
+    try:
+        out = subprocess.run(["pvesh", "get", path, "--output-format", "json"],
+                             capture_output=True, text=True, timeout=20)
+        snaps = json.loads(out.stdout) if out.returncode == 0 else []
+    except Exception:
+        continue
+    for snap in snaps if isinstance(snaps, list) else []:
+        name = snap.get("name") or ""
+        if OURS.match(name):
+            print("%s\t%s" % (path, name))
+' 2>/dev/null || true)
+
+    SNAP_COUNT=$(printf '%s' "${SNAP_LIST}" | grep -c . || true)
+    if [ "${SNAP_COUNT:-0}" -gt 0 ]; then
+        SNAP_GO=false
+        if [ "${PURGE}" = true ]; then
+            SNAP_GO=true
+        elif [ "${ASSUME_YES}" != true ]; then
+            echo ""
+            echo -e "  ${C_BOLD}${SNAP_COUNT} snapshot(s) taken before updates are still on this node.${C_NC}"
+            printf '%s\n' "${SNAP_LIST}" | sed 's|/nodes/[^/]*/[a-z]*/||; s|/snapshot\t|  |' \
+                | sed 's/^/      /' | head -20
+            [ "${SNAP_COUNT}" -gt 20 ] && echo "      … and $((SNAP_COUNT - 20)) more"
+            echo -e "  ${C_DIM}Removing this tool leaves nothing that knows to prune them.${C_NC}"
+            echo -e "  ${C_DIM}Guests are untouched either way; you lose these restore points.${C_NC}"
+            SNAP_ANS=""
+            printf '  Delete them? (y/N): '
+            if read -r SNAP_ANS < /dev/tty 2>/dev/null; then
+                if [[ "${SNAP_ANS}" =~ ^[Yy]$ ]]; then SNAP_GO=true; fi
+            fi
+        fi
+        if [ "${SNAP_GO}" = true ]; then
+            while IFS="$(printf '\t')" read -r SNAP_PATH SNAP_NAME; do
+                [ -n "${SNAP_NAME}" ] || continue
+                if pvesh delete "${SNAP_PATH}/${SNAP_NAME}" >/dev/null 2>&1; then
+                    SNAP_REMOVED=$((SNAP_REMOVED + 1))
+                fi
+            done <<<"${SNAP_LIST}"
+            print_ok "Removed ${SNAP_REMOVED} of ${SNAP_COUNT} pre-update snapshot(s)"
+        else
+            print_skip "Kept ${SNAP_COUNT} pre-update snapshot(s)"
+            print_skip "  Nothing will prune them now; remove them from the Proxmox UI"
+        fi
+    fi
+fi
 
 # --- 7. Config and logs, only with --purge ---
 if [ "${PURGE}" = true ]; then

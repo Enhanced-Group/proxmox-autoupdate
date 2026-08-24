@@ -12,6 +12,220 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.13.0 — 2026-08-24
+
+**If a fresh install leaves the panel unreachable, this is the release that
+fixes it.** Two independent faults produced the same symptom — the panel
+answering on `127.0.0.1` while every browser timed out — and neither wrote
+anything to any log.
+
+### Fixed
+
+- **One stalled client could wedge the entire panel.** The TLS handshake ran
+  inside `accept()`, on the single thread that accepts connections, with no
+  deadline on it. A client that completed the TCP connection and then sent no
+  ClientHello blocked every other connection for as long as it stayed open, and
+  the panel recovered the moment it went away. Chrome opens exactly that
+  connection when it speculatively pre-connects to a host:port, and so does any
+  LAN port scanner.
+
+  The handshake now happens in the worker thread that will serve the request,
+  under a ten-second deadline, so a slow or abandoned client can only ever
+  delay itself. The listen backlog goes from socketserver's default of 5 to
+  128: at 5, a handful of half-open connections filled the queue and the kernel
+  dropped further SYNs, which also presents as a timeout rather than a
+  refusal. Idle keep-alive connections are reaped after 65 seconds instead of
+  holding a thread indefinitely.
+
+- **A fresh install left the panel behind a closed firewall port.** While the
+  Proxmox firewall is enabled its default input policy drops anything it has no
+  rule for, and the rules it writes for itself cover 8006, 22, 3128 and
+  5900-5999 — not the panel's port. Nothing in this tool had ever heard of the
+  firewall.
+
+  The installer now checks, and opens the port with one rule per node address
+  — each pinned with `--dest` to that address and sourced from that address's
+  own network, rather than one blanket rule accepting the port on every address
+  the node holds now or later. Never to `any`: this port is equivalent to a
+  root shell, so if the node's addresses cannot be determined it prints the
+  command rather than widening the rule. `--firewall-source CIDR` narrows the
+  source further, `--no-firewall` skips the whole thing. `uninstall.sh` removes the rule again, matched on
+  the comment the installer writes, so rules added by hand are left alone.
+
+- **`--doctor` and the installer both asserted reachability they had never
+  tested.** Both probed `127.0.0.1` and then reported the panel as answering on
+  the node's hostname — an address neither had contacted. On a firewalled node
+  the self-check therefore passed cleanly while nothing could connect. Both now
+  name the address actually probed, and report separately whether the firewall
+  permits the port.
+
+- **The unreachable-panel dialog named two causes, and neither fitted a LAN
+  install.** It offered "a certificate that has not been approved" and "you are
+  behind a proxy", so somebody reaching Proxmox directly on 8006 was sent to
+  accept a certificate on a port that times out. It now names four — firewall,
+  dead service, certificate, proxy — each paired with what clicking OK actually
+  does, because a timeout, an instant refusal and a certificate warning are the
+  one piece of evidence the reader can collect in a second.
+
+- **Uninstalling never offered to remove the configuration.** `--purge` was the
+  only way to say yes and nothing mentioned it at the prompt, so answering "y"
+  to "Proceed?" left `/etc/proxmox-autoupdate.conf` on disk — and the next
+  install opened with "Keep my current settings", offering to reuse an install
+  that had been deliberately removed. The uninstaller now asks. The state
+  directory is listed honestly too: it was always deleted, but only ever
+  mentioned under `--purge`.
+
+### Changed
+
+- **The default panel port is now 8010.** 8007 belongs to Proxmox Backup
+  Server, and co-installing PBS on a PVE host is a documented setup — so the
+  default collided with it, and this tool's own advice when it did was to pick
+  another port.
+
+  Existing installs keep the port they are already on. A port is
+  infrastructure, not a preference: firewall rules, bookmarks and reverse-proxy
+  configuration all point at it. Typical mode preserves it as well, where it
+  used to reset it.
+
+- **The injected UI never leaves Proxmox.** The panel has always opened in a
+  frame inside the Proxmox web UI; the "open in a new tab" buttons — one on
+  that window, one in the unreachable-panel dialog — are gone, and CI now
+  fails if a `window.open` reappears in the injected block.
+
+  The tab was not a convenience. It was the only way to accept a self-signed
+  certificate, because **no browser will render a certificate interstitial
+  inside a frame** — Chrome, Firefox, Edge and Safari all refuse, since a page
+  able to prompt for trust in a subframe is a phishing primitive. So the
+  certificate now has to be made *trusted* rather than *accepted*, which is
+  better regardless: an exception is recorded per host **and port**, so it has
+  to be clicked again for every port and again whenever the port changes.
+
+  The installer, `--doctor` and the dialog all now lead with **Datacenter →
+  ACME**, which needs nothing accepted on any machine, works through a tunnel,
+  and removes the warning on `:8006` too. On a LAN with no public DNS name they
+  point at `/etc/pve/pve-root-ca.pem` instead — one import per workstation,
+  covering every port.
+
+- **`--doctor` reports which certificate the panel serves**, and says what to do
+  about it when that is the self-signed one.
+
+### Added
+
+- **The panel's external address is editable in Settings.** `WEB_UI_PUBLIC_URL`
+  was validated by the panel but had no field, so the only way to set it was to
+  edit `/etc/proxmox-autoupdate.conf` by hand and then run
+  `pve-autoupdate-patch-webui apply` — which meant a shell, for the setting
+  whose whole purpose is reaching the panel when you are somewhere else. It is
+  now under Settings → Configuration, and saving it re-applies the toolbar
+  button, so the change takes effect without one.
+
+- **Settings shows which port the panel is on**, and the command to change it.
+  Deliberately read-only: the service takes its port from its systemd drop-in
+  rather than from the config file, so a field that wrote the config would
+  change nothing until the unit was restarted by hand — and doing it properly
+  also means opening the new port in the firewall and re-pointing the toolbar
+  button, which cannot be done from the page being served on the old port.
+  `install.sh --port N` does the whole sequence and verifies it.
+
+- **An unattended install with no config to keep now takes the Typical
+  profile.** `--unattended` forced keep mode unconditionally, and keep mode
+  reads every value from the existing config — so on a machine that had never
+  had this installed, automation got an install with no web panel and the
+  fallback schedule, on the one path where nobody reads the output.
+
+### Found by review of the panel
+
+- **The Schedule tab was dead.** `/api/schedules` was registered under `do_POST`
+  while the page fetches it with `GET`, so opening Settings → Schedule showed
+  **Not found** and listed nothing at all. Neither the config-key parity check
+  nor anything else in CI looks at which HTTP method serves a route, and reading
+  the file does not show it either — both halves are correct in isolation. It
+  took running the panel and opening the tab.
+
+
+- **The per-guest update page was unreachable.** `/guest?vmid=N` is a complete
+  screen — check for updates, run this guest alone, live output, its own API
+  endpoint — and nothing in the UI linked to it. It existed only for whoever
+  had read the source. Every row of the guest list now offers **Update…**,
+  including for a guest that the schedule skips.
+
+- **Configuration was one flat column of fourteen unrelated settings**, running
+  from Windows update timeouts to snapshot retention to the panel's own port,
+  with nothing marking where one subject ended and the next began. It is now
+  grouped: guest update timeouts, stopped guests, snapshots, this node, this
+  panel.
+
+- **Keyboard focus was never styled.** Nothing in the stylesheet matched
+  `:focus` or `:focus-visible`, so focus fell back to whatever the browser
+  draws — on this dark panel, often a thin ring with almost no contrast against
+  the surface behind it.
+
+### Found by audit
+
+Seven defects found by deliberately attacking this release before shipping it -
+static analysis, injection and traversal fuzzing, three-way parser comparison,
+and a mock Proxmox node with stubbed guests.
+
+- **The toolbar button ignored a non-default port entirely.** `patch-webui.sh`
+  read `WEB_UI_PORT` with a pattern that accepted a bare number or a
+  *double*-quoted one. Config values are written by `sq()`, which emits
+  **single** quotes — so `WEB_UI_PORT='8011'` matched nothing and the port
+  silently fell back to the built-in default, while the service listened on the
+  configured one. Anyone who chose a non-default port got a button pointing at a
+  port with nothing behind it, and the symptom was an unreachable panel with the
+  config, the service and `--doctor` all agreeing on a port that one file had
+  never seen. Present since `sq()` was introduced.
+
+- **`--doctor` called a function that did not exist yet.** `config_field()` was
+  defined some 700 lines below the point where `--doctor` is dispatched, and
+  bash binds function names as it reads a file. Every run printed
+  `config_field: command not found` to stderr once per guest, and because the
+  failed call returned nothing, no container was ever recognised as a template:
+  the self-check reported "0 template(s) skipped" regardless, and probed
+  templates as though they were live containers. The update path was unaffected
+  — it runs after the definition.
+
+- **An unreadable certificate was reported as CA-signed.** If `openssl` failed
+  or the file could not be parsed, the issuer string came back empty, missed the
+  self-signed test, and fell through to "certificate is CA-signed — nothing to
+  accept". That is the same false reassurance as reporting a loopback probe as
+  proof the panel is reachable. It now says the type is unknown.
+
+- **A port clash was diagnosed only half the time.** The "something else is
+  already listening" hint appeared only when the service was *not* running. The
+  unit is `Type=simple`, so systemd reports "active" for the seconds a
+  crash-looping service spends forked-but-dying — which is exactly what a port
+  clash looks like. The hint is now shown in both branches, and names the
+  process holding the port.
+
+- **A NUL byte in a log name crashed the request.** `safe_log_path()` rejected
+  traversal, absolute paths, symlinks out of the directory and every encoding
+  trick thrown at it, but a NUL made `os.path.realpath` raise `ValueError`,
+  uncaught — a dropped request and a traceback in the journal instead of a
+  clean rejection. Authenticated-only, and never a disclosure.
+
+- **The two schedule parsers disagreed on two inputs.** A label containing `|`
+  was kept whole by the shell and truncated at the first separator by the panel,
+  so re-saving a hand-edited schedule silently lost label text; and a cron
+  expression with surrounding whitespace was trimmed by the panel and kept
+  verbatim by the shell. Neither changed when a host reboots — the cron and
+  mode fields agreed in all 26 cases tested — but they are required to agree.
+
+- **Uninstalling could leave the firewall rule behind in silence.** The cleanup
+  needs `python3` to read the rule list; without it the whole block was skipped
+  without a word, leaving a root-equivalent port open after an uninstall. It now
+  says so and prints how to remove the rule by hand.
+
+### Added
+
+- **The panel's port can be chosen, and bad choices are refused up front.** The
+  prompt rejects anything below 1024, above 65535, already listening, or
+  belonging to a common service — 8006, 8007, 3128, 8080, 5900-5999 and
+  60000-60050 among them — and says which of those it is, instead of failing
+  later at bind time where the only symptom is a panel that never started.
+  `--port N` applies the same rules non-interactively and is validated before
+  anything is written to disk.
+
 ## 1.12.4 — 2026-08-12
 
 **Upgrade immediately if you are on 1.11.0 – 1.12.3.** On those versions the
@@ -21,8 +235,7 @@ toolbar patch makes the entire Proxmox web UI load blank.
 
 - **The injected JavaScript block did not parse, so every patched node's web UI
   went blank.** Two string literals in the block contained real newlines instead
-  of `
-`. `pvemanagerlib.js` is a single script, so one syntax error anywhere
+  of `\n`. `pvemanagerlib.js` is a single script, so one syntax error anywhere
   in it stops the whole file executing — not just this tool's button, but the
   entire Proxmox interface.
 
