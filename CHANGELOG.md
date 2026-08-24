@@ -12,6 +12,80 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.13.1 — 2026-08-24
+
+Everything here was found after 1.13.0 was tagged, by continuing to attack it. **The first of these means a failed run could not tell you it had failed.**
+
+### Windows guests
+
+- **A Typical install gave Windows a third of the time it needs.**
+  `update-everything.sh` falls back to `3600` and the panel shows `3600` as the
+  default, but `apply_typical_profile()` wrote **1200** into the config — and a
+  value in the config beats the script's default. So the recommended install
+  path gave a Windows guest twenty minutes to install a cumulative update, next
+  to a help string in the panel reading "cumulative updates often need more than
+  an hour". Keep mode fell back to 1200 as well.
+
+  Both are 3600 now. **An install made before this still has 1200 in its
+  config**, and nothing rewrites it — a config value may have been chosen
+  deliberately. `--doctor` says so instead, but only when the node actually has
+  Windows VMs, with the one-line fix.
+
+  CI compared the panel's defaults against the updater's; nothing compared
+  either against the profile that writes the config, so two of the three
+  agreeing looked like agreement. It is compared now, with `REBOOT_TIME`
+  allowed as a deliberate difference.
+
+- **Windows guests are marked in the guest list**, and their **Update…** says
+  what it costs. The injected toolbar button hides itself for Windows
+  ("updated by the scheduled run only"); the panel offers it, because a flaky
+  Windows guest is the one most worth running on its own and watching — but an
+  unmarked action next to a Debian container implied the same five seconds.
+
+### Reports
+
+- **The HTML report is Proxmox grey, in the colours you chose.** It was
+  hard-coded light — `#f4f6f9` on white — so a report opened from a Discord
+  attachment was a white flash that looked nothing like the tool that sent it.
+  It now reads the same `/etc/proxmox-autoupdate-theme.json` the panel writes
+  and matches the panel's own surfaces, accent included. Status badges carry
+  their colour on the text and border rather than as a pale fill, which is what
+  made them shout against a dark ground.
+
+  Only a plain `#rrggbb` is ever interpolated into that stylesheet: the value
+  reaches CSS in a document you open in a browser, so everything else — a named
+  colour, `url(...)`, a closing `</style>`, a newline — falls back to the
+  shipped default.
+
+### Found by a second audit
+
+- **The fatal notifier could not send.** `json_escape()` opened with
+  `sed -e ':a' -e 'N' -e '$!ba'` to pull every line into the pattern space. With
+  two or more lines that works. With exactly one — which is every message
+  `notify_fatal` builds — `N` has no next line, and GNU sed prints the pattern
+  space and exits **before reaching the substitutions**. So the text went into
+  the JSON body unescaped: one quote or backslash and the body was invalid, the
+  endpoint rejected it, and the message saying the run had died was dropped
+  silently. It failed exactly when it was needed.
+
+  It now escapes with `json.dumps`, which also handles what no sed pipeline
+  can — an ANSI escape or a bell from an apt error is a raw control character,
+  and those are not legal inside a JSON string either. The sed fallback, for the
+  early-failure path where python3 might genuinely be missing, uses
+  `$!{N;ba}` and drops unrepresentable control characters. Sixteen shapes of
+  hostile text now round-trip to valid JSON; before, six of them did not.
+
+- **A line break in a schedule label produced a malformed crontab line.** The
+  label became a comment *and* a second command line beginning with the text
+  after the break, which `crontab(1)` rejects — taking the whole schedule with
+  it and aborting the installer at "Configuring the schedule" with an error
+  pointing at cron rather than at the label. Both of the panel's write paths
+  already refused labels containing `;`, `|`, CR or LF, so only a hand-edited
+  config could reach it; all three parsers now strip line breaks as well.
+
+- **`--purge` left the panel's colours behind.** `/etc/proxmox-autoupdate-theme.json`
+  is written when the panel is recoloured, and nothing ever removed it.
+
 ## 1.13.0 — 2026-08-24
 
 **If a fresh install leaves the panel unreachable, this is the release that
@@ -132,76 +206,6 @@ anything to any log.
   reads every value from the existing config — so on a machine that had never
   had this installed, automation got an install with no web panel and the
   fallback schedule, on the one path where nobody reads the output.
-
-### Found by a second audit
-
-- **The fatal notifier could not send.** `json_escape()` opened with
-  `sed -e ':a' -e 'N' -e '$!ba'` to pull every line into the pattern space. With
-  two or more lines that works. With exactly one — which is every message
-  `notify_fatal` builds — `N` has no next line, and GNU sed prints the pattern
-  space and exits **before reaching the substitutions**. So the text went into
-  the JSON body unescaped: one quote or backslash and the body was invalid, the
-  endpoint rejected it, and the message saying the run had died was dropped
-  silently. It failed exactly when it was needed.
-
-  It now escapes with `json.dumps`, which also handles what no sed pipeline
-  can — an ANSI escape or a bell from an apt error is a raw control character,
-  and those are not legal inside a JSON string either. The sed fallback, for the
-  early-failure path where python3 might genuinely be missing, uses
-  `$!{N;ba}` and drops unrepresentable control characters. Sixteen shapes of
-  hostile text now round-trip to valid JSON; before, six of them did not.
-
-- **A line break in a schedule label produced a malformed crontab line.** The
-  label became a comment *and* a second command line beginning with the text
-  after the break, which `crontab(1)` rejects — taking the whole schedule with
-  it and aborting the installer at "Configuring the schedule" with an error
-  pointing at cron rather than at the label. Both of the panel's write paths
-  already refused labels containing `;`, `|`, CR or LF, so only a hand-edited
-  config could reach it; all three parsers now strip line breaks as well.
-
-- **`--purge` left the panel's colours behind.** `/etc/proxmox-autoupdate-theme.json`
-  is written when the panel is recoloured, and nothing ever removed it.
-
-### Reports
-
-- **The HTML report is Proxmox grey, in the colours you chose.** It was
-  hard-coded light — `#f4f6f9` on white — so a report opened from a Discord
-  attachment was a white flash that looked nothing like the tool that sent it.
-  It now reads the same `/etc/proxmox-autoupdate-theme.json` the panel writes
-  and matches the panel's own surfaces, accent included. Status badges carry
-  their colour on the text and border rather than as a pale fill, which is what
-  made them shout against a dark ground.
-
-  Only a plain `#rrggbb` is ever interpolated into that stylesheet: the value
-  reaches CSS in a document you open in a browser, so everything else — a named
-  colour, `url(...)`, a closing `</style>`, a newline — falls back to the
-  shipped default.
-
-### Windows guests
-
-- **A Typical install gave Windows a third of the time it needs.**
-  `update-everything.sh` falls back to `3600` and the panel shows `3600` as the
-  default, but `apply_typical_profile()` wrote **1200** into the config — and a
-  value in the config beats the script's default. So the recommended install
-  path gave a Windows guest twenty minutes to install a cumulative update, next
-  to a help string in the panel reading "cumulative updates often need more than
-  an hour". Keep mode fell back to 1200 as well.
-
-  Both are 3600 now. **An install made before this still has 1200 in its
-  config**, and nothing rewrites it — a config value may have been chosen
-  deliberately. `--doctor` says so instead, but only when the node actually has
-  Windows VMs, with the one-line fix.
-
-  CI compared the panel's defaults against the updater's; nothing compared
-  either against the profile that writes the config, so two of the three
-  agreeing looked like agreement. It is compared now, with `REBOOT_TIME`
-  allowed as a deliberate difference.
-
-- **Windows guests are marked in the guest list**, and their **Update…** says
-  what it costs. The injected toolbar button hides itself for Windows
-  ("updated by the scheduled run only"); the panel offers it, because a flaky
-  Windows guest is the one most worth running on its own and watching — but an
-  unmarked action next to a Debian container implied the same five seconds.
 
 ### Found by review of the panel
 
