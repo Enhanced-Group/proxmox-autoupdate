@@ -414,6 +414,49 @@ for flag in --no-reboot --reboot-window; do
 done
 [ "${FLAG_OK}" -eq 1 ] && ok "--no-reboot and --reboot-window are emitted and understood"
 
+# --- 3d-sexies. Typical install sets every key it is responsible for ---------
+# A Typical install answers no questions, so every value the config file needs
+# must come from apply_typical_profile() or from the seeded-from-PREV block.
+# A setting added to the prompts but not to the profile leaves an unset variable
+# on that path — and under `set -u` that is not a missing default, it is an
+# abort partway through writing the config, on the install path most people use.
+echo "== Typical install covers every setting =="
+PROFILE=$(sed -n '/^apply_typical_profile() {/,/^}/p' install.sh)
+KEEPPROF=$(sed -n '/^apply_keep_profile() {/,/^}/p' install.sh)
+SEEDED=$(sed -n '/^# Everything the config file needs, seeded from/,/^echo ""$/p' install.sh)
+CONF_KEYS=$(sed -n '/^cat > "${CONFIG_FILE}" <<CONF$/,/^CONF$/p' install.sh             | grep -oE '^[A-Z0-9_]+=' | tr -d '=')
+# Written from a value the installer computes rather than one it is given.
+COMPUTED="NTFY_PRIORITY DRY_RUN LOG_DIR"
+MISSING=""
+KEEP_MISSING=""
+for key in ${CONF_KEYS}; do
+    case " ${COMPUTED} " in *" ${key} "*) continue ;; esac
+    grep -q "^\s*${key}=" <<<"${PROFILE}${SEEDED}"   || MISSING="${MISSING} ${key}"
+    grep -q "^\s*${key}=" <<<"${KEEPPROF}${SEEDED}"  || KEEP_MISSING="${KEEP_MISSING} ${key}"
+done
+if [ -n "${MISSING}" ]; then
+    fail "Typical install never sets:${MISSING}"
+else
+    ok "all $(echo "${CONF_KEYS}" | wc -w) config keys are set without asking"
+fi
+# Keep mode skips the prompts too, and used to rely on `source CONFIG_FILE`
+# having incidentally bound them — which fails the moment a key is absent from
+# an older config, after the heredoc has already truncated the file.
+if [ -n "${KEEP_MISSING}" ]; then
+    fail "keep/unattended install never sets:${KEEP_MISSING}"
+else
+    ok "keep mode sets every key explicitly, not via sourcing the old config"
+fi
+
+# The three prompt regions must stay behind asking(), or Typical starts
+# interrogating people again.
+GATES=$(grep -c '^if asking; then' install.sh)
+if [ "${GATES}" -eq 3 ]; then
+    ok "notifications, advanced settings and schedule are all gated on asking()"
+else
+    fail "expected 3 asking() gates in install.sh, found ${GATES}"
+fi
+
 # --- 3e. No faint text -------------------------------------------------------
 # \033[2m is rendered at very low contrast by xterm.js, which is what the
 # Proxmox web shell uses — it made roughly a third of the installer invisible

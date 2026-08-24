@@ -12,6 +12,62 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.10.0 — 2026-08-12
+
+### Added
+
+- **Typical or Custom, asked first.** The installer opened with fifteen
+  questions, which is a good way to lose someone at question four. It now asks
+  one:
+
+  ```
+  1) Typical  — recommended defaults, nothing to answer
+  2) Custom   — choose everything yourself
+  ```
+
+  Typical prints the full profile it is about to apply before applying it — it
+  is not a black box — and then asks nothing else until the optional dry run at
+  the end:
+
+  | | |
+  | --- | --- |
+  | Schedule | Fridays 23:00, reboot at 02:00 only if a kernel was installed |
+  | Guests | Stopped containers and Linux VMs started, updated, put back; Windows left alone |
+  | Web panel | Installed on port 8007, toolbar button added |
+  | Notifications | **Off** |
+  | Snapshots | Off |
+  | Logs | Kept for 90 days |
+  | Exclusions | None |
+
+  **Notifications stay off deliberately.** There is no safe guess at somebody's
+  mail server, and a channel configured wrongly is worse than none: it reports
+  nothing and looks configured. Add one afterwards from the panel.
+
+- **Re-installing offers to keep what is there.** On a host that already has a
+  config the first question becomes a three-way choice, defaulting to *Keep my
+  current settings*. "Typical" on a machine somebody has already set up would
+  mean silently discarding their settings, so it is never the default there.
+  The panel's unattended self-update takes the keep path automatically.
+
+### Fixed
+
+- **Keep mode was relying on `source` to bind its variables.** Skipping the
+  prompts left `NOTIFY_METHODS` and the rest defined only as a side effect of
+  sourcing the old config — so a config missing any key (anything written by an
+  older version) aborted with `unbound variable`, *after* the heredoc had
+  already truncated the config file to zero bytes. Keep mode now sets every
+  value explicitly, with the same fallbacks the prompts would have offered, and
+  synthesises a schedule list from `UPDATE_SCHEDULE_CRON` when upgrading a
+  pre-1.9.0 config. Caught by running the three modes back to back rather than
+  one at a time.
+
+- Every value the config file needs is now seeded before the prompts rather than
+  inside them. Skipping the prompts previously left those variables unset, and
+  under `set -u` that is not a missing default — it is an abort partway through
+  writing the config, on the install path most people would take. CI checks that
+  all 45 keys are set without asking, and that the three prompt sections stay
+  behind the mode gate.
+
 ## 1.9.0 — 2026-08-12
 
 ### Added

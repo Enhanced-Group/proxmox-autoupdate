@@ -25,7 +25,7 @@ REPO_SLUG="Enhanced-Group/proxmox-autoupdate"
 #
 # PAU_BRANCH is still honoured so existing documentation and scripts keep
 # working.
-PAU_FALLBACK_REF="v1.9.0"
+PAU_FALLBACK_REF="v1.10.0"
 PAU_CHANNEL="${PAU_CHANNEL:-release}"
 PAU_REF="${PAU_REF:-${PAU_BRANCH:-}}"
 
@@ -610,6 +610,158 @@ if [ -f "${CONFIG_FILE}" ]; then
     fi
 fi
 
+# 1a. Typical or Custom
+#
+# Asked before anything else is decided, because it decides everything else.
+# Most people want a working scheduled updater and a button in the Proxmox UI,
+# and answering fifteen questions to get it is a way to lose them at question
+# four. Typical asks nothing and prints exactly what it is choosing, so it is
+# not a black box — every value below is visible before it is written.
+#
+# Notifications stay off in Typical. There is no safe guess at somebody's mail
+# server, and a channel configured wrongly is worse than no channel: it reports
+# nothing and looks configured.
+INSTALL_MODE="typical"
+
+apply_typical_profile() {
+    NOTIFY_METHODS=""
+    NOTIFY_ON_FAILURE_ONLY="false"
+    EXCLUDE_IDS=""
+    WINDOWS_UPDATE_TIMEOUT="1200"
+    LINUX_UPDATE_TIMEOUT="1800"
+    APT_LOCK_TIMEOUT="600"
+    START_STOPPED_WINDOWS="false"
+    START_STOPPED_LXC="true"
+    START_STOPPED_LINUX_VMS="true"
+    SNAPSHOT_BEFORE_UPDATE="false"
+    SNAPSHOT_KEEP="3"
+    ENABLE_WEB_UI="true"
+    WEB_UI_PORT="8007"
+    KEEP_LOGS="true"
+    LOG_RETENTION_DAYS="90"
+    UPDATE_SCHEDULES="0 23 * * 5|yes|Weekly updates"
+    UPDATE_SCHEDULE_CRON="0 23 * * 5"
+    REBOOT_TIME="02:00"
+    CONFIRM_UPDATES="${PREV_CONFIRM:-true}"
+}
+
+# Keep mode: every value comes from the existing config, with the same fallbacks
+# the prompts would have offered.
+#
+# This is not optional bookkeeping. Keep mode skips the prompt blocks, and those
+# blocks are where NOTIFY_METHODS and friends were being set — so without this
+# the installer sourced the config, relied on that source having incidentally
+# bound the variables, and died with "NOTIFY_METHODS: unbound variable" the
+# moment the config was empty or predated a key. It had already truncated the
+# config file by then, because the heredoc opens before it fails.
+apply_keep_profile() {
+    NOTIFY_METHODS="${PREV_NOTIFY_METHODS}"
+    NOTIFY_ON_FAILURE_ONLY="${PREV_FAIL_ONLY:-false}"
+    EXCLUDE_IDS="${PREV_EXCLUDE}"
+    WINDOWS_UPDATE_TIMEOUT="${PREV_WIN_TIMEOUT:-1200}"
+    LINUX_UPDATE_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
+    APT_LOCK_TIMEOUT="${PREV_APT_LOCK:-600}"
+    START_STOPPED_WINDOWS="${PREV_START_WIN:-false}"
+    START_STOPPED_LXC="${PREV_START_LXC:-true}"
+    START_STOPPED_LINUX_VMS="${PREV_START_LINUX_VMS:-true}"
+    SNAPSHOT_BEFORE_UPDATE="${PREV_SNAPSHOT:-false}"
+    SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
+    ENABLE_WEB_UI="${PREV_WEBUI:-false}"
+    WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
+    KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
+    LOG_RETENTION_DAYS="${PREV_LOG_RETENTION:-90}"
+    UPDATE_SCHEDULE_CRON="${PREV_CRON:-0 23 * * 5}"
+    REBOOT_TIME="${PREV_REBOOT_TIME:-00:00}"
+    CONFIRM_UPDATES="${PREV_CONFIRM:-true}"
+    # A config from before 1.9.0 has no schedule list, only the single
+    # expression. Synthesise the list rather than writing an empty one, or the
+    # crontab this run rebuilds would lose the schedule entirely.
+    if [ -n "${PREV_SCHEDULES}" ]; then
+        UPDATE_SCHEDULES="${PREV_SCHEDULES}"
+    else
+        UPDATE_SCHEDULES="${UPDATE_SCHEDULE_CRON}|yes|Updates"
+    fi
+}
+
+print_typical_profile() {
+    echo -e "  ${C_CYAN}Schedule${C_NC}       Fridays at 23:00, and reboot at 02:00 if a kernel"
+    echo -e "                 was installed. Nothing reboots otherwise."
+    echo -e "  ${C_CYAN}Guests${C_NC}         Stopped containers and Linux VMs are started, updated"
+    echo -e "                 and put back as they were. Windows VMs are left alone —"
+    echo -e "                 Windows Update can run for well over half an hour."
+    echo -e "  ${C_CYAN}Web panel${C_NC}      Installed on port ${C_BOLD}8007${C_NC}, with the Update Everything"
+    echo -e "                 button added to the Proxmox toolbar."
+    echo -e "  ${C_CYAN}Notifications${C_NC}  ${C_BOLD}Off.${C_NC} Updates run quietly. Add email, Discord, Slack,"
+    echo -e "                 Teams, ntfy, Gotify, Telegram or a webhook later from"
+    echo -e "                 the panel — nothing here guesses at your mail server."
+    echo -e "  ${C_CYAN}Snapshots${C_NC}      Off. They need ZFS, LVM-thin or qcow2 and real disk"
+    echo -e "                 space, which is not a safe assumption to make for you."
+    echo -e "  ${C_CYAN}Logs${C_NC}           Kept in /var/log/proxmox-autoupdate/ for 90 days."
+    echo -e "  ${C_CYAN}Exclusions${C_NC}     None. Every guest is updated."
+    echo ""
+    echo -e "  ${C_DIM}All of it is editable afterwards, in the panel or in${C_NC}"
+    echo -e "  ${C_DIM}/etc/proxmox-autoupdate.conf. Re-running this installer offers to${C_NC}"
+    echo -e "  ${C_DIM}keep whatever you end up with.${C_NC}"
+}
+
+if [ "${UNATTENDED}" = true ]; then
+    # The panel's self-update path. Reuse everything; ask nothing.
+    INSTALL_MODE="keep"
+else
+    echo ""
+    print_box_top
+    print_box_line "${C_BOLD}How would you like to install?${C_NC}" "How would you like to install?"
+    print_box_bottom
+    echo ""
+    if [ -f "${CONFIG_FILE}" ]; then
+        # A configured host must not be reset by accident. Keeping what is there
+        # is the default, because "Typical" on a machine somebody has already
+        # set up means silently discarding their settings.
+        echo -e "    ${C_CYAN}1)${C_NC} ${C_BOLD}Keep my current settings${C_NC}  ${C_DIM}— just update the files${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} ${C_BOLD}Typical${C_NC}  ${C_DIM}— reset to the recommended defaults${C_NC}"
+        echo -e "    ${C_CYAN}3)${C_NC} ${C_BOLD}Custom${C_NC}   ${C_DIM}— go through every question${C_NC}"
+        echo ""
+        ask INPUT_MODE "  Select 1-3 [Enter for 1]: "
+        case "${INPUT_MODE}" in
+            2) INSTALL_MODE="typical" ;;
+            3) INSTALL_MODE="custom" ;;
+            *) INSTALL_MODE="keep" ;;
+        esac
+    else
+        echo -e "    ${C_CYAN}1)${C_NC} ${C_BOLD}Typical${C_NC}  ${C_DIM}— recommended defaults, nothing to answer${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} ${C_BOLD}Custom${C_NC}   ${C_DIM}— choose everything yourself${C_NC}"
+        echo ""
+        ask INPUT_MODE "  Select 1 or 2 [Enter for 1]: "
+        case "${INPUT_MODE}" in
+            2) INSTALL_MODE="custom" ;;
+            *) INSTALL_MODE="typical" ;;
+        esac
+    fi
+fi
+
+case "${INSTALL_MODE}" in
+    typical)
+        apply_typical_profile
+        echo ""
+        print_ok "Typical install. Here is exactly what that means:"
+        echo ""
+        print_typical_profile
+        ;;
+    keep)
+        apply_keep_profile
+        print_ok "Keeping the existing configuration ${C_DIM}(${CONFIG_FILE})${C_NC}"
+        print_skip "Nothing will be asked; the files are refreshed and the schedule re-applied."
+        ;;
+    *)
+        print_ok "Custom install — every setting is asked."
+        ;;
+esac
+
+# True only when the installer should be putting questions to a human. Every
+# prompt block below is gated on this, so Typical and the panel's unattended
+# self-update take exactly the same path through the rest of the script.
+asking() { [ "${INSTALL_MODE}" = "custom" ]; }
+
 # 1b. Dependencies
 #   jq      — every guest-agent reply is parsed as JSON; regex-scraping that
 #             output fails silently in ways that look like timeouts.
@@ -636,40 +788,14 @@ done
 # so the two never end up pointing at different places.
 LOG_DIR="${PREV_LOG_DIR:-${LOG_DIR}}"
 
-echo ""
-step "Notifications"
-echo ""
-echo -e "  ${C_DIM}Optional. Updates run on schedule whether or not a channel is set${C_NC}"
-echo -e "  ${C_DIM}up — without one they simply run quietly. You can add or change${C_NC}"
-echo -e "  ${C_DIM}channels later from the web panel or the config file.${C_NC}"
-echo ""
-
+# Everything the config file needs, seeded from whatever is already installed.
+#
+# These used to sit inside the Notifications prompts. Typical and unattended
+# installs skip those prompts, and under `set -u` an unset key here is not a
+# missing default, it is an immediate abort partway through writing the config.
 DISCORD_BOT_TOKEN="${PREV_BOT_TOKEN}"
 DISCORD_USER_ID="${PREV_USER_ID}"
 CONFIRM_UPDATES="${PREV_CONFIRM:-true}"
-DEFAULT_METHODS="${PREV_NOTIFY_METHODS:-}"
-if [ -n "${DEFAULT_METHODS}" ]; then
-    echo -e "  ${C_DIM}Currently enabled: ${DEFAULT_METHODS}${C_NC}"
-fi
-echo -e "  ${C_CYAN}1)${C_NC} Skip for now  ${C_DIM}(updates still run; add a channel later)${C_NC}"
-echo -e "  ${C_CYAN}2)${C_NC} Email  ${C_DIM}(any SMTP server, or the Mailgun API)${C_NC}"
-echo -e "  ${C_CYAN}3)${C_NC} Discord  ${C_DIM}(webhook, or a bot DM)${C_NC}"
-echo -e "  ${C_CYAN}4)${C_NC} Slack  ${C_DIM}(incoming webhook)${C_NC}"
-echo -e "  ${C_CYAN}5)${C_NC} Microsoft Teams  ${C_DIM}(separate — Teams cannot read Slack's format)${C_NC}"
-echo -e "  ${C_CYAN}6)${C_NC} ntfy  ${C_DIM}(self-hosted or ntfy.sh)${C_NC}"
-echo -e "  ${C_CYAN}7)${C_NC} Gotify"
-echo -e "  ${C_CYAN}8)${C_NC} Telegram  ${C_DIM}(bot)${C_NC}"
-echo -e "  ${C_CYAN}9)${C_NC} Generic webhook  ${C_DIM}(JSON POST)${C_NC}"
-echo ""
-echo -e "  ${C_DIM}Enter one or more numbers, e.g. \"3\" or \"2,3\".${C_NC}"
-# "[Enter to keep current]" was meaningless on a fresh install, where there is
-# no current — it read as though pressing Enter would keep something.
-if [ -n "${DEFAULT_METHODS}" ]; then
-    ask INPUT_METHODS "  Select [Enter to keep ${DEFAULT_METHODS}]: "
-else
-    ask INPUT_METHODS "  Select [Enter for 1, skip]: "
-fi
-
 MAILGUN_API_KEY="${PREV_KEY}"
 MAILGUN_DOMAIN="${PREV_DOMAIN}"
 MAILGUN_REGION="${PREV_REGION:-EU}"
@@ -696,638 +822,713 @@ DISCORD_WEBHOOK_URL="${PREV_DISCORD}"
 SLACK_WEBHOOK_URL="${PREV_SLACK}"
 GENERIC_WEBHOOK_URL="${PREV_GENERIC}"
 
-if [ -z "${INPUT_METHODS}" ]; then
-    NOTIFY_METHODS="${DEFAULT_METHODS}"
-    if [ -z "${NOTIFY_METHODS}" ]; then
-        print_ok "Notifications: none ${C_DIM}(updates will run silently)${C_NC}"
-    else
-        print_ok "Notifications unchanged: ${NOTIFY_METHODS}"
-    fi
-else
-    NOTIFY_METHODS=""
-    for CHOICE in $(echo "${INPUT_METHODS}" | tr ',' ' '); do
-        case "${CHOICE}" in
-            1) NOTIFY_METHODS=""; break ;;
-            2) NOTIFY_METHODS="${NOTIFY_METHODS},email" ;;
-            3) NOTIFY_METHODS="${NOTIFY_METHODS},discord" ;;
-            4) NOTIFY_METHODS="${NOTIFY_METHODS},slack" ;;
-            5) NOTIFY_METHODS="${NOTIFY_METHODS},teams" ;;
-            6) NOTIFY_METHODS="${NOTIFY_METHODS},ntfy" ;;
-            7) NOTIFY_METHODS="${NOTIFY_METHODS},gotify" ;;
-            8) NOTIFY_METHODS="${NOTIFY_METHODS},telegram" ;;
-            9) NOTIFY_METHODS="${NOTIFY_METHODS},webhook" ;;
-            *) print_fail "Ignoring unrecognised choice '${CHOICE}'" ;;
-        esac
-    done
-    NOTIFY_METHODS="${NOTIFY_METHODS#,}"
-
-    # --- Per-channel details, asked only for the channels chosen ---
-    if echo ",${NOTIFY_METHODS}," | grep -q ",email,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Email${C_NC}"
-        # SMTP was added to the updater and the panel in 1.2.0 but never to the
-        # installer, which still assumed email meant Mailgun. A fresh install
-        # was therefore forced through Mailgun prompts it could not skip, even
-        # for someone who only wanted to use their own mail server.
-        echo -e "  ${C_DIM}1) SMTP server — any mail server, relay or app password${C_NC}"
-        echo -e "  ${C_DIM}2) Mailgun API${C_NC}"
-        DEFAULT_TRANSPORT="1"
-        [ "${PREV_TRANSPORT}" = "mailgun" ] && DEFAULT_TRANSPORT="2"
-        [ -z "${PREV_TRANSPORT}" ] && [ -n "${PREV_KEY}" ] && DEFAULT_TRANSPORT="2"
-        ask I "  Send via [${DEFAULT_TRANSPORT}]: "
-        case "${I:-${DEFAULT_TRANSPORT}}" in
-            2) EMAIL_TRANSPORT="mailgun" ;;
-            *) EMAIL_TRANSPORT="smtp" ;;
-        esac
-
-        if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
-            ask_required MAILGUN_API_KEY "API key" "${PREV_KEY}"
-            ask_required MAILGUN_DOMAIN "Domain (e.g. mg.example.com)" "${PREV_DOMAIN}"
-            if [ "${MAILGUN_REGION}" = "US" ]; then
-                ask I "  Region — 1 for EU, 2 for US [Enter for 2]: "
-            else
-                ask I "  Region — 1 for EU, 2 for US [Enter for 1]: "
-            fi
-            case "${I}" in 1) MAILGUN_REGION="EU" ;; 2) MAILGUN_REGION="US" ;; esac
-        else
-            ask_required SMTP_HOST "SMTP host (e.g. smtp.example.com)" "${PREV_SMTP_HOST}"
-            ask I "  Port [${PREV_SMTP_PORT:-587}]: "
-            SMTP_PORT="${I:-${PREV_SMTP_PORT:-587}}"
-            echo -e "  ${C_DIM}1) STARTTLS (587)   2) SSL/TLS (465)   3) none — local relay${C_NC}"
-            case "${SMTP_SECURITY}" in ssl) SEC_DEFAULT=2 ;; none) SEC_DEFAULT=3 ;; *) SEC_DEFAULT=1 ;; esac
-            ask I "  Encryption [Enter for ${SEC_DEFAULT}]: "
-            case "${I:-${SEC_DEFAULT}}" in
-                2) SMTP_SECURITY="ssl" ;;
-                3) SMTP_SECURITY="none" ;;
-                *) SMTP_SECURITY="starttls" ;;
-            esac
-            if [ -n "${PREV_SMTP_USER}" ]; then
-                ask I "  Username [Enter keeps ${PREV_SMTP_USER}]: "
-            else
-                ask I "  Username [Enter for none — unauthenticated relay]: "
-            fi
-            SMTP_USER="${I:-${PREV_SMTP_USER}}"
-            if [ -n "${SMTP_USER}" ]; then
-                if [ -n "${PREV_SMTP_PASSWORD}" ]; then
-                    ask_secret I "  Password [Enter to keep the existing one]: "
-                else
-                    ask_secret I "  Password (not echoed): "
-                fi
-                SMTP_PASSWORD="${I:-${PREV_SMTP_PASSWORD}}"
-            fi
-        fi
-
-        ask_required SENDER_EMAIL "From address" "${PREV_SENDER}"
-        ask_required RECIPIENT_EMAIL "To address" "${PREV_RECIPIENT}"
-        if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
-            print_ok "Email via Mailgun (${MAILGUN_REGION} → ${RECIPIENT_EMAIL})"
-        else
-            print_ok "Email via SMTP (${SMTP_HOST}:${SMTP_PORT} → ${RECIPIENT_EMAIL})"
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",discord,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Discord${C_NC}"
-        echo -e "    ${C_CYAN}1)${C_NC} Channel webhook  ${C_DIM}(Server Settings → Integrations → Webhooks)${C_NC}"
-        echo -e "    ${C_CYAN}2)${C_NC} Direct message   ${C_DIM}(bot token + your user ID)${C_NC}"
-        ask I "  Select 1 or 2 [1]: "
-        if [ "${I}" = "2" ]; then
-            echo -e "  ${C_DIM}The bot must share a server with you for Discord to allow the DM.${C_NC}"
-            echo -e "  ${C_DIM}It is never run as a process — the token is only used to POST.${C_NC}"
-            ask_secret I "  Bot token (not echoed): "
-            DISCORD_BOT_TOKEN="${I:-${PREV_BOT_TOKEN}}"
-            ask I "  Your Discord user ID (numeric): "
-            DISCORD_USER_ID="${I:-${PREV_USER_ID}}"
-            ask I "  Fallback webhook URL (optional): "
-            DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
-            if [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; then
-                print_ok "Discord DM configured"
-            else
-                print_fail "Both a bot token and a user ID are needed — dropping Discord."
-                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
-            fi
-        else
-            ask I "  Webhook URL: "
-            DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
-            if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
-                print_ok "Discord configured"
-            else
-                print_fail "No URL given — dropping Discord."
-                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
-            fi
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",slack,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Slack${C_NC}"
-        ask I "  Webhook URL: "
-        SLACK_WEBHOOK_URL="${I:-${PREV_SLACK}}"
-        if [ -n "${SLACK_WEBHOOK_URL}" ]; then
-            print_ok "Slack configured"
-        else
-            print_fail "No URL given — dropping Slack."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/slack//; s/,,/,/g; s/^,//; s/,$//')
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",teams,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Microsoft Teams${C_NC}"
-        echo -e "  ${C_DIM}Works with a Power Automate \"when a Teams webhook request is${C_NC}"
-        echo -e "  ${C_DIM}received\" trigger, or a legacy Office 365 connector.${C_NC}"
-        ask I "  Webhook URL: "
-        TEAMS_WEBHOOK_URL="${I:-${PREV_TEAMS}}"
-        if [ -n "${TEAMS_WEBHOOK_URL}" ]; then
-            print_ok "Teams configured"
-        else
-            print_fail "No URL given — dropping Teams."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/teams//; s/,,/,/g; s/^,//; s/,$//')
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",ntfy,"; then
-        echo ""
-        echo -e "  ${C_BOLD}ntfy${C_NC}"
-        echo -e "  ${C_DIM}The topic is part of the URL, e.g. https://ntfy.sh/my-topic${C_NC}"
-        ask I "  Topic URL: "
-        NTFY_URL="${I:-${PREV_NTFY_URL}}"
-        if [ -n "${NTFY_URL}" ]; then
-            ask_secret I "  Access token [Enter for none]: "
-            NTFY_TOKEN="${I:-${PREV_NTFY_TOKEN}}"
-            print_ok "ntfy configured"
-        else
-            print_fail "No URL given — dropping ntfy."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/ntfy//; s/,,/,/g; s/^,//; s/,$//')
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",gotify,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Gotify${C_NC}"
-        ask I "  Server URL (e.g. https://gotify.example.com): "
-        GOTIFY_URL="${I:-${PREV_GOTIFY_URL}}"
-        ask_secret I "  Application token: "
-        GOTIFY_TOKEN="${I:-${PREV_GOTIFY_TOKEN}}"
-        if [ -n "${GOTIFY_URL}" ] && [ -n "${GOTIFY_TOKEN}" ]; then
-            print_ok "Gotify configured"
-        else
-            print_fail "Both a URL and a token are needed — dropping Gotify."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/gotify//; s/,,/,/g; s/^,//; s/,$//')
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",telegram,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Telegram${C_NC}"
-        echo -e "  ${C_DIM}Create a bot with @BotFather, message it, then read your chat ID${C_NC}"
-        echo -e "  ${C_DIM}from https://api.telegram.org/bot<token>/getUpdates${C_NC}"
-        ask_secret I "  Bot token (not echoed): "
-        TELEGRAM_BOT_TOKEN="${I:-${PREV_TG_TOKEN}}"
-        ask I "  Chat ID: "
-        TELEGRAM_CHAT_ID="${I:-${PREV_TG_CHAT}}"
-        if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
-            print_ok "Telegram configured"
-        else
-            print_fail "Both a token and a chat ID are needed — dropping Telegram."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/telegram//; s/,,/,/g; s/^,//; s/,$//')
-        fi
-    fi
-
-    if echo ",${NOTIFY_METHODS}," | grep -q ",webhook,"; then
-        echo ""
-        echo -e "  ${C_BOLD}Generic webhook${C_NC}"
-        echo -e "  ${C_DIM}Receives a JSON POST — Home Assistant, n8n, your own endpoint.${C_NC}"
-        echo -e "  ${C_DIM}ntfy and Gotify have their own options above; they need their own${C_NC}"
-        echo -e "  ${C_DIM}request shapes, not this one.${C_NC}"
-        ask I "  URL: "
-        GENERIC_WEBHOOK_URL="${I:-${PREV_GENERIC}}"
-        if [ -n "${GENERIC_WEBHOOK_URL}" ]; then
-            print_ok "Generic webhook configured"
-        else
-            print_fail "No URL given — dropping the generic webhook."
-            NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/webhook//; s/,,/,/g; s/^,//; s/,$//')
-        fi
-    fi
-
-    if [ -z "${NOTIFY_METHODS}" ]; then
-        print_ok "Notifications: none ${C_DIM}(updates will run silently)${C_NC}"
-    fi
-fi
-
-# --- Notify only on failure? ---
-if [ -n "${NOTIFY_METHODS}" ]; then
+echo ""
+step "Notifications"
+if asking; then
     echo ""
-    DEFAULT_FAIL_ONLY="${PREV_FAIL_ONLY:-false}"
-    echo -e "  ${C_BOLD}Only notify when something fails?${C_NC}"
-    echo -e "  ${C_DIM}A weekly \"nothing happened\" message trains you to ignore the channel.${C_NC}"
-    if [ "${DEFAULT_FAIL_ONLY}" = "true" ]; then
-        ask I "  1 = only on failure, 2 = every run [Enter for 1]: "
-    else
-        ask I "  1 = only on failure, 2 = every run [Enter for 2]: "
+    echo -e "  ${C_DIM}Optional. Updates run on schedule whether or not a channel is set${C_NC}"
+    echo -e "  ${C_DIM}up — without one they simply run quietly. You can add or change${C_NC}"
+    echo -e "  ${C_DIM}channels later from the web panel or the config file.${C_NC}"
+    echo ""
+
+    DEFAULT_METHODS="${PREV_NOTIFY_METHODS:-}"
+    if [ -n "${DEFAULT_METHODS}" ]; then
+        echo -e "  ${C_DIM}Currently enabled: ${DEFAULT_METHODS}${C_NC}"
     fi
-    case "${I}" in
-        1) NOTIFY_ON_FAILURE_ONLY="true" ;;
-        2) NOTIFY_ON_FAILURE_ONLY="false" ;;
-        *) NOTIFY_ON_FAILURE_ONLY="${DEFAULT_FAIL_ONLY}" ;;
-    esac
-    print_ok "Notify on failure only: ${NOTIFY_ON_FAILURE_ONLY}"
+    echo -e "  ${C_CYAN}1)${C_NC} Skip for now  ${C_DIM}(updates still run; add a channel later)${C_NC}"
+    echo -e "  ${C_CYAN}2)${C_NC} Email  ${C_DIM}(any SMTP server, or the Mailgun API)${C_NC}"
+    echo -e "  ${C_CYAN}3)${C_NC} Discord  ${C_DIM}(webhook, or a bot DM)${C_NC}"
+    echo -e "  ${C_CYAN}4)${C_NC} Slack  ${C_DIM}(incoming webhook)${C_NC}"
+    echo -e "  ${C_CYAN}5)${C_NC} Microsoft Teams  ${C_DIM}(separate — Teams cannot read Slack's format)${C_NC}"
+    echo -e "  ${C_CYAN}6)${C_NC} ntfy  ${C_DIM}(self-hosted or ntfy.sh)${C_NC}"
+    echo -e "  ${C_CYAN}7)${C_NC} Gotify"
+    echo -e "  ${C_CYAN}8)${C_NC} Telegram  ${C_DIM}(bot)${C_NC}"
+    echo -e "  ${C_CYAN}9)${C_NC} Generic webhook  ${C_DIM}(JSON POST)${C_NC}"
+    echo ""
+    echo -e "  ${C_DIM}Enter one or more numbers, e.g. \"3\" or \"2,3\".${C_NC}"
+    # "[Enter to keep current]" was meaningless on a fresh install, where there is
+    # no current — it read as though pressing Enter would keep something.
+    if [ -n "${DEFAULT_METHODS}" ]; then
+        ask INPUT_METHODS "  Select [Enter to keep ${DEFAULT_METHODS}]: "
+    else
+        ask INPUT_METHODS "  Select [Enter for 1, skip]: "
+    fi
+
+
+    if [ -z "${INPUT_METHODS}" ]; then
+        NOTIFY_METHODS="${DEFAULT_METHODS}"
+        if [ -z "${NOTIFY_METHODS}" ]; then
+            print_ok "Notifications: none ${C_DIM}(updates will run silently)${C_NC}"
+        else
+            print_ok "Notifications unchanged: ${NOTIFY_METHODS}"
+        fi
+    else
+        NOTIFY_METHODS=""
+        for CHOICE in $(echo "${INPUT_METHODS}" | tr ',' ' '); do
+            case "${CHOICE}" in
+                1) NOTIFY_METHODS=""; break ;;
+                2) NOTIFY_METHODS="${NOTIFY_METHODS},email" ;;
+                3) NOTIFY_METHODS="${NOTIFY_METHODS},discord" ;;
+                4) NOTIFY_METHODS="${NOTIFY_METHODS},slack" ;;
+                5) NOTIFY_METHODS="${NOTIFY_METHODS},teams" ;;
+                6) NOTIFY_METHODS="${NOTIFY_METHODS},ntfy" ;;
+                7) NOTIFY_METHODS="${NOTIFY_METHODS},gotify" ;;
+                8) NOTIFY_METHODS="${NOTIFY_METHODS},telegram" ;;
+                9) NOTIFY_METHODS="${NOTIFY_METHODS},webhook" ;;
+                *) print_fail "Ignoring unrecognised choice '${CHOICE}'" ;;
+            esac
+        done
+        NOTIFY_METHODS="${NOTIFY_METHODS#,}"
+
+        # --- Per-channel details, asked only for the channels chosen ---
+        if echo ",${NOTIFY_METHODS}," | grep -q ",email,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Email${C_NC}"
+            # SMTP was added to the updater and the panel in 1.2.0 but never to the
+            # installer, which still assumed email meant Mailgun. A fresh install
+            # was therefore forced through Mailgun prompts it could not skip, even
+            # for someone who only wanted to use their own mail server.
+            echo -e "  ${C_DIM}1) SMTP server — any mail server, relay or app password${C_NC}"
+            echo -e "  ${C_DIM}2) Mailgun API${C_NC}"
+            DEFAULT_TRANSPORT="1"
+            [ "${PREV_TRANSPORT}" = "mailgun" ] && DEFAULT_TRANSPORT="2"
+            [ -z "${PREV_TRANSPORT}" ] && [ -n "${PREV_KEY}" ] && DEFAULT_TRANSPORT="2"
+            ask I "  Send via [${DEFAULT_TRANSPORT}]: "
+            case "${I:-${DEFAULT_TRANSPORT}}" in
+                2) EMAIL_TRANSPORT="mailgun" ;;
+                *) EMAIL_TRANSPORT="smtp" ;;
+            esac
+
+            if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
+                ask_required MAILGUN_API_KEY "API key" "${PREV_KEY}"
+                ask_required MAILGUN_DOMAIN "Domain (e.g. mg.example.com)" "${PREV_DOMAIN}"
+                if [ "${MAILGUN_REGION}" = "US" ]; then
+                    ask I "  Region — 1 for EU, 2 for US [Enter for 2]: "
+                else
+                    ask I "  Region — 1 for EU, 2 for US [Enter for 1]: "
+                fi
+                case "${I}" in 1) MAILGUN_REGION="EU" ;; 2) MAILGUN_REGION="US" ;; esac
+            else
+                ask_required SMTP_HOST "SMTP host (e.g. smtp.example.com)" "${PREV_SMTP_HOST}"
+                ask I "  Port [${PREV_SMTP_PORT:-587}]: "
+                SMTP_PORT="${I:-${PREV_SMTP_PORT:-587}}"
+                echo -e "  ${C_DIM}1) STARTTLS (587)   2) SSL/TLS (465)   3) none — local relay${C_NC}"
+                case "${SMTP_SECURITY}" in ssl) SEC_DEFAULT=2 ;; none) SEC_DEFAULT=3 ;; *) SEC_DEFAULT=1 ;; esac
+                ask I "  Encryption [Enter for ${SEC_DEFAULT}]: "
+                case "${I:-${SEC_DEFAULT}}" in
+                    2) SMTP_SECURITY="ssl" ;;
+                    3) SMTP_SECURITY="none" ;;
+                    *) SMTP_SECURITY="starttls" ;;
+                esac
+                if [ -n "${PREV_SMTP_USER}" ]; then
+                    ask I "  Username [Enter keeps ${PREV_SMTP_USER}]: "
+                else
+                    ask I "  Username [Enter for none — unauthenticated relay]: "
+                fi
+                SMTP_USER="${I:-${PREV_SMTP_USER}}"
+                if [ -n "${SMTP_USER}" ]; then
+                    if [ -n "${PREV_SMTP_PASSWORD}" ]; then
+                        ask_secret I "  Password [Enter to keep the existing one]: "
+                    else
+                        ask_secret I "  Password (not echoed): "
+                    fi
+                    SMTP_PASSWORD="${I:-${PREV_SMTP_PASSWORD}}"
+                fi
+            fi
+
+            ask_required SENDER_EMAIL "From address" "${PREV_SENDER}"
+            ask_required RECIPIENT_EMAIL "To address" "${PREV_RECIPIENT}"
+            if [ "${EMAIL_TRANSPORT}" = "mailgun" ]; then
+                print_ok "Email via Mailgun (${MAILGUN_REGION} → ${RECIPIENT_EMAIL})"
+            else
+                print_ok "Email via SMTP (${SMTP_HOST}:${SMTP_PORT} → ${RECIPIENT_EMAIL})"
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",discord,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Discord${C_NC}"
+            echo -e "    ${C_CYAN}1)${C_NC} Channel webhook  ${C_DIM}(Server Settings → Integrations → Webhooks)${C_NC}"
+            echo -e "    ${C_CYAN}2)${C_NC} Direct message   ${C_DIM}(bot token + your user ID)${C_NC}"
+            ask I "  Select 1 or 2 [1]: "
+            if [ "${I}" = "2" ]; then
+                echo -e "  ${C_DIM}The bot must share a server with you for Discord to allow the DM.${C_NC}"
+                echo -e "  ${C_DIM}It is never run as a process — the token is only used to POST.${C_NC}"
+                ask_secret I "  Bot token (not echoed): "
+                DISCORD_BOT_TOKEN="${I:-${PREV_BOT_TOKEN}}"
+                ask I "  Your Discord user ID (numeric): "
+                DISCORD_USER_ID="${I:-${PREV_USER_ID}}"
+                ask I "  Fallback webhook URL (optional): "
+                DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
+                if [ -n "${DISCORD_BOT_TOKEN}" ] && [ -n "${DISCORD_USER_ID}" ]; then
+                    print_ok "Discord DM configured"
+                else
+                    print_fail "Both a bot token and a user ID are needed — dropping Discord."
+                    NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
+                fi
+            else
+                ask I "  Webhook URL: "
+                DISCORD_WEBHOOK_URL="${I:-${PREV_DISCORD}}"
+                if [ -n "${DISCORD_WEBHOOK_URL}" ]; then
+                    print_ok "Discord configured"
+                else
+                    print_fail "No URL given — dropping Discord."
+                    NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/discord//; s/,,/,/g; s/^,//; s/,$//')
+                fi
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",slack,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Slack${C_NC}"
+            ask I "  Webhook URL: "
+            SLACK_WEBHOOK_URL="${I:-${PREV_SLACK}}"
+            if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+                print_ok "Slack configured"
+            else
+                print_fail "No URL given — dropping Slack."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/slack//; s/,,/,/g; s/^,//; s/,$//')
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",teams,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Microsoft Teams${C_NC}"
+            echo -e "  ${C_DIM}Works with a Power Automate \"when a Teams webhook request is${C_NC}"
+            echo -e "  ${C_DIM}received\" trigger, or a legacy Office 365 connector.${C_NC}"
+            ask I "  Webhook URL: "
+            TEAMS_WEBHOOK_URL="${I:-${PREV_TEAMS}}"
+            if [ -n "${TEAMS_WEBHOOK_URL}" ]; then
+                print_ok "Teams configured"
+            else
+                print_fail "No URL given — dropping Teams."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/teams//; s/,,/,/g; s/^,//; s/,$//')
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",ntfy,"; then
+            echo ""
+            echo -e "  ${C_BOLD}ntfy${C_NC}"
+            echo -e "  ${C_DIM}The topic is part of the URL, e.g. https://ntfy.sh/my-topic${C_NC}"
+            ask I "  Topic URL: "
+            NTFY_URL="${I:-${PREV_NTFY_URL}}"
+            if [ -n "${NTFY_URL}" ]; then
+                ask_secret I "  Access token [Enter for none]: "
+                NTFY_TOKEN="${I:-${PREV_NTFY_TOKEN}}"
+                print_ok "ntfy configured"
+            else
+                print_fail "No URL given — dropping ntfy."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/ntfy//; s/,,/,/g; s/^,//; s/,$//')
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",gotify,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Gotify${C_NC}"
+            ask I "  Server URL (e.g. https://gotify.example.com): "
+            GOTIFY_URL="${I:-${PREV_GOTIFY_URL}}"
+            ask_secret I "  Application token: "
+            GOTIFY_TOKEN="${I:-${PREV_GOTIFY_TOKEN}}"
+            if [ -n "${GOTIFY_URL}" ] && [ -n "${GOTIFY_TOKEN}" ]; then
+                print_ok "Gotify configured"
+            else
+                print_fail "Both a URL and a token are needed — dropping Gotify."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/gotify//; s/,,/,/g; s/^,//; s/,$//')
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",telegram,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Telegram${C_NC}"
+            echo -e "  ${C_DIM}Create a bot with @BotFather, message it, then read your chat ID${C_NC}"
+            echo -e "  ${C_DIM}from https://api.telegram.org/bot<token>/getUpdates${C_NC}"
+            ask_secret I "  Bot token (not echoed): "
+            TELEGRAM_BOT_TOKEN="${I:-${PREV_TG_TOKEN}}"
+            ask I "  Chat ID: "
+            TELEGRAM_CHAT_ID="${I:-${PREV_TG_CHAT}}"
+            if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+                print_ok "Telegram configured"
+            else
+                print_fail "Both a token and a chat ID are needed — dropping Telegram."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/telegram//; s/,,/,/g; s/^,//; s/,$//')
+            fi
+        fi
+
+        if echo ",${NOTIFY_METHODS}," | grep -q ",webhook,"; then
+            echo ""
+            echo -e "  ${C_BOLD}Generic webhook${C_NC}"
+            echo -e "  ${C_DIM}Receives a JSON POST — Home Assistant, n8n, your own endpoint.${C_NC}"
+            echo -e "  ${C_DIM}ntfy and Gotify have their own options above; they need their own${C_NC}"
+            echo -e "  ${C_DIM}request shapes, not this one.${C_NC}"
+            ask I "  URL: "
+            GENERIC_WEBHOOK_URL="${I:-${PREV_GENERIC}}"
+            if [ -n "${GENERIC_WEBHOOK_URL}" ]; then
+                print_ok "Generic webhook configured"
+            else
+                print_fail "No URL given — dropping the generic webhook."
+                NOTIFY_METHODS=$(echo "${NOTIFY_METHODS}" | sed 's/webhook//; s/,,/,/g; s/^,//; s/,$//')
+            fi
+        fi
+
+        if [ -z "${NOTIFY_METHODS}" ]; then
+            print_ok "Notifications: none ${C_DIM}(updates will run silently)${C_NC}"
+        fi
+    fi
+
+    # --- Notify only on failure? ---
+    if [ -n "${NOTIFY_METHODS}" ]; then
+        echo ""
+        DEFAULT_FAIL_ONLY="${PREV_FAIL_ONLY:-false}"
+        echo -e "  ${C_BOLD}Only notify when something fails?${C_NC}"
+        echo -e "  ${C_DIM}A weekly \"nothing happened\" message trains you to ignore the channel.${C_NC}"
+        if [ "${DEFAULT_FAIL_ONLY}" = "true" ]; then
+            ask I "  1 = only on failure, 2 = every run [Enter for 1]: "
+        else
+            ask I "  1 = only on failure, 2 = every run [Enter for 2]: "
+        fi
+        case "${I}" in
+            1) NOTIFY_ON_FAILURE_ONLY="true" ;;
+            2) NOTIFY_ON_FAILURE_ONLY="false" ;;
+            *) NOTIFY_ON_FAILURE_ONLY="${DEFAULT_FAIL_ONLY}" ;;
+        esac
+        print_ok "Notify on failure only: ${NOTIFY_ON_FAILURE_ONLY}"
+    else
+        NOTIFY_ON_FAILURE_ONLY="${PREV_FAIL_ONLY:-false}"
+    fi
+
+    # --- Advanced Settings ---
 else
-    NOTIFY_ON_FAILURE_ONLY="${PREV_FAIL_ONLY:-false}"
+    echo ""
+    if [ -n "${NOTIFY_METHODS}" ]; then
+        print_ok "Notifications: ${NOTIFY_METHODS}"
+    else
+        print_ok "Notifications: none — updates run quietly"
+        print_skip "Add a channel any time from the panel, or in ${CONFIG_FILE}"
+    fi
 fi
 
-# --- Advanced Settings ---
 echo ""
 step "Advanced settings"
-echo ""
-echo -e "  ${C_DIM}Every question here has a working default — press Enter to take it.${C_NC}"
-echo -e "  ${C_DIM}All of it can be changed later in the web panel or the config file.${C_NC}"
-echo ""
+if asking; then
+    echo ""
+    echo -e "  ${C_DIM}Every question here has a working default — press Enter to take it.${C_NC}"
+    echo -e "  ${C_DIM}All of it can be changed later in the web panel or the config file.${C_NC}"
+    echo ""
 
-# --- Exclude IDs ---
-echo -e "  ${C_BOLD}Guests to leave alone${C_NC}"
-echo -e "  ${C_DIM}VM and container IDs the updater should skip entirely — a database${C_NC}"
-echo -e "  ${C_DIM}that must not restart, an appliance you patch by hand. Comma-separated,${C_NC}"
-echo -e "  ${C_DIM}e.g. 100,201,305.${C_NC}"
-EXCLUDE_IDS=""
-if [ -n "${PREV_EXCLUDE}" ]; then
-    ask INPUT_EXCLUDE "  Exclude VM/CT IDs [Enter keeps ${PREV_EXCLUDE}, 'none' clears]: "
-else
-    ask INPUT_EXCLUDE "  Exclude VM/CT IDs [Enter for none]: "
-fi
-# `:-` treats an empty answer as "unset", so pressing Enter to clear the list
-# silently reinstated the previous one and there was no way to empty it from
-# the installer at all. `-` distinguishes "not answered" from "answered with
-# nothing", and the sentinel gives an explicit way to say none.
-if [ -z "${INPUT_EXCLUDE+set}" ]; then
-    EXCLUDE_IDS="${PREV_EXCLUDE}"
-elif [ "${INPUT_EXCLUDE}" = "none" ] || [ "${INPUT_EXCLUDE}" = "-" ]; then
+    # --- Exclude IDs ---
+    echo -e "  ${C_BOLD}Guests to leave alone${C_NC}"
+    echo -e "  ${C_DIM}VM and container IDs the updater should skip entirely — a database${C_NC}"
+    echo -e "  ${C_DIM}that must not restart, an appliance you patch by hand. Comma-separated,${C_NC}"
+    echo -e "  ${C_DIM}e.g. 100,201,305.${C_NC}"
     EXCLUDE_IDS=""
-else
-    EXCLUDE_IDS="${INPUT_EXCLUDE:-${PREV_EXCLUDE}}"
-fi
-if [ -n "${EXCLUDE_IDS}" ]; then
-    print_ok "Excluding: ${EXCLUDE_IDS}"
-else
-    print_ok "No exclusions"
-fi
-
-# --- Windows Update Timeout ---
-echo ""
-echo -e "  ${C_BOLD}Windows Update timeout${C_NC}"
-echo -e "  ${C_DIM}How long a Windows VM gets to finish before it is reported as timed${C_NC}"
-echo -e "  ${C_DIM}out. Cumulative updates on a machine that has been off for a while${C_NC}"
-echo -e "  ${C_DIM}routinely take longer than you would guess.${C_NC}"
-WINDOWS_UPDATE_TIMEOUT=""
-DEFAULT_WIN_TIMEOUT="${PREV_WIN_TIMEOUT:-1200}"
-ask INPUT_WIN_TIMEOUT "  Seconds [Enter for ${DEFAULT_WIN_TIMEOUT}]: "
-WINDOWS_UPDATE_TIMEOUT="${INPUT_WIN_TIMEOUT:-${DEFAULT_WIN_TIMEOUT}}"
-print_ok "Windows timeout: ${WINDOWS_UPDATE_TIMEOUT}s"
-
-# --- Start Stopped Windows VMs ---
-echo ""
-echo -e "  ${C_BOLD}Start stopped Windows VMs for updates?${C_NC}"
-echo -e "  ${C_DIM}(Windows Update can take 30+ minutes — not recommended for short maintenance windows)${C_NC}"
-DEFAULT_START_WIN="${PREV_START_WIN:-false}"
-if [ "${DEFAULT_START_WIN}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
-    echo -e "    ${C_CYAN}2)${C_NC} No"
-else
-    echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
-fi
-ask INPUT_START_WIN "  Select 1 or 2 [Enter to keep the marked one]: "
-case "${INPUT_START_WIN}" in
-    1) START_STOPPED_WINDOWS="true" ;;
-    2) START_STOPPED_WINDOWS="false" ;;
-    "") START_STOPPED_WINDOWS="${DEFAULT_START_WIN}" ;;
-    *) START_STOPPED_WINDOWS="${DEFAULT_START_WIN}" ;;
-esac
-print_ok "Start stopped Windows VMs: ${START_STOPPED_WINDOWS}"
-
-# --- Start Stopped LXC Containers ---
-echo ""
-echo -e "  ${C_BOLD}Start stopped LXC Containers for updates?${C_NC}"
-DEFAULT_START_LXC="${PREV_START_LXC:-true}"
-if [ "${DEFAULT_START_LXC}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
-    echo -e "    ${C_CYAN}2)${C_NC} No"
-else
-    echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
-fi
-ask INPUT_START_LXC "  Select 1 or 2 [Enter to keep the marked one]: "
-case "${INPUT_START_LXC}" in
-    1) START_STOPPED_LXC="true" ;;
-    2) START_STOPPED_LXC="false" ;;
-    "") START_STOPPED_LXC="${DEFAULT_START_LXC}" ;;
-    *) START_STOPPED_LXC="${DEFAULT_START_LXC}" ;;
-esac
-print_ok "Start stopped LXC: ${START_STOPPED_LXC}"
-
-# --- Start Stopped Linux VMs ---
-echo ""
-echo -e "  ${C_BOLD}Start stopped Linux VMs for updates?${C_NC}"
-DEFAULT_START_LINUX_VMS="${PREV_START_LINUX_VMS:-true}"
-if [ "${DEFAULT_START_LINUX_VMS}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
-    echo -e "    ${C_CYAN}2)${C_NC} No"
-else
-    echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
-fi
-ask INPUT_START_LINUX_VMS "  Select 1 or 2 [Enter to keep the marked one]: "
-case "${INPUT_START_LINUX_VMS}" in
-    1) START_STOPPED_LINUX_VMS="true" ;;
-    2) START_STOPPED_LINUX_VMS="false" ;;
-    "") START_STOPPED_LINUX_VMS="${DEFAULT_START_LINUX_VMS}" ;;
-    *) START_STOPPED_LINUX_VMS="${DEFAULT_START_LINUX_VMS}" ;;
-esac
-print_ok "Start stopped Linux VMs: ${START_STOPPED_LINUX_VMS}"
-
-# --- Linux Update Timeout ---
-echo ""
-DEFAULT_LINUX_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
-echo -e "  ${C_DIM}How long a Linux guest gets to finish its upgrade before being"
-echo -e "  reported as timed out. A large dist-upgrade on a slow mirror can"
-echo -e "  easily exceed 10 minutes.${C_NC}"
-ask INPUT_LINUX_TIMEOUT "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: "
-LINUX_UPDATE_TIMEOUT="${INPUT_LINUX_TIMEOUT:-${DEFAULT_LINUX_TIMEOUT}}"
-print_ok "Linux timeout: ${LINUX_UPDATE_TIMEOUT}s"
-
-# --- APT Lock Timeout ---
-echo ""
-DEFAULT_APT_LOCK="${PREV_APT_LOCK:-600}"
-echo -e "  ${C_DIM}How long apt waits for the dpkg lock inside a guest. Distros with"
-echo -e "  unattended-upgrades enabled (Ubuntu by default) fail with exit code"
-echo -e "  100 if this is 0 and the two happen to overlap.${C_NC}"
-ask INPUT_APT_LOCK "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: "
-APT_LOCK_TIMEOUT="${INPUT_APT_LOCK:-${DEFAULT_APT_LOCK}}"
-print_ok "APT lock wait: ${APT_LOCK_TIMEOUT}s"
-
-# --- Pre-update Snapshots ---
-echo ""
-echo -e "  ${C_BOLD}Take a snapshot of each guest before updating it?${C_NC}"
-echo -e "  ${C_DIM}(Needs a snapshot-capable storage backend: ZFS, LVM-thin, qcow2.${C_NC}"
-echo -e "  ${C_DIM} Uses disk space, but gives you a one-command rollback.)${C_NC}"
-DEFAULT_SNAPSHOT="${PREV_SNAPSHOT:-false}"
-if [ "${DEFAULT_SNAPSHOT}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
-    echo -e "    ${C_CYAN}2)${C_NC} No"
-else
-    echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
-fi
-ask INPUT_SNAPSHOT "  Select 1 or 2 [Enter to keep the marked one]: "
-case "${INPUT_SNAPSHOT}" in
-    1) SNAPSHOT_BEFORE_UPDATE="true" ;;
-    2) SNAPSHOT_BEFORE_UPDATE="false" ;;
-    *) SNAPSHOT_BEFORE_UPDATE="${DEFAULT_SNAPSHOT}" ;;
-esac
-print_ok "Pre-update snapshots: ${SNAPSHOT_BEFORE_UPDATE}"
-
-DEFAULT_SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
-if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
-    ask INPUT_SNAPSHOT_KEEP "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: "
-    SNAPSHOT_KEEP="${INPUT_SNAPSHOT_KEEP:-${DEFAULT_SNAPSHOT_KEEP}}"
-    print_ok "Keeping ${SNAPSHOT_KEEP} snapshot(s) per guest"
-else
-    SNAPSHOT_KEEP="${DEFAULT_SNAPSHOT_KEEP}"
-fi
-
-# --- Web Control Panel ---
-echo ""
-echo -e "  ${C_BOLD}Add an 'Auto-Update' button to the Proxmox web UI?${C_NC}"
-echo -e "  ${C_DIM}Places a button in the toolbar, left of Documentation. It opens a${C_NC}"
-echo -e "  ${C_DIM}panel to run updates, edit the schedule and config, and read logs.${C_NC}"
-echo -e "  ${C_DIM}Only root@pam can use it; access is authorised by your existing${C_NC}"
-echo -e "  ${C_DIM}Proxmox login session.${C_NC}"
-DEFAULT_WEBUI="${PREV_WEBUI:-false}"
-if [ "${DEFAULT_WEBUI}" = "true" ]; then
-    echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
-    echo -e "    ${C_CYAN}2)${C_NC} No"
-else
-    echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
-fi
-ask INPUT_WEBUI "  Select 1 or 2 [Enter to keep the marked one]: "
-case "${INPUT_WEBUI}" in
-    1) ENABLE_WEB_UI="true" ;;
-    2) ENABLE_WEB_UI="false" ;;
-    *) ENABLE_WEB_UI="${DEFAULT_WEBUI}" ;;
-esac
-
-WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
-if [ "${ENABLE_WEB_UI}" = "true" ]; then
-    ask INPUT_WEBUI_PORT "  Port for the control panel [Enter for ${WEB_UI_PORT}]: "
-    WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
-    print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
-else
-    print_ok "Web control panel: disabled"
-fi
-
-# --- Log retention ---
-echo ""
-DEFAULT_KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
-echo -e "  ${C_BOLD}Keep update logs on disk?${C_NC}"
-echo -e "  ${C_DIM}\"No\" still lets you watch a run live, then deletes the log after.${C_NC}"
-if [ "${DEFAULT_KEEP_LOGS}" = "true" ]; then
-    ask INPUT_KEEP_LOGS "  1 = keep, 2 = discard [Enter for 1]: "
-else
-    ask INPUT_KEEP_LOGS "  1 = keep, 2 = discard [Enter for 2]: "
-fi
-case "${INPUT_KEEP_LOGS}" in
-    1) KEEP_LOGS="true" ;;
-    2) KEEP_LOGS="false" ;;
-    *) KEEP_LOGS="${DEFAULT_KEEP_LOGS}" ;;
-esac
-
-DEFAULT_LOG_RETENTION="${PREV_LOG_RETENTION:-90}"
-if [ "${KEEP_LOGS}" = "true" ]; then
-    ask I "  Delete logs older than N days (0 = never) [${DEFAULT_LOG_RETENTION}]: "
-    LOG_RETENTION_DAYS="${I:-${DEFAULT_LOG_RETENTION}}"
-    print_ok "Logs kept in ${LOG_DIR}/ for ${LOG_RETENTION_DAYS} day(s)"
-else
-    LOG_RETENTION_DAYS="${DEFAULT_LOG_RETENTION}"
-    print_ok "Logs discarded after each run"
-fi
-
-# --- Validate numeric inputs before writing them out ---
-for NUM_PAIR in "WINDOWS_UPDATE_TIMEOUT:${WINDOWS_UPDATE_TIMEOUT}" \
-                "LINUX_UPDATE_TIMEOUT:${LINUX_UPDATE_TIMEOUT}" \
-                "APT_LOCK_TIMEOUT:${APT_LOCK_TIMEOUT}" \
-                "SNAPSHOT_KEEP:${SNAPSHOT_KEEP}" \
-                "WEB_UI_PORT:${WEB_UI_PORT}"; do
-    NUM_NAME="${NUM_PAIR%%:*}"
-    NUM_VALUE="${NUM_PAIR#*:}"
-    if ! [[ "${NUM_VALUE}" =~ ^[0-9]+$ ]]; then
-        echo ""
-        print_fail "${NUM_NAME} must be a positive integer (got '${NUM_VALUE}')"
-        exit 1
+    if [ -n "${PREV_EXCLUDE}" ]; then
+        ask INPUT_EXCLUDE "  Exclude VM/CT IDs [Enter keeps ${PREV_EXCLUDE}, 'none' clears]: "
+    else
+        ask INPUT_EXCLUDE "  Exclude VM/CT IDs [Enter for none]: "
     fi
-done
+    # `:-` treats an empty answer as "unset", so pressing Enter to clear the list
+    # silently reinstated the previous one and there was no way to empty it from
+    # the installer at all. `-` distinguishes "not answered" from "answered with
+    # nothing", and the sentinel gives an explicit way to say none.
+    if [ -z "${INPUT_EXCLUDE+set}" ]; then
+        EXCLUDE_IDS="${PREV_EXCLUDE}"
+    elif [ "${INPUT_EXCLUDE}" = "none" ] || [ "${INPUT_EXCLUDE}" = "-" ]; then
+        EXCLUDE_IDS=""
+    else
+        EXCLUDE_IDS="${INPUT_EXCLUDE:-${PREV_EXCLUDE}}"
+    fi
+    if [ -n "${EXCLUDE_IDS}" ]; then
+        print_ok "Excluding: ${EXCLUDE_IDS}"
+    else
+        print_ok "No exclusions"
+    fi
 
-# --- Schedule & Reboot Settings ---
+    # --- Windows Update Timeout ---
+    echo ""
+    echo -e "  ${C_BOLD}Windows Update timeout${C_NC}"
+    echo -e "  ${C_DIM}How long a Windows VM gets to finish before it is reported as timed${C_NC}"
+    echo -e "  ${C_DIM}out. Cumulative updates on a machine that has been off for a while${C_NC}"
+    echo -e "  ${C_DIM}routinely take longer than you would guess.${C_NC}"
+    WINDOWS_UPDATE_TIMEOUT=""
+    DEFAULT_WIN_TIMEOUT="${PREV_WIN_TIMEOUT:-1200}"
+    ask INPUT_WIN_TIMEOUT "  Seconds [Enter for ${DEFAULT_WIN_TIMEOUT}]: "
+    WINDOWS_UPDATE_TIMEOUT="${INPUT_WIN_TIMEOUT:-${DEFAULT_WIN_TIMEOUT}}"
+    print_ok "Windows timeout: ${WINDOWS_UPDATE_TIMEOUT}s"
+
+    # --- Start Stopped Windows VMs ---
+    echo ""
+    echo -e "  ${C_BOLD}Start stopped Windows VMs for updates?${C_NC}"
+    echo -e "  ${C_DIM}(Windows Update can take 30+ minutes — not recommended for short maintenance windows)${C_NC}"
+    DEFAULT_START_WIN="${PREV_START_WIN:-false}"
+    if [ "${DEFAULT_START_WIN}" = "true" ]; then
+        echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} No"
+    else
+        echo -e "    ${C_CYAN}1)${C_NC} Yes"
+        echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
+    fi
+    ask INPUT_START_WIN "  Select 1 or 2 [Enter to keep the marked one]: "
+    case "${INPUT_START_WIN}" in
+        1) START_STOPPED_WINDOWS="true" ;;
+        2) START_STOPPED_WINDOWS="false" ;;
+        "") START_STOPPED_WINDOWS="${DEFAULT_START_WIN}" ;;
+        *) START_STOPPED_WINDOWS="${DEFAULT_START_WIN}" ;;
+    esac
+    print_ok "Start stopped Windows VMs: ${START_STOPPED_WINDOWS}"
+
+    # --- Start Stopped LXC Containers ---
+    echo ""
+    echo -e "  ${C_BOLD}Start stopped LXC Containers for updates?${C_NC}"
+    DEFAULT_START_LXC="${PREV_START_LXC:-true}"
+    if [ "${DEFAULT_START_LXC}" = "true" ]; then
+        echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} No"
+    else
+        echo -e "    ${C_CYAN}1)${C_NC} Yes"
+        echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
+    fi
+    ask INPUT_START_LXC "  Select 1 or 2 [Enter to keep the marked one]: "
+    case "${INPUT_START_LXC}" in
+        1) START_STOPPED_LXC="true" ;;
+        2) START_STOPPED_LXC="false" ;;
+        "") START_STOPPED_LXC="${DEFAULT_START_LXC}" ;;
+        *) START_STOPPED_LXC="${DEFAULT_START_LXC}" ;;
+    esac
+    print_ok "Start stopped LXC: ${START_STOPPED_LXC}"
+
+    # --- Start Stopped Linux VMs ---
+    echo ""
+    echo -e "  ${C_BOLD}Start stopped Linux VMs for updates?${C_NC}"
+    DEFAULT_START_LINUX_VMS="${PREV_START_LINUX_VMS:-true}"
+    if [ "${DEFAULT_START_LINUX_VMS}" = "true" ]; then
+        echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} No"
+    else
+        echo -e "    ${C_CYAN}1)${C_NC} Yes"
+        echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
+    fi
+    ask INPUT_START_LINUX_VMS "  Select 1 or 2 [Enter to keep the marked one]: "
+    case "${INPUT_START_LINUX_VMS}" in
+        1) START_STOPPED_LINUX_VMS="true" ;;
+        2) START_STOPPED_LINUX_VMS="false" ;;
+        "") START_STOPPED_LINUX_VMS="${DEFAULT_START_LINUX_VMS}" ;;
+        *) START_STOPPED_LINUX_VMS="${DEFAULT_START_LINUX_VMS}" ;;
+    esac
+    print_ok "Start stopped Linux VMs: ${START_STOPPED_LINUX_VMS}"
+
+    # --- Linux Update Timeout ---
+    echo ""
+    DEFAULT_LINUX_TIMEOUT="${PREV_LINUX_TIMEOUT:-1800}"
+    echo -e "  ${C_DIM}How long a Linux guest gets to finish its upgrade before being"
+    echo -e "  reported as timed out. A large dist-upgrade on a slow mirror can"
+    echo -e "  easily exceed 10 minutes.${C_NC}"
+    ask INPUT_LINUX_TIMEOUT "  Linux update timeout in seconds [Enter for ${DEFAULT_LINUX_TIMEOUT}]: "
+    LINUX_UPDATE_TIMEOUT="${INPUT_LINUX_TIMEOUT:-${DEFAULT_LINUX_TIMEOUT}}"
+    print_ok "Linux timeout: ${LINUX_UPDATE_TIMEOUT}s"
+
+    # --- APT Lock Timeout ---
+    echo ""
+    DEFAULT_APT_LOCK="${PREV_APT_LOCK:-600}"
+    echo -e "  ${C_DIM}How long apt waits for the dpkg lock inside a guest. Distros with"
+    echo -e "  unattended-upgrades enabled (Ubuntu by default) fail with exit code"
+    echo -e "  100 if this is 0 and the two happen to overlap.${C_NC}"
+    ask INPUT_APT_LOCK "  APT lock wait in seconds [Enter for ${DEFAULT_APT_LOCK}]: "
+    APT_LOCK_TIMEOUT="${INPUT_APT_LOCK:-${DEFAULT_APT_LOCK}}"
+    print_ok "APT lock wait: ${APT_LOCK_TIMEOUT}s"
+
+    # --- Pre-update Snapshots ---
+    echo ""
+    echo -e "  ${C_BOLD}Take a snapshot of each guest before updating it?${C_NC}"
+    echo -e "  ${C_DIM}(Needs a snapshot-capable storage backend: ZFS, LVM-thin, qcow2.${C_NC}"
+    echo -e "  ${C_DIM} Uses disk space, but gives you a one-command rollback.)${C_NC}"
+    DEFAULT_SNAPSHOT="${PREV_SNAPSHOT:-false}"
+    if [ "${DEFAULT_SNAPSHOT}" = "true" ]; then
+        echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} No"
+    else
+        echo -e "    ${C_CYAN}1)${C_NC} Yes"
+        echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
+    fi
+    ask INPUT_SNAPSHOT "  Select 1 or 2 [Enter to keep the marked one]: "
+    case "${INPUT_SNAPSHOT}" in
+        1) SNAPSHOT_BEFORE_UPDATE="true" ;;
+        2) SNAPSHOT_BEFORE_UPDATE="false" ;;
+        *) SNAPSHOT_BEFORE_UPDATE="${DEFAULT_SNAPSHOT}" ;;
+    esac
+    print_ok "Pre-update snapshots: ${SNAPSHOT_BEFORE_UPDATE}"
+
+    DEFAULT_SNAPSHOT_KEEP="${PREV_SNAPSHOT_KEEP:-3}"
+    if [ "${SNAPSHOT_BEFORE_UPDATE}" = "true" ]; then
+        ask INPUT_SNAPSHOT_KEEP "  Snapshots to keep per guest [Enter for ${DEFAULT_SNAPSHOT_KEEP}]: "
+        SNAPSHOT_KEEP="${INPUT_SNAPSHOT_KEEP:-${DEFAULT_SNAPSHOT_KEEP}}"
+        print_ok "Keeping ${SNAPSHOT_KEEP} snapshot(s) per guest"
+    else
+        SNAPSHOT_KEEP="${DEFAULT_SNAPSHOT_KEEP}"
+    fi
+
+    # --- Web Control Panel ---
+    echo ""
+    echo -e "  ${C_BOLD}Add an 'Auto-Update' button to the Proxmox web UI?${C_NC}"
+    echo -e "  ${C_DIM}Places a button in the toolbar, left of Documentation. It opens a${C_NC}"
+    echo -e "  ${C_DIM}panel to run updates, edit the schedule and config, and read logs.${C_NC}"
+    echo -e "  ${C_DIM}Only root@pam can use it; access is authorised by your existing${C_NC}"
+    echo -e "  ${C_DIM}Proxmox login session.${C_NC}"
+    DEFAULT_WEBUI="${PREV_WEBUI:-false}"
+    if [ "${DEFAULT_WEBUI}" = "true" ]; then
+        echo -e "    ${C_CYAN}1)${C_NC} Yes  ${C_DIM}${MARK_CURRENT}${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} No"
+    else
+        echo -e "    ${C_CYAN}1)${C_NC} Yes"
+        echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}${MARK_CURRENT}${C_NC}"
+    fi
+    ask INPUT_WEBUI "  Select 1 or 2 [Enter to keep the marked one]: "
+    case "${INPUT_WEBUI}" in
+        1) ENABLE_WEB_UI="true" ;;
+        2) ENABLE_WEB_UI="false" ;;
+        *) ENABLE_WEB_UI="${DEFAULT_WEBUI}" ;;
+    esac
+
+    WEB_UI_PORT="${PREV_WEBUI_PORT:-8007}"
+    if [ "${ENABLE_WEB_UI}" = "true" ]; then
+        ask INPUT_WEBUI_PORT "  Port for the control panel [Enter for ${WEB_UI_PORT}]: "
+        WEB_UI_PORT="${INPUT_WEBUI_PORT:-${WEB_UI_PORT}}"
+        print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
+    else
+        print_ok "Web control panel: disabled"
+    fi
+
+    # --- Log retention ---
+    echo ""
+    DEFAULT_KEEP_LOGS="${PREV_KEEP_LOGS:-true}"
+    echo -e "  ${C_BOLD}Keep update logs on disk?${C_NC}"
+    echo -e "  ${C_DIM}\"No\" still lets you watch a run live, then deletes the log after.${C_NC}"
+    if [ "${DEFAULT_KEEP_LOGS}" = "true" ]; then
+        ask INPUT_KEEP_LOGS "  1 = keep, 2 = discard [Enter for 1]: "
+    else
+        ask INPUT_KEEP_LOGS "  1 = keep, 2 = discard [Enter for 2]: "
+    fi
+    case "${INPUT_KEEP_LOGS}" in
+        1) KEEP_LOGS="true" ;;
+        2) KEEP_LOGS="false" ;;
+        *) KEEP_LOGS="${DEFAULT_KEEP_LOGS}" ;;
+    esac
+
+    DEFAULT_LOG_RETENTION="${PREV_LOG_RETENTION:-90}"
+    if [ "${KEEP_LOGS}" = "true" ]; then
+        ask I "  Delete logs older than N days (0 = never) [${DEFAULT_LOG_RETENTION}]: "
+        LOG_RETENTION_DAYS="${I:-${DEFAULT_LOG_RETENTION}}"
+        print_ok "Logs kept in ${LOG_DIR}/ for ${LOG_RETENTION_DAYS} day(s)"
+    else
+        LOG_RETENTION_DAYS="${DEFAULT_LOG_RETENTION}"
+        print_ok "Logs discarded after each run"
+    fi
+
+    # --- Validate numeric inputs before writing them out ---
+    for NUM_PAIR in "WINDOWS_UPDATE_TIMEOUT:${WINDOWS_UPDATE_TIMEOUT}" \
+                    "LINUX_UPDATE_TIMEOUT:${LINUX_UPDATE_TIMEOUT}" \
+                    "APT_LOCK_TIMEOUT:${APT_LOCK_TIMEOUT}" \
+                    "SNAPSHOT_KEEP:${SNAPSHOT_KEEP}" \
+                    "WEB_UI_PORT:${WEB_UI_PORT}"; do
+        NUM_NAME="${NUM_PAIR%%:*}"
+        NUM_VALUE="${NUM_PAIR#*:}"
+        if ! [[ "${NUM_VALUE}" =~ ^[0-9]+$ ]]; then
+            echo ""
+            print_fail "${NUM_NAME} must be a positive integer (got '${NUM_VALUE}')"
+            exit 1
+        fi
+    done
+
+    # --- Schedule & Reboot Settings ---
+else
+    echo ""
+    print_ok "Exclusions: ${EXCLUDE_IDS:-none}"
+    print_ok "Stopped guests: LXC=${START_STOPPED_LXC}, Linux VMs=${START_STOPPED_LINUX_VMS}, Windows=${START_STOPPED_WINDOWS}"
+    print_ok "Timeouts: Windows=${WINDOWS_UPDATE_TIMEOUT}s, Linux=${LINUX_UPDATE_TIMEOUT}s, apt lock=${APT_LOCK_TIMEOUT}s"
+    print_ok "Pre-update snapshots: ${SNAPSHOT_BEFORE_UPDATE}"
+    if [ "${ENABLE_WEB_UI}" = "true" ]; then
+        print_ok "Web control panel: enabled on port ${WEB_UI_PORT}"
+    else
+        print_skip "Web control panel: not installed"
+    fi
+    if [ "${KEEP_LOGS}" = "true" ]; then
+        print_ok "Logs kept in ${LOG_DIR}/ for ${LOG_RETENTION_DAYS} day(s)"
+    else
+        print_ok "Logs streamed live, then deleted"
+    fi
+fi
+
 echo ""
 step "Schedule and reboot timing"
-echo ""
-
-# --- Cron schedules ---
-#
-# More than one is allowed, and each says for itself whether it may reboot the
-# host. The setup this exists for: install updates every week without an
-# outage, and let one run a month be the one that takes the kernel.
-DEFAULT_CRON="${PREV_CRON:-0 23 * * 5}"
-UPDATE_SCHEDULES=""
-SCHED_COUNT=0
-
-echo -e "  ${C_DIM}Updates run from cron. You can have more than one schedule, and each${C_NC}"
-echo -e "  ${C_DIM}one decides for itself whether it is allowed to reboot the host — so${C_NC}"
-echo -e "  ${C_DIM}updates can land weekly while the reboot only happens monthly.${C_NC}"
-
-# Offer to keep what is already configured.
-#
-# Without this, pressing Enter through a re-install rebuilt the list from
-# scratch as a single always-reboots schedule, quietly throwing away a
-# weekly/monthly split — and the panel's unattended self-update runs this same
-# script, so it would have happened without anyone at the keyboard.
-KEEP_SCHEDULES=false
-if [ -n "${PREV_SCHEDULES}" ]; then
+if asking; then
     echo ""
-    echo -e "  ${C_BOLD}Currently configured:${C_NC}"
-    parse_schedules "${PREV_SCHEDULES}" | while IFS="$(printf '	')" read -r c r l; do
+
+    # --- Cron schedules ---
+    #
+    # More than one is allowed, and each says for itself whether it may reboot the
+    # host. The setup this exists for: install updates every week without an
+    # outage, and let one run a month be the one that takes the kernel.
+    DEFAULT_CRON="${PREV_CRON:-0 23 * * 5}"
+    UPDATE_SCHEDULES=""
+    SCHED_COUNT=0
+
+    echo -e "  ${C_DIM}Updates run from cron. You can have more than one schedule, and each${C_NC}"
+    echo -e "  ${C_DIM}one decides for itself whether it is allowed to reboot the host — so${C_NC}"
+    echo -e "  ${C_DIM}updates can land weekly while the reboot only happens monthly.${C_NC}"
+
+    # Offer to keep what is already configured.
+    #
+    # Without this, pressing Enter through a re-install rebuilt the list from
+    # scratch as a single always-reboots schedule, quietly throwing away a
+    # weekly/monthly split — and the panel's unattended self-update runs this same
+    # script, so it would have happened without anyone at the keyboard.
+    KEEP_SCHEDULES=false
+    if [ -n "${PREV_SCHEDULES}" ]; then
+        echo ""
+        echo -e "  ${C_BOLD}Currently configured:${C_NC}"
+        parse_schedules "${PREV_SCHEDULES}" | while IFS="$(printf '	')" read -r c r l; do
+            case "${r}" in
+                no)   echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }update, never reboots${C_NC}" ;;
+                only) echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }reboot window, no updates${C_NC}" ;;
+                *)    echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }update, may reboot${C_NC}" ;;
+            esac
+        done
+        echo -e "    ${C_CYAN}1)${C_NC} Keep these"
+        echo -e "    ${C_CYAN}2)${C_NC} Replace them"
+        ask INPUT_SCHED_KEEP "  Select 1 or 2 [Enter for 1]: "
+        if [ "${INPUT_SCHED_KEEP}" != "2" ]; then
+            UPDATE_SCHEDULES="${PREV_SCHEDULES}"
+            KEEP_SCHEDULES=true
+            print_ok "Schedules unchanged"
+        fi
+    fi
+
+    while [ "${KEEP_SCHEDULES}" = false ] && [ "${SCHED_COUNT}" -lt 5 ]; do
+        SCHED_COUNT=$((SCHED_COUNT + 1))
+        echo ""
+        echo -e "  ${C_BOLD}Schedule ${SCHED_COUNT}${C_NC}"
+        echo -e "    ${C_CYAN}1)${C_NC} Friday at 23:00  ${C_DIM}(0 23 * * 5)${C_NC}"
+        echo -e "    ${C_CYAN}2)${C_NC} Friday at 22:00  ${C_DIM}(0 22 * * 5)${C_NC}"
+        echo -e "    ${C_CYAN}3)${C_NC} Friday at 20:00  ${C_DIM}(0 20 * * 5)${C_NC}"
+        echo -e "    ${C_CYAN}4)${C_NC} Sunday at 03:00  ${C_DIM}(0 3 * * 0)${C_NC}"
+        # Monthly by day-of-month, never "first Sunday". cron ORs day-of-month with
+        # day-of-week when both are restricted, so the obvious "0 3 1-7 * 0" fires
+        # on the 1st-7th *and* on every Sunday — weekly, not monthly.
+        echo -e "    ${C_CYAN}5)${C_NC} 1st of the month at 03:00  ${C_DIM}(0 3 1 * *)${C_NC}"
+        echo -e "    ${C_CYAN}6)${C_NC} Custom cron expression"
+
+        SCHED_LABEL=""
+        if [ "${SCHED_COUNT}" -eq 1 ]; then
+            ask INPUT_SCHED_CHOICE "  Select 1-6 [Enter for ${DEFAULT_CRON}]: "
+        else
+            ask INPUT_SCHED_CHOICE "  Select 1-6: "
+        fi
+        case "${INPUT_SCHED_CHOICE:-0}" in
+            1) SCHED_CRON="0 23 * * 5"; SCHED_LABEL="Friday 23:00" ;;
+            2) SCHED_CRON="0 22 * * 5"; SCHED_LABEL="Friday 22:00" ;;
+            3) SCHED_CRON="0 20 * * 5"; SCHED_LABEL="Friday 20:00" ;;
+            4) SCHED_CRON="0 3 * * 0";  SCHED_LABEL="Sunday 03:00" ;;
+            5) SCHED_CRON="0 3 1 * *";  SCHED_LABEL="Monthly, 1st at 03:00" ;;
+            6)
+                ask CUSTOM_CRON "  Enter 5-field cron expression (e.g. 0 10 * * 5): "
+                SCHED_CRON="${CUSTOM_CRON:-${DEFAULT_CRON}}"
+                SCHED_LABEL="Custom"
+                ;;
+            *) SCHED_CRON="${DEFAULT_CRON}"; SCHED_LABEL="Updates" ;;
+        esac
+
+        # Reject a malformed expression here rather than letting crontab refuse the
+        # whole file at the end, which used to abort the install after everything
+        # else had already been written.
+        if ! echo "${SCHED_CRON}" | grep -qE '^[0-9*,/@ -]{1,100}$'        || [ "$(echo "${SCHED_CRON}" | wc -w)" -ne 5 ]; then
+            print_fail "Not a 5-field cron expression: '${SCHED_CRON}'"
+            SCHED_CRON="${DEFAULT_CRON}"
+            SCHED_LABEL="Updates"
+            print_skip "Using ${SCHED_CRON}."
+        fi
+
+        echo ""
+        echo -e "  ${C_DIM}What should this schedule do?${C_NC}"
+        echo -e "    ${C_CYAN}1)${C_NC} Update, and reboot if it installs a new kernel"
+        echo -e "    ${C_CYAN}2)${C_NC} Update, never reboot  ${C_DIM}— leave the reboot to another schedule${C_NC}"
+        echo -e "    ${C_CYAN}3)${C_NC} Reboot only  ${C_DIM}— install nothing; reboot if one is already owed${C_NC}"
+        ask INPUT_SCHED_REBOOT "  Select 1-3 [Enter for 1]: "
+        case "${INPUT_SCHED_REBOOT}" in
+            2) SCHED_REBOOT="no" ;;
+            3) SCHED_REBOOT="only"; SCHED_LABEL="Reboot window" ;;
+            *) SCHED_REBOOT="yes" ;;
+        esac
+
+        # ';' and '|' are the separators, so they cannot appear inside a label.
+        SCHED_LABEL=$(echo "${SCHED_LABEL}" | tr -d ';|')
+        UPDATE_SCHEDULES="${UPDATE_SCHEDULES}${UPDATE_SCHEDULES:+;}${SCHED_CRON}|${SCHED_REBOOT}|${SCHED_LABEL}"
+        case "${SCHED_REBOOT}" in
+            yes)  print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(update, may reboot)${C_NC}" ;;
+            no)   print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(update, never reboots)${C_NC}" ;;
+            only) print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(reboot window — no updates)${C_NC}" ;;
+        esac
+
+        [ "${SCHED_COUNT}" -ge 5 ] && break
+        echo ""
+        echo -e "  ${C_DIM}Add another schedule? A second one is how you get weekly updates${C_NC}"
+        echo -e "  ${C_DIM}with a monthly reboot.${C_NC}"
+        echo -e "    ${C_CYAN}1)${C_NC} Yes"
+        echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(done)${C_NC}"
+        ask INPUT_SCHED_MORE "  Select 1 or 2 [Enter for 2]: "
+        [ "${INPUT_SCHED_MORE}" = "1" ] || break
+    done
+
+    # Kept in step with the first schedule so a config written here still reads
+    # correctly to anything that only knows about the single-schedule key.
+    UPDATE_SCHEDULE_CRON=$(parse_schedules "${UPDATE_SCHEDULES}" | head -1 | cut -f1)
+
+    if [ "${SCHED_COUNT}" -gt 1 ] \
+       && ! echo "${UPDATE_SCHEDULES}" | grep -qE '\|(yes|only)\|'; then
+        print_fail "None of these schedules may reboot."
+        print_fail "A kernel update will install and then wait indefinitely."
+    fi
+
+    # --- Reboot Time ---
+    echo ""
+    echo -e "  ${C_BOLD}Reboot time after a kernel update${C_NC}"
+    echo -e "  ${C_DIM}A new kernel only takes effect after a reboot. If one is installed,${C_NC}"
+    echo -e "  ${C_DIM}the host is scheduled to reboot at this time; otherwise nothing${C_NC}"
+    echo -e "  ${C_DIM}happens. 24-hour HH:MM.${C_NC}"
+    DEFAULT_REBOOT_TIME="${PREV_REBOOT_TIME:-00:00}"
+    # Checked here because update-everything.sh treats anything that is not HH:MM
+    # as FATAL and exits before touching a single guest. Typing the obvious "9:00"
+    # used to earn a green tick and "Deployment successful", and then every
+    # scheduled run aborted for good, into a cron log nobody reads. A single-digit
+    # hour is the common slip, so it is padded rather than rejected.
+    REBOOT_ATTEMPTS=0
+    while :; do
+        REBOOT_ATTEMPTS=$((REBOOT_ATTEMPTS + 1))
+        ask INPUT_REBOOT_TIME "  Reboot at [Enter for ${DEFAULT_REBOOT_TIME}]: "
+        REBOOT_TIME="${INPUT_REBOOT_TIME:-${DEFAULT_REBOOT_TIME}}"
+        [[ "${REBOOT_TIME}" =~ ^[0-9]:[0-5][0-9]$ ]] && REBOOT_TIME="0${REBOOT_TIME}"
+        [[ "${REBOOT_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break
+        print_fail "Not a 24-hour HH:MM time: '"'"'${REBOOT_TIME}'"'"'  (e.g. 00:00, 03:30, 23:15)"
+        if [ "${HAVE_TTY}" != true ] || [ "${REBOOT_ATTEMPTS}" -ge 5 ]; then
+            REBOOT_TIME="${DEFAULT_REBOOT_TIME}"
+            print_skip "Using ${REBOOT_TIME}."
+            break
+        fi
+    done
+    print_ok "Scheduled reboot time: ${REBOOT_TIME}"
+
+    # 3. Write credentials to a secure config file
+    echo ""
+else
+    echo ""
+    parse_schedules "${UPDATE_SCHEDULES}" | while IFS="$(printf '	')" read -r c r l; do
         case "${r}" in
-            no)   echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }update, never reboots${C_NC}" ;;
-            only) echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }reboot window, no updates${C_NC}" ;;
-            *)    echo -e "    ${C_CYAN}•${C_NC} ${c}  ${C_DIM}${l:+${l} — }update, may reboot${C_NC}" ;;
+            no)   print_ok "Schedule: ${c} ${C_DIM}${l:+${l} — }update, never reboots${C_NC}" ;;
+            only) print_ok "Schedule: ${c} ${C_DIM}${l:+${l} — }reboot window, no updates${C_NC}" ;;
+            *)    print_ok "Schedule: ${c} ${C_DIM}${l:+${l} — }update, may reboot${C_NC}" ;;
         esac
     done
-    echo -e "    ${C_CYAN}1)${C_NC} Keep these"
-    echo -e "    ${C_CYAN}2)${C_NC} Replace them"
-    ask INPUT_SCHED_KEEP "  Select 1 or 2 [Enter for 1]: "
-    if [ "${INPUT_SCHED_KEEP}" != "2" ]; then
-        UPDATE_SCHEDULES="${PREV_SCHEDULES}"
-        KEEP_SCHEDULES=true
-        print_ok "Schedules unchanged"
-    fi
+    print_ok "Reboot time if a kernel is installed: ${REBOOT_TIME}"
 fi
 
-while [ "${KEEP_SCHEDULES}" = false ] && [ "${SCHED_COUNT}" -lt 5 ]; do
-    SCHED_COUNT=$((SCHED_COUNT + 1))
-    echo ""
-    echo -e "  ${C_BOLD}Schedule ${SCHED_COUNT}${C_NC}"
-    echo -e "    ${C_CYAN}1)${C_NC} Friday at 23:00  ${C_DIM}(0 23 * * 5)${C_NC}"
-    echo -e "    ${C_CYAN}2)${C_NC} Friday at 22:00  ${C_DIM}(0 22 * * 5)${C_NC}"
-    echo -e "    ${C_CYAN}3)${C_NC} Friday at 20:00  ${C_DIM}(0 20 * * 5)${C_NC}"
-    echo -e "    ${C_CYAN}4)${C_NC} Sunday at 03:00  ${C_DIM}(0 3 * * 0)${C_NC}"
-    # Monthly by day-of-month, never "first Sunday". cron ORs day-of-month with
-    # day-of-week when both are restricted, so the obvious "0 3 1-7 * 0" fires
-    # on the 1st-7th *and* on every Sunday — weekly, not monthly.
-    echo -e "    ${C_CYAN}5)${C_NC} 1st of the month at 03:00  ${C_DIM}(0 3 1 * *)${C_NC}"
-    echo -e "    ${C_CYAN}6)${C_NC} Custom cron expression"
-
-    SCHED_LABEL=""
-    if [ "${SCHED_COUNT}" -eq 1 ]; then
-        ask INPUT_SCHED_CHOICE "  Select 1-6 [Enter for ${DEFAULT_CRON}]: "
-    else
-        ask INPUT_SCHED_CHOICE "  Select 1-6: "
-    fi
-    case "${INPUT_SCHED_CHOICE:-0}" in
-        1) SCHED_CRON="0 23 * * 5"; SCHED_LABEL="Friday 23:00" ;;
-        2) SCHED_CRON="0 22 * * 5"; SCHED_LABEL="Friday 22:00" ;;
-        3) SCHED_CRON="0 20 * * 5"; SCHED_LABEL="Friday 20:00" ;;
-        4) SCHED_CRON="0 3 * * 0";  SCHED_LABEL="Sunday 03:00" ;;
-        5) SCHED_CRON="0 3 1 * *";  SCHED_LABEL="Monthly, 1st at 03:00" ;;
-        6)
-            ask CUSTOM_CRON "  Enter 5-field cron expression (e.g. 0 10 * * 5): "
-            SCHED_CRON="${CUSTOM_CRON:-${DEFAULT_CRON}}"
-            SCHED_LABEL="Custom"
-            ;;
-        *) SCHED_CRON="${DEFAULT_CRON}"; SCHED_LABEL="Updates" ;;
-    esac
-
-    # Reject a malformed expression here rather than letting crontab refuse the
-    # whole file at the end, which used to abort the install after everything
-    # else had already been written.
-    if ! echo "${SCHED_CRON}" | grep -qE '^[0-9*,/@ -]{1,100}$'        || [ "$(echo "${SCHED_CRON}" | wc -w)" -ne 5 ]; then
-        print_fail "Not a 5-field cron expression: '${SCHED_CRON}'"
-        SCHED_CRON="${DEFAULT_CRON}"
-        SCHED_LABEL="Updates"
-        print_skip "Using ${SCHED_CRON}."
-    fi
-
-    echo ""
-    echo -e "  ${C_DIM}What should this schedule do?${C_NC}"
-    echo -e "    ${C_CYAN}1)${C_NC} Update, and reboot if it installs a new kernel"
-    echo -e "    ${C_CYAN}2)${C_NC} Update, never reboot  ${C_DIM}— leave the reboot to another schedule${C_NC}"
-    echo -e "    ${C_CYAN}3)${C_NC} Reboot only  ${C_DIM}— install nothing; reboot if one is already owed${C_NC}"
-    ask INPUT_SCHED_REBOOT "  Select 1-3 [Enter for 1]: "
-    case "${INPUT_SCHED_REBOOT}" in
-        2) SCHED_REBOOT="no" ;;
-        3) SCHED_REBOOT="only"; SCHED_LABEL="Reboot window" ;;
-        *) SCHED_REBOOT="yes" ;;
-    esac
-
-    # ';' and '|' are the separators, so they cannot appear inside a label.
-    SCHED_LABEL=$(echo "${SCHED_LABEL}" | tr -d ';|')
-    UPDATE_SCHEDULES="${UPDATE_SCHEDULES}${UPDATE_SCHEDULES:+;}${SCHED_CRON}|${SCHED_REBOOT}|${SCHED_LABEL}"
-    case "${SCHED_REBOOT}" in
-        yes)  print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(update, may reboot)${C_NC}" ;;
-        no)   print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(update, never reboots)${C_NC}" ;;
-        only) print_ok "Schedule ${SCHED_COUNT}: ${SCHED_CRON} ${C_DIM}(reboot window — no updates)${C_NC}" ;;
-    esac
-
-    [ "${SCHED_COUNT}" -ge 5 ] && break
-    echo ""
-    echo -e "  ${C_DIM}Add another schedule? A second one is how you get weekly updates${C_NC}"
-    echo -e "  ${C_DIM}with a monthly reboot.${C_NC}"
-    echo -e "    ${C_CYAN}1)${C_NC} Yes"
-    echo -e "    ${C_CYAN}2)${C_NC} No  ${C_DIM}(done)${C_NC}"
-    ask INPUT_SCHED_MORE "  Select 1 or 2 [Enter for 2]: "
-    [ "${INPUT_SCHED_MORE}" = "1" ] || break
-done
-
-# Kept in step with the first schedule so a config written here still reads
-# correctly to anything that only knows about the single-schedule key.
-UPDATE_SCHEDULE_CRON=$(parse_schedules "${UPDATE_SCHEDULES}" | head -1 | cut -f1)
-
-if [ "${SCHED_COUNT}" -gt 1 ] \
-   && ! echo "${UPDATE_SCHEDULES}" | grep -qE '\|(yes|only)\|'; then
-    print_fail "None of these schedules may reboot."
-    print_fail "A kernel update will install and then wait indefinitely."
-fi
-
-# --- Reboot Time ---
-echo ""
-echo -e "  ${C_BOLD}Reboot time after a kernel update${C_NC}"
-echo -e "  ${C_DIM}A new kernel only takes effect after a reboot. If one is installed,${C_NC}"
-echo -e "  ${C_DIM}the host is scheduled to reboot at this time; otherwise nothing${C_NC}"
-echo -e "  ${C_DIM}happens. 24-hour HH:MM.${C_NC}"
-DEFAULT_REBOOT_TIME="${PREV_REBOOT_TIME:-00:00}"
-# Checked here because update-everything.sh treats anything that is not HH:MM
-# as FATAL and exits before touching a single guest. Typing the obvious "9:00"
-# used to earn a green tick and "Deployment successful", and then every
-# scheduled run aborted for good, into a cron log nobody reads. A single-digit
-# hour is the common slip, so it is padded rather than rejected.
-REBOOT_ATTEMPTS=0
-while :; do
-    REBOOT_ATTEMPTS=$((REBOOT_ATTEMPTS + 1))
-    ask INPUT_REBOOT_TIME "  Reboot at [Enter for ${DEFAULT_REBOOT_TIME}]: "
-    REBOOT_TIME="${INPUT_REBOOT_TIME:-${DEFAULT_REBOOT_TIME}}"
-    [[ "${REBOOT_TIME}" =~ ^[0-9]:[0-5][0-9]$ ]] && REBOOT_TIME="0${REBOOT_TIME}"
-    [[ "${REBOOT_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break
-    print_fail "Not a 24-hour HH:MM time: '"'"'${REBOOT_TIME}'"'"'  (e.g. 00:00, 03:30, 23:15)"
-    if [ "${HAVE_TTY}" != true ] || [ "${REBOOT_ATTEMPTS}" -ge 5 ]; then
-        REBOOT_TIME="${DEFAULT_REBOOT_TIME}"
-        print_skip "Using ${REBOOT_TIME}."
-        break
-    fi
-done
-print_ok "Scheduled reboot time: ${REBOOT_TIME}"
-
-# 3. Write credentials to a secure config file
-echo ""
 echo ""
 step "Saving configuration"
 print_action "Writing ${C_DIM}${CONFIG_FILE}${C_NC}"

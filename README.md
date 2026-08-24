@@ -161,6 +161,39 @@ do what you expect.
 
 ## One-Command Quick Install / Update
 
+The first question is the only one a normal install has to answer:
+
+```
+1) Typical  — recommended defaults, nothing to answer
+2) Custom   — choose everything yourself
+```
+
+**Typical** prints exactly what it is about to do, then does it:
+
+| | |
+| --- | --- |
+| Schedule | Fridays at 23:00. Reboot at 02:00, and only if that run installed a kernel. |
+| Guests | Stopped containers and Linux VMs are started, updated and put back as they were. Windows VMs are left alone — Windows Update can run well over half an hour. |
+| Web panel | Installed on port 8007, with the **Update Everything** button added to the Proxmox toolbar. |
+| Notifications | **Off.** |
+| Snapshots | Off. |
+| Logs | Kept in `/var/log/proxmox-autoupdate/` for 90 days. |
+| Exclusions | None — every guest is updated. |
+
+Notifications are off on purpose. There is no safe guess at your mail server,
+and a channel configured wrongly is worse than no channel at all: it reports
+nothing and looks configured. Add email, Discord, Slack, Teams, ntfy, Gotify,
+Telegram or a webhook afterwards, from the panel or the config file.
+
+**Custom** asks about all of it, including multiple schedules with per-schedule
+reboot control.
+
+Everything Typical chooses is editable later. Re-running the installer on a host
+that is already configured offers **Keep my current settings** as the default,
+so an upgrade never silently resets you — and the panel's own self-update always
+takes that path.
+
+
 Run this on your Proxmox host **as `root`**:
 
 ```bash

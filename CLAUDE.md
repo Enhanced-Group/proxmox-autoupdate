@@ -80,3 +80,18 @@ match), run `ci/invariants.sh`, commit, push, tag `vX.Y.Z`, then create the
 GitHub release via the API with `make_latest: true`.
 
 Commits: no `Co-Authored-By` trailer.
+
+## Install modes
+
+`install.sh` asks Typical / Custom first (Keep / Typical / Custom when a config
+already exists; the panel's `--unattended` self-update always takes Keep).
+
+- `apply_typical_profile()` holds the Typical defaults. Notifications are off —
+  never guess at somebody's mail server.
+- `asking()` is true only in Custom mode. The Notifications, Advanced settings
+  and Schedule prompt blocks are each wrapped in `if asking; then … else
+  <print what was chosen> fi`.
+- **Every config key must be set outside those gates**, either in
+  `apply_typical_profile()` or in the seeded-from-`PREV_*` block above
+  `step "Notifications"`. Skipping a prompt otherwise leaves the variable unset,
+  and `set -u` aborts partway through writing the config. CI enforces this.
