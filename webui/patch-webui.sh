@@ -857,7 +857,6 @@ JSBLOCK_HEAD
             interval: 500,
             run: function () {
                 attempts++;
-                if (attempts > 240) { return false; }
                 try {
                     var anchor = findAnchorButton();
                     var tb = anchor && anchor.ownerCt;
