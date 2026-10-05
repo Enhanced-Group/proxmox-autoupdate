@@ -12,6 +12,22 @@ update should describe what they would actually get.
 The heading format is parsed by the panel: `## <version> — <YYYY-MM-DD>`, then
 `### Added` / `### Fixed` / `### Changed` sections of bullet points.
 
+## 1.13.4 — 2026-10-05
+
+### Fixed
+
+- **The floating fallback button could never appear.** When the Proxmox header
+  toolbar is not recognised, the injected code is meant to give up looking after
+  240 attempts and add a plain "Update Everything" button over the page instead.
+  A guard at the top of the poll loop stopped it one step earlier, so the loop
+  ended before the code that adds the button ever ran. On a Proxmox release whose
+  header this tool did not recognise there was no button at all — and the console
+  warning said a floating one would be added.
+
+  Existing nodes get the corrected block the next time `pve-autoupdate-patch-webui
+  apply` runs, which the apt hook and the self-update both do. Hard-refresh the
+  Proxmox UI afterwards.
+
 ## 1.13.3 — 2026-08-25
 
 The four areas nothing had ever looked at: the Windows payload, concurrency,
